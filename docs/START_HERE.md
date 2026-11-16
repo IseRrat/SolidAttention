@@ -2,28 +2,23 @@
 
 ## 1. 获取 llama.cpp 并固定版本
 
-在项目根目录将上游加入 `third_party/llama.cpp`，使用 Git submodule 记录依赖提交：
-
-```bash
-git submodule add https://github.com/ggml-org/llama.cpp.git third_party/llama.cpp
-git -C third_party/llama.cpp rev-parse HEAD
-```
-
-完成首次构建和短输入推理后，将通过验证的完整提交号写入 [实施决策 D01](DECISIONS.md)。后续实验使用同一提交。现有检出的依赖通过以下命令恢复：
+上游已通过 Git submodule 固定到 `ef6bc6f367082338006c8379bc7bcab3e1584766`。获取项目后恢复依赖：
 
 ```bash
 git submodule update --init --recursive
+git -C third_party/llama.cpp rev-parse HEAD
 ```
 
-对 llama.cpp 的适配保存在项目 fork 的 `codex/solidattention` 分支，主仓库 submodule 指向对应提交；实验同时记录上游基点和适配提交。
+提交号由 `cmake/Upstream.cmake` 校验，接口记录见 [UPSTREAM_MAP](UPSTREAM_MAP.md)。运行原版基线使用 [构建与检查](DEVELOPMENT.md) 中的统一入口；每次实验同时记录主仓库和上游提交。
 
 ## 2. 在 Linux 上构建 CUDA 基线
 
 准备 C++ 工具链、CMake、CUDA Toolkit 和模型 GGUF 文件。构建方式参考 [上游构建文档](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)，具体选项以锁定提交的 `docs/build.md` 为准。
 
 ```bash
-cmake -S third_party/llama.cpp -B build/llama-cuda -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON
-cmake --build build/llama-cuda --config Release -j 8
+cmake --preset cuda
+cmake --build --preset cuda
+ctest --preset cuda
 ```
 
 先查看生成程序的 `--help`，选定一个模型运行短输入。保存实际命令、完整日志、生成结果、prefill/decode 耗时以及 DRAM/VRAM 峰值。固定 GPU 层数、KV dtype、Flash Attention 开关、上下文容量和生成参数。
@@ -54,7 +49,7 @@ cmake --build build/llama-cuda --config Release -j 8
 | 后端 | 主机与 GPU 复制、事件、执行流、计算图拆分边界 |
 | Prefill | microbatch 切分、历史 KV 访问、分块写出和内存释放 |
 
-第一轮接口验证完成后，在 [系统设计](DESIGN.md) 中补充实际符号及调用位置。
+已定位的符号和调用关系见 [UPSTREAM_MAP](UPSTREAM_MAP.md)，适配时在该表记录改动。
 
 ## 5. 进入同步 SSD 路径
 

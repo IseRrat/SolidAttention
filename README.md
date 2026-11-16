@@ -12,6 +12,7 @@
 4. [实施决策](docs/DECISIONS.md)：已选方案及参数锁定任务。
 5. [测试与评测](docs/TEST_PLAN.md)：正确性测试、实验矩阵和统计口径。
 6. [论文依据](docs/REFERENCES.md)：论文参数、图表与实验对应关系。
+7. [构建与检查](docs/DEVELOPMENT.md)：代码构建、单元检查和实验环境运行入口。
 
 ## 系统机制
 

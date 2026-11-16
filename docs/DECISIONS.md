@@ -4,7 +4,7 @@
 
 | 编号 | 方案 | 落实位置 |
 | --- | --- | --- |
-| D01 | Linux + llama.cpp + CUDA；上游以 submodule 固定，适配提交保存在项目 fork | 阶段 0，START_HERE |
+| D01 | Linux + llama.cpp + CUDA；上游 submodule 固定到 `ef6bc6f367082338006c8379bc7bcab3e1584766`，由 CMake 校验 | 阶段 0，START_HERE、UPSTREAM_MAP |
 | D02 | SSD 保存完整 KV，decode 复用单层 DRAM/VRAM 工作集 | DESIGN §3 |
 | D03 | 32 token 块；短输入预算 25%，其余 1k；init/local 和 selected 各占一半 | DESIGN §4，论文 §7 |
 | D04 | 代表构造按 InfLLM §3.2，参数与模型位置规则一起锁定 | DESIGN §4 |
@@ -18,8 +18,8 @@
 
 | 阶段 | 项目 | 决策所需证据 |
 | --- | --- | --- |
-| 0 | 上游完整提交号、fork 地址及适配分支 | 编译日志、短输入结果、接口定位表 |
-| 0 | 首个模型、GGUF revision/哈希及具体 INT4 格式 | 模型 KV 形状、上下文配置、显存占用 |
+| 0 | 适配提交管理方式 | 上游改动范围、编译记录、接口定位表 |
+| 0 | 首个模型的实验路径与上下文配置 | `configs/models.lock.json`、模型元数据、显存占用 |
 | 0 | Linux/CUDA/liburing、硬件与文件系统 | 环境记录、SSD 随机读微基准 |
 | 1 | prefill microbatch/tile、attention 接入点 | dense 输出对照、受限内存峰值 |
 | 1 | 代表 token 数、评分窗口、head 聚合 | 选块轨迹、长文本检索与任务得分 |

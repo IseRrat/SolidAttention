@@ -1,0 +1,33 @@
+{
+  "version": 3,
+  "configurePresets": [
+    {
+      "name": "checks",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/checks",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug",
+        "SOLID_BUILD_RUNNER": "OFF",
+        "SOLID_BUILD_TESTS": "ON"
+      }
+    },
+    {
+      "name": "cuda",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/release",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "SOLID_CUDA": "ON",
+        "SOLID_BUILD_TESTS": "ON"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "checks", "configurePreset": "checks", "jobs": 4},
+    {"name": "cuda", "configurePreset": "cuda", "jobs": 4}
+  ],
+  "testPresets": [
+    {"name": "checks", "configurePreset": "checks", "output": {"outputOnFailure": true}},
+    {"name": "cuda", "configurePreset": "cuda", "output": {"outputOnFailure": true}}
+  ]
+}

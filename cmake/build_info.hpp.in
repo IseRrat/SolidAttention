@@ -1,0 +1,2 @@
+#pragma once
+inline constexpr const char * solid_build_info = R"solid(@SOLID_BUILD_JSON@)solid";

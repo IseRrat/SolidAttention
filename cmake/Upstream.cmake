@@ -1,0 +1,10 @@
+set(SOLID_UPSTREAM_COMMIT "ef6bc6f367082338006c8379bc7bcab3e1584766")
+if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/llama.cpp/include/llama.h")
+    message(FATAL_ERROR "Run git submodule update --init --recursive first")
+endif()
+find_package(Git REQUIRED)
+execute_process(COMMAND "${GIT_EXECUTABLE}" -C "${PROJECT_SOURCE_DIR}/third_party/llama.cpp" rev-parse HEAD
+    OUTPUT_VARIABLE SOLID_ACTUAL_UPSTREAM OUTPUT_STRIP_TRAILING_WHITESPACE RESULT_VARIABLE SOLID_GIT_STATUS)
+if(NOT SOLID_GIT_STATUS EQUAL 0 OR NOT SOLID_ACTUAL_UPSTREAM STREQUAL SOLID_UPSTREAM_COMMIT)
+    message(FATAL_ERROR "llama.cpp commit differs from cmake/Upstream.cmake")
+endif()
