@@ -1,0 +1,15 @@
+# Local build products and experiment data
+build/
+cmake-build-*/
+*.o
+*.so
+*.a
+*.exe
+*.bin
+*.log
+results/
+data/
+models/
+.cache/
+.vscode/
+.idea/
