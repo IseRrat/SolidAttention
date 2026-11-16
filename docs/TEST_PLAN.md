@@ -19,6 +19,8 @@ dense 内存与 SSD 路径比较 K/V、attention 输出和 logits。稀疏内存
 
 ## 2. 功能验收
 
+检查入口为 `bash scripts/check.sh --cuda`；测试覆盖与结果记录见 [CHECKS](CHECKS.md)，模型固定 token 对照见 [SSD_PATH](SSD_PATH.md)。
+
 | 场景 | 构造 | 观察结果 |
 | --- | --- | --- |
 | 交错布局 | 多 head、递增 K/V、满块和尾块 | encode/decode 逐元素一致，attention 只访问有效位置 |

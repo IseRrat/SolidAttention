@@ -1,5 +1,6 @@
 #include "solid/config.hpp"
 #include "solid/filehash.hpp"
+#include "solid/llama_adapter.hpp"
 #include "solid_build_info.hpp"
 #include "llama.h"
 #include "ggml-backend.h"
@@ -18,6 +19,7 @@
 #include <vector>
 
 namespace {
+static_assert(sizeof(float) == 4 && std::numeric_limits<float>::is_iec559, "logits require IEEE float32");
 using Clock = std::chrono::steady_clock;
 using Json = nlohmann::json;
 double milliseconds(Clock::time_point from) {
@@ -51,7 +53,7 @@ llama_token greedy(llama_context * ctx, int vocabulary) {
     return static_cast<llama_token>(best);
 }
 void submit(llama_context * ctx, llama_batch_ext * batch, const llama_token * tokens,
-            std::size_t count, llama_pos first, bool output) {
+            std::size_t count, llama_pos first, bool output, solid::AttentionAdapter * adapter = nullptr) {
     llama_batch_ext_clear(batch);
     for (std::size_t i = 0; i < count; ++i) {
         const int index = llama_batch_ext_add_token(batch, 0, tokens[i]);
@@ -64,6 +66,7 @@ void submit(llama_context * ctx, llama_batch_ext * batch, const llama_token * to
     const int status = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
     if (status != 0) throw std::runtime_error("llama_process failed: " + std::to_string(status));
     llama_synchronize(ctx);
+    if (adapter) adapter->check();
 }
 Json metadata(const llama_model * model) {
     Json result = Json::object();
@@ -130,6 +133,9 @@ int main(int argc, char ** argv) {
         const double load_ms = milliseconds(load_start);
         if (llama_model_has_encoder(model.get())) throw std::runtime_error("runner requires a decoder-only model");
         const auto * vocab = llama_model_get_vocab(model.get());
+        for (const auto token : config.replay_token_ids) {
+            if (token >= llama_vocab_n_tokens(vocab)) throw std::invalid_argument("replay token ID exceeds model vocabulary");
+        }
         int n = llama_tokenize(vocab, prompt.data(), static_cast<int32_t>(prompt.size()), nullptr, 0, true, true);
         if (n >= 0 || n == std::numeric_limits<int>::min()) throw std::runtime_error("tokenizer sizing failed");
         std::vector<llama_token> tokens(static_cast<std::size_t>(-n));
@@ -153,6 +159,12 @@ int main(int argc, char ** argv) {
         cp.flash_attn_type = config.flash_attention ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cp.offload_kqv = config.kv_on_gpu;
         cp.no_perf = false;
+        std::unique_ptr<solid::AttentionAdapter> adapter;
+        if (config.attention.enabled) {
+            std::filesystem::create_directories(config.output.parent_path());
+            adapter = std::make_unique<solid::AttentionAdapter>(model.get(), config.attention, config.context_tokens,
+                       tokens.size(), config.output.parent_path() / "selection.jsonl");
+        }
         const auto context_start = Clock::now();
         std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), cp), llama_free);
         if (!ctx) throw std::runtime_error("context initialization failed");
@@ -162,12 +174,22 @@ int main(int argc, char ** argv) {
         const auto prefill_start = Clock::now();
         for (std::size_t first = 0; first < tokens.size();) {
             const auto count = std::min<std::size_t>(config.batch_tokens, tokens.size() - first);
-            submit(ctx.get(), batch.get(), tokens.data() + first, count, static_cast<llama_pos>(first), first + count == tokens.size());
+            submit(ctx.get(), batch.get(), tokens.data() + first, count, static_cast<llama_pos>(first), first + count == tokens.size(), adapter.get());
             first += count;
         }
+        if (adapter) adapter->flush();
         const double prefill_ms = milliseconds(prefill_start);
+        std::ofstream logits_file;
+        const auto logits_path = config.output.parent_path() / "logits.f32";
+        if (config.dump_logits) {
+            std::filesystem::create_directories(config.output.parent_path());
+            if (std::filesystem::exists(logits_path)) throw std::runtime_error("logits output already exists");
+            logits_file.open(logits_path, std::ios::binary);
+            if (!logits_file) throw std::runtime_error("cannot create logits output");
+        }
         Json trace = Json::array();
         std::vector<llama_token> generated;
+        std::vector<llama_token> decode_inputs;
         std::string text;
         std::string stop = "length";
         double decode_ms = 0;
@@ -176,13 +198,20 @@ int main(int argc, char ** argv) {
             double process_ms = 0;
             if (i > 0) {
                 const auto processing = Clock::now();
-                submit(ctx.get(), batch.get(), &generated.back(), 1,
-                       static_cast<llama_pos>(tokens.size() + i - 1), true);
+                const llama_token input = config.replay ? config.replay_token_ids[i - 1] : generated.back();
+                decode_inputs.push_back(input);
+                submit(ctx.get(), batch.get(), &input, 1,
+                       static_cast<llama_pos>(tokens.size() + i - 1), true, adapter.get());
                 process_ms = milliseconds(processing);
             }
             const auto sample_start = Clock::now();
             const auto token = greedy(ctx.get(), llama_vocab_n_tokens(vocab));
             const double sample_ms = milliseconds(sample_start);
+            if (config.dump_logits) {
+                const auto * logits = llama_get_logits_ith(ctx.get(), -1);
+                logits_file.write(reinterpret_cast<const char *>(logits), static_cast<std::streamsize>(llama_vocab_n_tokens(vocab)) * sizeof(float));
+                if (!logits_file) throw std::runtime_error("logits write failed");
+            }
             const bool eos = llama_vocab_is_eog(vocab, token);
             const auto bytes = piece(vocab, token);
             generated.push_back(token);
@@ -191,25 +220,55 @@ int main(int argc, char ** argv) {
             if (i > 0) decode_ms += total_ms;
             trace.push_back({{"index", i}, {"token_id", token}, {"source", i == 0 ? "prefill" : "decode"},
                              {"process_ms", process_ms}, {"sample_ms", sample_ms}, {"total_ms", total_ms}, {"eos", eos}});
-            if (eos && !config.ignore_eos) { stop = "eos"; break; }
+            if (eos && !config.ignore_eos && !config.replay) { stop = "eos"; break; }
         }
+        if (config.replay) stop = "replay_length";
+        if (config.dump_logits) { logits_file.close(); if (!logits_file) throw std::runtime_error("logits close failed"); }
+        const auto final_flush_start = Clock::now();
+        if (adapter) adapter->flush();
+        const double final_flush_ms = milliseconds(final_flush_start);
         const auto perf = llama_perf_context(ctx.get());
         Json result = {
             {"schema_version", 1}, {"upstream_commit", SOLID_UPSTREAM_COMMIT},
             {"build_info", Json::parse(solid_build_info)},
             {"model", config.model.string()}, {"model_sha256", config.model_sha256},
             {"model_metadata", metadata(model.get())}, {"prompt_token_ids", tokens}, {"generated_token_ids", generated},
+            {"decode_input_token_ids", decode_inputs}, {"replay", config.replay},
             {"text", text}, {"stop_reason", stop}, {"trace", trace},
             {"model_shape", {{"layers", llama_model_n_layer(model.get())}, {"query_heads", llama_model_n_head(model.get())},
                              {"kv_heads", llama_model_n_head_kv(model.get())}, {"embedding", llama_model_n_embd(model.get())}}},
             {"effective_context_tokens", llama_n_ctx(ctx.get())},
             {"timing", {{"model_load_ms", load_ms}, {"context_init_ms", context_ms}, {"prefill_ms", prefill_ms},
                         {"decode_loop_ms", decode_ms}, {"decode_steps", generated.size() - 1},
+                        {"final_flush_ms", final_flush_ms},
                         {"first_token_ms", prefill_ms + trace.front().at("total_ms").get<double>()},
                         {"request_ms", milliseconds(request_start)}}},
             {"llama_counters", {{"prefill_tokens", perf.n_p_eval}, {"decode_tokens", perf.n_eval},
                                 {"prefill_ms", perf.t_p_eval_ms}, {"decode_ms", perf.t_eval_ms}}}
         };
+        result["model_parts_sha256"] = Json::array({config.model_sha256});
+        for (const auto & part : config.additional_model_files) result["model_parts_sha256"].push_back(part.sha256);
+        if (config.dump_logits) {
+            result["logits"] = {{"file", "logits.f32"}, {"dtype", "float32-le"}, {"rows", generated.size()},
+                                {"columns", llama_vocab_n_tokens(vocab)}, {"sha256", solid::sha256_file(logits_path)}};
+        }
+        if (adapter) {
+            const auto stats = adapter->stats();
+            const auto budget = adapter->budget();
+            result["attention"] = {
+                {"storage", config.attention.in_memory ? "memory" : "ssd"}, {"sparse", config.attention.sparse},
+                {"block_tokens", config.attention.block_tokens}, {"context_budget_tokens", budget.total},
+                {"init_tokens", budget.initial}, {"local_tokens", budget.local}, {"representative_count", budget.representatives},
+                {"head_aggregation", "mean"}, {"position_policy", "absolute_native_rope"},
+                {"attention_backend", config.attention.gpu_decode ? "ggml_flash_decode+cpu_streaming_prefill" : "cpu_streaming_reference"},
+                {"io_mode", "buffered"},
+                {"attention_queries", stats.attention_queries}, {"selected_tokens", stats.selected_tokens},
+                {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"kv_buffer_bytes", stats.kv_resident_bytes},
+                {"representative_buffer_bytes", stats.representative_bytes},
+                {"read_requests", stats.io.read_requests}, {"read_bytes", stats.io.read_bytes},
+                {"write_requests", stats.io.write_requests}, {"write_bytes", stats.io.write_bytes}
+            };
+        }
         std::filesystem::create_directories(config.output.parent_path());
         const auto temporary = config.output.string() + ".tmp";
         std::ofstream file(temporary, std::ios::binary | std::ios::trunc);

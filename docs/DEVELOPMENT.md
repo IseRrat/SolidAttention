@@ -2,6 +2,8 @@
 
 已执行的检查记录见 [CHECKS](CHECKS.md)。
 
+同步 SSD、内存参考和稀疏模式的配置及数值对照见 [SSD_PATH](SSD_PATH.md)。
+
 ## 源码
 
 ```bash

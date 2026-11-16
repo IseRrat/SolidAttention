@@ -22,4 +22,20 @@ bash scripts/check.sh --cuda
 
 结果为 4 项 CTest 和 5 项 Python 单元检查通过。检查使用配置文件、临时文本和合成数据。模型推理、性能及准确率使用 [DEVELOPMENT](DEVELOPMENT.md) 中的实验环境入口执行。
 
-接口定位见 [UPSTREAM_MAP](UPSTREAM_MAP.md)。下一步按 [ROADMAP 阶段 1](ROADMAP.md) 接入同步 SSD 存储、稀疏选择与有界 prefill。
+接口定位见 [UPSTREAM_MAP](UPSTREAM_MAP.md)。
+
+## 2026-11-17：同步 SSD 与稀疏路径
+
+| 检查范围 | 证据 |
+| --- | --- |
+| FP16 转换 | 全部有限 half 位模式 round-trip、subnormal 和 ties-to-even 边界 |
+| 同步文件 | 独立与交错布局、多层多头、尾块、短读写重试、脏数据转发 |
+| 错误处理 | EOF、写失败、在用文件独占创建、临时文件清理、计算图错误传递 |
+| 内存 | SSD 写缓存容量随上下文保持固定；内存参考按上下文容量预留空间 |
+| 代表与选择 | 后续窗口定稿、GQA、正负相关度、init/local 去重及 token 预算 |
+| Prefill | 分批与连续处理的一致性、causal mask、独立 dense softmax 公式对照 |
+| 图接入 | 非连续 Q/K/V 视图、FP16 收集、多头 mask、padding、CPU Flash Attention 数值对照 |
+| 回放工具 | 固定实际输入 token、参考上下文继承、checksum、非有限值及首次超差定位 |
+| 上游适配 | 构建目录生成文件，原始源文件字节保持一致，固定提交检查通过 |
+
+完整检查入口为 `bash scripts/check.sh --cuda`，包含 CUDA 编译、11 项 CTest、10 项 Python 单元检查和源码指纹核对。计算使用合成张量与临时文件。实验环境的原版/内存/SSD 数值对照命令见 [SSD_PATH](SSD_PATH.md)。

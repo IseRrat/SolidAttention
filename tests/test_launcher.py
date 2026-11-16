@@ -50,7 +50,11 @@ class LauncherTests(unittest.TestCase):
             root = Path(temporary).resolve()
             source = root / "CMakeLists.txt"
             source.write_text("original")
-            info = {"upstream_commit": launcher.UPSTREAM, "source_files": {"CMakeLists.txt": launcher.digest(source)}}
+            (root / "scripts").mkdir()
+            generator = root / "scripts/generate_adapter.py"
+            generator.write_text("generator")
+            info = {"upstream_commit": launcher.UPSTREAM, "source_files": {
+                "CMakeLists.txt": launcher.digest(source), "scripts/generate_adapter.py": launcher.digest(generator)}}
             launcher.verify_build_info(info, root)
             source.write_text("changed")
             with self.assertRaisesRegex(ValueError, "different source"):

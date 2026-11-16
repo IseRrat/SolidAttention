@@ -60,7 +60,7 @@ def command_output(args, cwd=ROOT):
 
 
 def verify_build_info(info, root=ROOT):
-    source_files = {"CMakeLists.txt"}
+    source_files = {"CMakeLists.txt", "scripts/generate_adapter.py"}
     for folder, pattern in (("src", "*.cpp"), ("include", "*.hpp"), ("cmake", "*")):
         source_files.update(path.relative_to(root).as_posix() for path in (root / folder).rglob(pattern) if path.is_file())
     if info["upstream_commit"] != UPSTREAM or set(info["source_files"]) != source_files:
@@ -127,6 +127,8 @@ def main():
     config = json.loads(config_path.read_text(encoding="utf-8"))
     for key in ("model", "prompt", "output"):
         config[key] = str((config_path.parent / config[key]).resolve())
+    if "session_file" in config.get("attention", {}):
+        config["attention"]["session_file"] = str((config_path.parent / config["attention"]["session_file"]).resolve())
     model, prompt, output = (Path(config[key]) for key in ("model", "prompt", "output"))
     model_files = validate_model_files(config, config_path.parent)
     for part in config.get("additional_model_files", []):

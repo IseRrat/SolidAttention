@@ -12,6 +12,21 @@ struct ModelFile {
     std::string sha256;
 };
 
+struct AttentionConfig {
+    bool enabled = false;
+    bool in_memory = false;
+    bool sparse = false;
+    bool gpu_decode = true;
+    std::uint32_t block_tokens = 32;
+    std::uint32_t context_budget_tokens = 0;
+    std::uint32_t init_tokens = 0;
+    std::uint32_t local_tokens = 0;
+    std::uint32_t representative_count = 1;
+    std::uint32_t write_buffer_bytes_per_layer = 32768;
+    std::filesystem::path session_file;
+    bool keep_session_file = false;
+};
+
 struct RunConfig {
     std::filesystem::path model;
     std::string model_sha256;
@@ -27,6 +42,10 @@ struct RunConfig {
     bool flash_attention = true;
     bool kv_on_gpu = true;
     bool ignore_eos = false;
+    AttentionConfig attention;
+    bool dump_logits = false;
+    bool replay = false;
+    std::vector<std::int32_t> replay_token_ids;
 
     static RunConfig load(const std::filesystem::path & path);
 };

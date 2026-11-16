@@ -46,6 +46,8 @@ solid-baseline
 
 ## SSD 路径的改动范围
 
+接入由 `cmake/Adapter.cmake` 与 `scripts/generate_adapter.py` 生成两个构建目录编译单元，调用主仓库的 `src/llama_adapter.cpp`。具体数据流与模式见 [SSD_PATH](SSD_PATH.md)。
+
 1. 由独立存储层管理完整历史 KV，向计算图提供预算内的每层工作集。
 2. 在 Q 就绪后评分，按 KV head 收集逻辑块，生成对应位置与 mask。
 3. 将 K/V 写入、SSD 读入、H2D、attention 和释放槽位表达为明确依赖。

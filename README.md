@@ -13,6 +13,7 @@
 5. [测试与评测](docs/TEST_PLAN.md)：正确性测试、实验矩阵和统计口径。
 6. [论文依据](docs/REFERENCES.md)：论文参数、图表与实验对应关系。
 7. [构建与检查](docs/DEVELOPMENT.md)：代码构建、单元检查和实验环境运行入口。
+8. [同步 SSD 路径](docs/SSD_PATH.md)：内存/SSD 模式、选块规则、文件格式和固定 token 对照。
 
 ## 系统机制
 

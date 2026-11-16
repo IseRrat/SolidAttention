@@ -13,21 +13,20 @@
 | D07 | 论文评测配置采用 INT4 权重、FP16 KV、batch=1、最大输出 512 | TEST_PLAN |
 | D08 | 每层 32 KiB 写缓冲，最新待提交版本由内存转发 | DESIGN §5，论文 §7 |
 | D09 | I/O 完成或取消确认后释放槽位，generation 校验完成通知 | DESIGN §7 |
+| D10 | 上游适配生成到构建目录，主仓库保存生成器和接入代码 | cmake/Adapter.cmake，UPSTREAM_MAP |
+| D11 | 阶段 1 使用流式 prefill 与 FP16 收集后的 GGML Flash Attention decode | SSD_PATH，strided-attention-graph、gathered-flash-attention |
+| D12 | 默认 1 个代表，GQA 组内平均 Q，使用原生 RoPE；并列按逻辑位置排序 | SSD_PATH，kv-and-attention |
 
 ## 参数锁定任务
 
 | 阶段 | 项目 | 决策所需证据 |
 | --- | --- | --- |
-| 0 | 适配提交管理方式 | 上游改动范围、编译记录、接口定位表 |
 | 0 | 首个模型的实验路径与上下文配置 | `configs/models.lock.json`、模型元数据、显存占用 |
 | 0 | Linux/CUDA/liburing、硬件与文件系统 | 环境记录、SSD 随机读微基准 |
-| 1 | prefill microbatch/tile、attention 接入点 | dense 输出对照、受限内存峰值 |
-| 1 | 代表 token 数、评分窗口、head 聚合 | 选块轨迹、长文本检索与任务得分 |
-| 1 | init/local 拆分、整块取整、当前 token 计数 | 边界输入、实际参与 token 数 |
-| 1 | RoPE、位置与 mask | 原版张量对照、块重排实验 |
+| 实验 | microbatch 大小、代表数量和窗口预算扫描 | 固定 token 对照、选块轨迹及任务得分 |
+| 实验 | 数值容差和准确率阈值 | 流式参考、原版 logits 和任务样本分布 |
 | 2 | direct I/O 对齐、请求聚合、队列深度 | 实际设备字节数、吞吐和尾延迟 |
 | 3 | 各缓冲区容量、线程绑定 | 重叠轨迹、内存与容量压力测试 |
-| 1 | 数值容差 | 参考路径重复性与后端误差分布 |
 | 5 | 复跑次数、准确率阈值 | 运行波动与样本得分分布 |
 
 ## 决策记录格式

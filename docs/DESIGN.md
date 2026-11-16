@@ -10,11 +10,13 @@ Linux + llama.cpp + CUDA，单请求 decode。先获取并锁定上游，提供�
 
 KV 对由 `(layer_id, kv_head_id, token_pos)` 标识；`block_id = floor(token_pos / B)`，`B` 为每块 token 数。每个 head 的块独立选择，GQA 的 query head 到 KV head 映射由模型配置确定。
 
-首版物理 I/O 单元采用单层、单 KV head、单逻辑块。交错 payload 形状为 `[B, 2, D]`，顺序为 `K0 V0 K1 V1 ...`。`D` 为 head 维度，K/V 维度相同；每个元素占 `s` 字节。
+物理 I/O 单元采用单层、单 KV head、单逻辑块。同步基线使用独立 K/V plane；交错布局的 payload 形状为 `[B, 2, D]`，顺序为 `K0 V0 K1 V1 ...`。`D` 为 head 维度，K/V 维度相同；每个元素占 `s` 字节。实现与文件头见 [同步 SSD 路径](SSD_PATH.md)。
 
 ```text
 payload_bytes = B * 2 * D * s
-slot_bytes = align_up(payload_bytes, io_alignment)
+separate_slot_bytes = 2 * align_up(B * D * s, io_alignment)
+interleaved_slot_bytes = align_up(payload_bytes, io_alignment)
+slot_bytes = selected_layout_slot_bytes
 blocks_per_head = ceil(context_capacity / B)
 slot_index = (layer_id * kv_heads + kv_head_id) * blocks_per_head + block_id
 byte_offset = data_offset + slot_index * slot_bytes
@@ -65,7 +67,7 @@ DRAM 与 VRAM 缓冲区分别管理生命周期。当前层 attention 期间，D
 
 ## 5. Prefill 与新增 KV
 
-短输入先通过原版 dense prefill 对照张量和输出。长输入采用有界 microbatch，逐批生成并写出 KV；历史 attention 按 KV tile 读取并累积 softmax，记录工作区和峰值内存。阶段 0 定位上游支持程度，阶段 1 完成该路径及 dense 数值对照。
+prefill 使用上游投影和有界 microbatch，在 CPU 上逐块读取历史 KV 并在线累计 softmax。decode 收集预算内的 FP16 K/V，接入 GGML Flash Attention。`gpu_decode=false` 提供 CPU 流式参考。固定 token 的 logits 对照入口见 [同步 SSD 路径](SSD_PATH.md)。
 
 每个 microbatch 保留历史位置和 causal mask。代表构造器消费所需 Q/K，满足窗口条件后提交块元数据。decode 在 prefill 写入、元数据和尾块版本全部完成后开始。首次 decode 使用 init/local 预取及正式 selected 选择。
 

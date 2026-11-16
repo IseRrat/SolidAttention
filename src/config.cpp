@@ -47,7 +47,7 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     const std::set<std::string> keys = {
         "schema_version", "model", "model_sha256", "additional_model_files", "prompt", "output", "context_tokens",
         "batch_tokens", "microbatch_tokens", "max_new_tokens", "threads", "gpu_layers",
-        "flash_attention", "kv_on_gpu", "ignore_eos", "sampling", "kv_dtype"
+        "flash_attention", "kv_on_gpu", "ignore_eos", "sampling", "kv_dtype", "attention", "dump_logits", "replay_token_ids"
     };
     if (!j.is_object()) {
         throw std::invalid_argument("config must be an object");
@@ -116,6 +116,53 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     result.flash_attention = j.at("flash_attention").get<bool>();
     result.kv_on_gpu = j.at("kv_on_gpu").get<bool>();
     result.ignore_eos = j.at("ignore_eos").get<bool>();
+    if (j.contains("dump_logits")) result.dump_logits = j.at("dump_logits").get<bool>();
+    if (j.contains("replay_token_ids")) {
+        const auto & ids = j.at("replay_token_ids");
+        if (!ids.is_array() || ids.size() != result.max_new_tokens - 1) throw std::invalid_argument("replay_token_ids requires max_new_tokens - 1 entries");
+        result.replay = true;
+        for (const auto & id : ids) {
+            if (!id.is_number_integer() || id.get<std::int64_t>() < 0 ||
+                id.get<std::uint64_t>() > static_cast<std::uint64_t>(std::numeric_limits<std::int32_t>::max())) {
+                throw std::invalid_argument("replay token ID must be a nonnegative int32");
+            }
+            result.replay_token_ids.push_back(id.get<std::int32_t>());
+        }
+    }
+    if (j.contains("attention")) {
+        const auto & a = j.at("attention");
+        const std::set<std::string> allowed = {"storage", "sparse", "gpu_decode", "block_tokens", "context_budget_tokens",
+            "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file"};
+        if (!a.is_object()) throw std::invalid_argument("attention must be an object");
+        for (const auto & item : a.items()) if (allowed.count(item.key()) == 0) throw std::invalid_argument("unknown attention key: " + item.key());
+        auto & target = result.attention;
+        target.enabled = true;
+        const auto storage = a.at("storage").get<std::string>();
+        if (storage != "memory" && storage != "ssd") throw std::invalid_argument("attention storage must be memory or ssd");
+        target.in_memory = storage == "memory";
+        target.sparse = a.at("sparse").get<bool>();
+        if (a.contains("gpu_decode")) target.gpu_decode = a.at("gpu_decode").get<bool>();
+        if (a.contains("block_tokens")) target.block_tokens = positive(a, "block_tokens");
+        if (a.contains("representative_count")) target.representative_count = positive(a, "representative_count");
+        if (target.representative_count > target.block_tokens) throw std::invalid_argument("representative_count exceeds block_tokens");
+        if (a.contains("write_buffer_bytes_per_layer")) target.write_buffer_bytes_per_layer = positive(a, "write_buffer_bytes_per_layer");
+        if (a.contains("context_budget_tokens")) {
+            target.context_budget_tokens = positive(a, "context_budget_tokens");
+            if (target.context_budget_tokens > result.context_tokens) throw std::invalid_argument("attention budget exceeds context_tokens");
+            if (!a.at("init_tokens").is_number_integer() || a.at("init_tokens").get<std::int64_t>() < 0 ||
+                a.at("init_tokens").get<std::uint64_t>() > target.context_budget_tokens) throw std::invalid_argument("invalid init_tokens");
+            target.init_tokens = a.at("init_tokens").get<std::uint32_t>();
+            target.local_tokens = positive(a, "local_tokens");
+            if (static_cast<std::uint64_t>(target.init_tokens) + target.local_tokens > target.context_budget_tokens) {
+                throw std::invalid_argument("init/local exceed context budget");
+            }
+        } else if (a.contains("init_tokens") || a.contains("local_tokens")) {
+            throw std::invalid_argument("explicit init/local require context_budget_tokens");
+        }
+        target.session_file = a.contains("session_file") ? resolve(base, a.at("session_file").get<std::string>()) :
+            result.output.parent_path() / "kv.cache";
+        if (a.contains("keep_session_file")) target.keep_session_file = a.at("keep_session_file").get<bool>();
+    }
     if (result.microbatch_tokens > result.batch_tokens || result.batch_tokens > result.context_tokens ||
         result.max_new_tokens > result.context_tokens) {
         throw std::invalid_argument("require microbatch <= batch <= context and max_new_tokens <= context");

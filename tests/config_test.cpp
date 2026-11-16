@@ -38,8 +38,16 @@ int main() {
         if (parsed.model != root / "weights.gguf" || parsed.batch_tokens != 128) {
             throw std::runtime_error("configuration path or numeric parsing failed");
         }
+        write(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"context_budget_tokens\":4,\"init_tokens\":1,\"local_tokens\":1}}");
+        const auto sparse = solid::RunConfig::load(config);
+        if (!sparse.attention.enabled || sparse.attention.context_budget_tokens != 4 || sparse.attention.session_file != root / "kv.cache") {
+            throw std::runtime_error("attention configuration parsing failed");
+        }
         reject(prefix + ",\"unrecognized\":true}");
         reject(prefix + ",\"threads\":8}");
+        reject(prefix + ",\"replay_token_ids\":[0]}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"context_budget_tokens\":4,\"init_tokens\":4,\"local_tokens\":1}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"unexpected\":1}}");
         auto change = [&](const std::string & from, const std::string & to) {
             auto content = prefix + "}";
             content.replace(content.find(from), from.size(), to);
