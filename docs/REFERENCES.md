@@ -1,16 +1,32 @@
-# 论文依据与复现边界
+# 论文依据
 
-主要来源：Xinrui Zheng, Dongliang Wei, Jianxiang Gao, Yixin Song, Zeyu Mi, Haibo Chen, *SolidAttention: Low-Latency SSD-based Serving on Memory-Constrained PCs*, 24th USENIX Conference on File and Storage Technologies (FAST '26), pp. 67–82. [会议页面](https://www.usenix.org/conference/fast26/presentation/zheng) · [论文 PDF](https://www.usenix.org/system/files/fast26-zheng.pdf)。本设计根据用户提供的 17 页论文核对。
+Xinrui Zheng, Dongliang Wei, Jianxiang Gao, Yixin Song, Zeyu Mi, Haibo Chen. *SolidAttention: Low-Latency SSD-based Serving on Memory-Constrained PCs*. FAST '26, pp. 67-82。[会议页面](https://www.usenix.org/conference/fast26/presentation/zheng) · [论文 PDF](https://www.usenix.org/system/files/fast26-zheng.pdf)。
 
-| 论文位置 | 已确认的内容 | 在本项目中的处理 |
+## 机制与实现参数
+
+| 论文位置 | 内容 | 项目对应 |
 | --- | --- | --- |
-| §3.1、图 3–4 | SSD 保存完整 KV；init/local/selected 三类块；代表向量与 Q 相似度选 top-k | 先实现确定性选择及块身份映射 |
-| §4、图 7–8 | token 级 K/V 交错使传输单元增大，不增加块内 token 数；K/V 投影权重可离线合并 | 先做布局与访问，再适配融合投影 |
-| §5、图 9–10 | 每层上一轮选择历史预测 selected 块；正式选择后补读遗漏块并覆盖无用预取槽 | 纠错是正确性条件，预取只影响性能 |
-| §6、图 11、算法 1 | 微任务 DAG、关键路径优先、同步点复用，需防止并行 I/O 覆盖仍在使用的数据 | 以缓冲区状态机和事件依赖实现 |
-| §7 | llama.cpp + liburing；实验设块大小 32 token；短于 4k 的预算为输入长度 25%，否则 1k；init/local 合占预算一半 | 参数作为论文复现配置，不写死为通用最优值 |
-| §8 | CUDA 与 SYCL、多个模型、速度/内存/准确率/消融评测 | 先做 CUDA，随后评估其他后端 |
+| §3.1，图 3-4 | 完整 KV 存于 SSD；init/local/selected；Q 与块代表相关度选 top-k | 逻辑块、代表构造、选择器 |
+| §3.2，图 5 | 单层 SSD/DRAM/VRAM 数据流及跨层预取 | 缓冲区生命周期与事件轨迹 |
+| §4，图 7-8 | token 级 K/V 交错、投影权重合并、strided attention 访问 | 布局及融合投影 |
+| §5，图 9-10 | 同层上一轮选择预测 selected，补读遗漏并覆盖误预取槽位 | 历史预取和纠错 |
+| §6，图 11、算法 1 | 微任务 DAG、关键路径和 LST 优先级、同步复用 | 调度器 |
+| §7 | llama.cpp + liburing；I/O 与协调各使用一个专用 CPU 核；每层 32 KiB 写缓冲 | 上游适配、线程绑定、聚合回写 |
+| §7 | 块大小 32；输入短于 4k 的预算为 25%，其余 1k；init/local 合占一半 | 预算配置 |
+| §8.1-8.2 | INT4 权重、FP16 KV、batch=1、最大输出 512；端到端实验 DRAM 限额 16 GB | 性能配置 |
+| §8.2，图 14 | 单层预算内 KV 缓冲，常驻代表向量；约 62× KV 内存下降 | 内存分项 |
+| §8.3，表 1 | OpenCompass，通用任务与 LongBench 准确率 | 质量评测 |
+| §8.4-8.6 | 预取、布局、调度、预算、块大小与干扰实验 | TEST_PLAN 实验矩阵 |
 
-**待核实的实现细节**：论文 §3.1 指出代表向量沿用 InfLLM，但并未给出足以直接重写全部边界条件的伪代码；模型适配时应核对其引用实现、RoPE 与分组注意力语义。论文的具体模型版本、量化配置、I/O 队列设置和设备性能也应在实验前锁定。设计文档中的接口和状态机是我们的工程方案，不能当作论文作者的原始代码。
+CUDA 参照环境：Ultra 9 185H、RTX 4070 Laptop 8 GB、Linux 6.8、CUDA 12.8。SYCL 参照环境：Ultra 7 255H、Arc 140T、Linux 6.11、oneAPI 2025.0。两台机器均为 64 GB DDR5、Samsung 990 PRO 1 TB。
 
-辅助一手来源：Chaojun Xiao 等，*InfLLM: Training-Free Long-Context Extrapolation for LLMs with an Efficient Context Memory*，[论文 PDF](https://arxiv.org/pdf/2402.04617)，§3.2 给出 representative score、每块多个代表 token 与查询相关度的计算。SolidAttention 引用其代表选择思想，但没有在正文中规定本项目所需的全部参数；不能直接把 InfLLM 的默认参数当作 SolidAttention 的实验配置。
+## 适配时锁定的参数
+
+上游提交、GGUF 的具体 INT4 格式、模型 revision、代表数量、init/local 拆分、head 聚合、RoPE、I/O 对齐和队列深度，集中记录在 [实施决策](DECISIONS.md)。
+
+## 辅助来源
+
+- Chaojun Xiao 等，*InfLLM: Training-Free Long-Context Extrapolation for LLMs with an Efficient Context Memory*，[论文](https://arxiv.org/pdf/2402.04617)。§3.2 用于代表评分、代表 token 和块相关度计算。
+- [llama.cpp](https://github.com/ggml-org/llama.cpp)：模型执行、KV 管理、计算图及 CUDA/SYCL 后端；[构建文档](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)。
+- [liburing](https://github.com/axboe/liburing)：异步 SSD I/O。
+- [fio](https://github.com/axboe/fio)：SSD 微基准和干扰负载。

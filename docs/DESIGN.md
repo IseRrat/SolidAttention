@@ -1,93 +1,135 @@
-# SolidAttention-Lab 详细设计（v0.2）
+# 系统设计
 
-## 1. 目标、边界与基线
+## 1. 执行路线
 
-本项目先复现 FAST '26 SolidAttention 的关键因果链：**完整 KV 留在 SSD → 动态选块 → K/V 交错提高 I/O 粒度 → 历史选择预取 → 依赖感知调度减少阻塞**。目标是检验这些机制在受限内存 PC 上的延迟、内存与准确率权衡；现阶段不是论文代码的移植或性能承诺。论文依据见 [REFERENCES](REFERENCES.md)。
+Linux + llama.cpp + CUDA，单请求 decode。先获取并锁定上游，运行全内存参考，定位 KV 管理和计算图接口，再依次实现同步 SSD、动态选块、交错布局、预取和调度。操作步骤见 [开始复现](START_HERE.md)，阶段验收见 [实施计划](ROADMAP.md)。
 
-第一实现目标为 Linux、llama.cpp、CUDA、单请求 decode。基线包括全内存推理、朴素全量 SSD offload、同步稀疏 SSD 路径。所有比较必须固定模型权重、量化、输入、生成参数和可见上下文。模型与 llama.cpp 版本在阶段 0 锁定，避免先写适配层后才发现 KV 形状或执行接口变化。
+模型权重使用 INT4，KV 使用 FP16。实验固定权重、输入、生成参数和可见历史；稀疏路径额外固定选择器与上下文预算。
 
-## 2. 术语与数据模型
+## 2. 逻辑块与磁盘布局
 
-- `layer_id`、`kv_head_id`、`token_pos` 唯一标识一个 KV 对；使用 KV head 而非 query head，兼容 GQA/MQA。
-- `block_id = floor(token_pos / block_tokens)`，块身份固定，不以缓存槽号充当身份。最后一个块可不满；有效 token 数与每个 token 的绝对位置单独记录。
-- 每个 token 的 K 和 V 维度、数据类型、量化比例、RoPE 阶段以及 head 映射必须与所选推理后端一致。K/V 在 SSD 和内存中始终成对移动。
-- `BlockMeta` 至少含 `(layer, kv_head, block_id, first_pos, valid_tokens, byte_offset, bytes, format_version, state)`；偏移和长度做溢出与边界检查。元数据驻留内存，完整 KV 内容驻留 SSD；init/local 的热块副本允许进入有限缓冲区。
-- `BlockSelection` 是本轮**实际**要参与注意力的逻辑块集合；`Prediction` 仅是预取提示，不得改变实际选择结果。
+KV 对由 `(layer_id, kv_head_id, token_pos)` 标识；`block_id = floor(token_pos / B)`，`B` 为每块 token 数。每个 head 的块独立选择，GQA 的 query head 到 KV head 映射由模型配置确定。
 
-磁盘布局拟按 layer/head/block 连续分配，每块有版本化头部与对齐的 payload。真正的 I/O 对齐由 SSD、文件系统与 liburing 设置确定，不能把论文实验中的 32 token 误作字节对齐要求。阶段 1 先实现普通文件 I/O 与正确性，再评估 direct I/O、队列深度和写缓冲。断电恢复、跨进程共享和持久化模型缓存不列入首版目标；每次会话从已知状态初始化 KV 文件。
+首版物理 I/O 单元采用单层、单 KV head、单逻辑块。交错 payload 形状为 `[B, 2, D]`，顺序为 `K0 V0 K1 V1 ...`。`D` 为 head 维度，K/V 维度相同；每个元素占 `s` 字节。
 
-## 3. 动态稀疏注意力
+```text
+payload_bytes = B * 2 * D * s
+slot_bytes = align_up(payload_bytes, io_alignment)
+blocks_per_head = ceil(context_capacity / B)
+slot_index = (layer_id * kv_heads + kv_head_id) * blocks_per_head + block_id
+byte_offset = data_offset + slot_index * slot_bytes
+```
 
-对每个 layer 和 KV head，维护固定的 init 区、最新的 local 窗口，以及从其余历史块中选出的 selected 集合。由代表向量与当前 Q 的相似度选 top-k，合并三类集合后去重，且只允许位置早于或等于当前 decode 位置的有效 token 参与注意力。预算按**token 数**核算，边界块实际有效长度也计入；窗口交叠不得双算。长上下文论文配置：32 token/块、≥4k 时上下文预算 1k token，init/local 合占一半，selected 占一半；短于 4k 时预算为输入长度的 25%。这是评测配置，实际 `k`、窗口及不足整块时的取整策略须在实验配置中显式记录。
+会话文件头记录布局版本、模型 KV 形状、dtype、容量和对齐；固定槽位只存 payload 与 padding。内存块表记录有效 token 数、绝对位置、版本与读写状态。尾块按完整槽位存储，attention 按有效长度访问。
 
-代表向量的计算需要与论文所引用的 InfLLM 方案及适配模型保持一致。实现前先做独立选择器与全内存参考比较，检查打分方向、top-k 并列、NaN/Inf、head 分组、RoPE、位置掩码和块更新。论文中“动态稀疏”不等于永久丢弃未选块：未选中的历史 KV 继续保存在 SSD，以供未来重新选择。
+示例：`B=32, D=128, s=2` 时，独立 K/V 各为 8 KiB，交错请求为 16 KiB。多个 head 的聚合读取作为布局扫描项，同时测量请求数量、读放大和吞吐。跨 head 聚合需要连续地址与相应选择集合。
 
-### 3.1 代表向量的可实施路线
+同步版本使用普通文件 I/O。性能版本比较 buffered I/O 和 direct I/O；direct I/O 对齐参数从目标设备与文件系统获取，应用到文件偏移、长度和缓冲区地址。所有结果记录请求字节与设备实际读取字节。
 
-InfLLM 原文 §3.2 的做法是在每个 memory unit 中，根据 token 的 K 与后续 local 窗口 Q 的平均点积计算代表分数，选分数最高的若干 token；查询时以当前 Q 与这些代表 K 的点积汇总得到 unit 相关度。SolidAttention §3.1 说沿用 InfLLM 提取代表向量，但并未规定适用于本项目的代表 token 数、头间共享或所有位置编码边界。因此先写一个可替换的 `RepresentativeBuilder`，以 InfLLM 公式为第一候选；保存每块代表 K 与构造时的绝对位置。`rank_blocks` 按每个 query head 映射到 KV head 后打分，合并 head 选择的规则须作为明确配置，不可默默任选一种。先用全内存实现与逐 token 全注意力对照，再与论文所述选块召回实验对照，冻结参数后才接入 SSD。若模型的 RoPE 处理与 InfLLM 的位置重映射不相容，必须记录适配方案及准确率差异，不宣称是逐字复现。
+## 3. 内存预算与缓冲区
 
-### 3.2 Prefill 到 decode
+decode 按单层工作集复用 DRAM 和 VRAM 缓冲区。设 `C` 为该层预算内 token 数，`Hkv` 为 KV head 数：
 
-prefill 不应套用“上一轮 decode 选择”逻辑。prefill 产生每层每个 KV head 的全部 K/V，按固定块号连续写入会话 SSD 文件，并同步生成代表元数据；只有确认文件、元数据和最后尾块一致后，decode 才可开始。首个 decode token 没有选择历史，使用 init/local 预取加正式 selected 选择。decode 新 token 的 KV 先对当前注意力可见，再按块追加或更新到 SSD；部分块的更新不能覆盖仍被读取的旧版本。会话结束时清理临时文件，任何写失败使后续读取该块失败而不是回退到旧内容。
+```text
+layer_kv_bytes = C * Hkv * 2 * D * s
+write_buffer_bytes = layers * 32 KiB
+representative_bytes = layers * Hkv * blocks_per_head * representative_count * D * s
+```
 
-## 4. KV consolidator 与数据布局
+物理分配还包含整块取整和 I/O padding。各 head 的选择预算独立计算，显存容量按全部 head 的槽位总和检查。
 
-基本 payload 顺序定义为每个 token 的 `K, V` 交错：`K0 V0 K1 V1 ...`，而非先存整块 K 再存整块 V。这样同一 token 的 K/V 一次顺序读取即可获取。论文指出交错可增大传输单元并减少操作数，**不靠扩大 token 块来换带宽**；增大块内 token 数可能损害检索准确率。
+容量示例：32 层、8 个 KV head、head 维度 128、FP16、131072 token、32 token/块、每块 1 个代表时，代表向量占 256 MiB；1024 token 的单层 KV 工作集占 4 MiB。块表和对齐开销另计。
 
-首版在 CPU 侧以明确的 encode/decode 实现布局，验证每种 dtype 的字节顺序、padding、对齐和 round-trip。之后在模型初始化时研究合并 K/V 投影权重，使输出直接形成交错布局；attention kernel 通过 stride/view 读出 K 与 V，避免每步重排。融合投影须与原投影逐元素对照；如后端不支持等价视图，先保留可靠的显式转换并单独测量其成本。
+| 区域 | 容量与用途 | 释放或复用条件 |
+| --- | --- | --- |
+| DRAM 读缓冲区 | 一层选中 KV，承接 SSD 读取和 H2D | 对应 H2D 完成且主机读者释放 |
+| VRAM attention 缓冲区 | 一层选中 KV 和当前 token KV | 当前 attention 完成 |
+| DRAM 写缓冲区 | 每层 32 KiB，聚合新增 KV | SSD 写入完成 |
+| 传输暂存区 | 固定容量，容纳 D2H 及尾块更新 | 消费该数据的写入完成 |
+| 元数据和代表向量 | 按层、head、块常驻 | 会话结束 |
+| 模型与计算工作区 | 由后端分配 | 按后端生命周期管理 |
 
-## 5. 预取与纠错
+DRAM 与 VRAM 缓冲区分别管理生命周期。当前层 attention 期间，DRAM 可在 H2D 完成后装入下一层 KV；下一层 H2D 等待 VRAM attention 缓冲区释放。首版将 init/local 计入同一层预算，随层切换装载。
 
-每层保存上一 decode 轮的 selected 块 ID。下一轮在正式 Q 可用前，确定性预取 init/local 块，并按该层历史列表预取 selected 块。冷启动时没有历史，只预取确定性块。历史记录应在**正式选择完成后**更新，而不是在预测发出时更新。
+实验分别记录以上分项、进程内存、页缓存和设备显存峰值。额外暂存区以配置限制容量，容量耗尽时暂停提交并等待消费完成。
 
-正式选择后求 `missing = actual − resident` 与 `unused = predicted − actual`。为 missing 发读请求；可优先占用 unused 的槽位，但必须等该槽位的异步写入结束且没有任何 GPU/CPU 读者，再将新块写入。有效预取槽位不搬迁；用 `logical_block_id → physical_slot` 映射供 attention 访问。论文的“无需重排”依赖 K/V 成对且位置语义正确，不能据此省略位置、mask 或槽位映射。仅当全部实际块就绪、对应事件完成后才启动 attention。预取失败可退回同步 miss load；真正的 SSD 读取失败应显式报错，不能静默使用旧数据。
+## 4. 动态稀疏选择
 
-建议槽位状态：`FREE → LOADING → READY → PINNED → READY/FREE`，回写可另设 `DIRTY/WRITING`。每次复用槽位递增 generation；完成事件同时核对 `(slot, generation, block_id)`，丢弃迟到的旧 I/O 完成通知。`PINNED` 或 `LOADING` 槽不得覆盖。容量不足时先停止额外预测，保留实际选择所需空间；如果实际集合仍无法容纳，配置报错或使用分批注意力的明确路径，不能越界。
+每层维护 init、local 和 selected 集合。init 覆盖初始窗口，local 覆盖最新窗口，其余历史块按当前 Q 与代表 K 的相关度选 top-k。合并后按逻辑身份去重，保留绝对位置和有效长度。
 
-## 6. SSD-aware 调度
+论文预算：输入长度短于 4k 时取 25%，其余取 1k；init/local 合占一半，selected 占一半，块大小 32。输入长度在请求开始时确定，整个 decode 使用该预算。init/local 的拆分、整块取整和当前 token 的预算归属在阶段 1 锁定，纳入边界测试。
 
-以任务 DAG 而非固定函数调用顺序定义每层 decode。主要节点：`q_proj`、`kv_proj`、`select`、`prefetch`、`miss_load`、`attention`、`store_new_kv`、`ffn`。约束包括：`q_proj → select → miss_load → attention`；`kv_proj → attention` 且新 KV 必须可见；`attention` 完成才可释放其 pin；新 KV 写入 SSD 前须完成生产者事件；下一层预取可在当前层计算期间提前发起。具体边在 llama.cpp 集成后以事件轨迹验证。
+`RepresentativeBuilder` 按 InfLLM §3.2 构造代表 K，记录代表 token 的位置和构造窗口。选择器配置包括代表数量、分数聚合、query head 到 KV head 的聚合、并列排序和 NaN/Inf 处理。构造器与查询端共用同一套 RoPE 和位置规则。
 
-先实现串行参考调度，再加异步 I/O。就绪任务按关键路径优先；相同优先级可参考最晚开始时间；非关键 I/O 尽早发出以覆盖计算窗口。同步点复用只在合并的事件确实覆盖所有先决条件时成立，不能为了减少同步而提前释放 buffer。必须区分 GPU 事件完成、主机复制完成、SSD I/O 完成和数据对 attention 可见。回写与预取可共享合适的同步点，但回写失败必须保留错误状态并阻止后续依赖读取。
+代表向量在块离开 local 窗口并具备评分所需 Q 后定稿；定稿前保留所需 K/Q 工作集，计入内存预算。prefill 尾部和 decode 新块使用同一状态转换。历史块完整保存在 SSD，供后续轮次选择。
 
-## 7. 接口草案与模块边界
+## 5. Prefill 与新增 KV
+
+短输入先通过原版 dense prefill 对照张量和输出。长输入采用有界 microbatch，逐批生成并写出 KV；历史 attention 按 KV tile 读取并累积 softmax，记录工作区和峰值内存。阶段 0 定位上游支持程度，阶段 1 完成该路径及 dense 数值对照。
+
+每个 microbatch 保留历史位置和 causal mask。代表构造器消费所需 Q/K，满足窗口条件后提交块元数据。decode 在 prefill 写入、元数据和尾块版本全部完成后开始。首次 decode 使用 init/local 预取及正式 selected 选择。
+
+decode 当前 token 的 KV 先进入 attention 工作集，再进入每层写缓冲区。写缓冲区按 32 KiB 聚合，满载或会话结束时写出；部分尾块按版本更新。读取通过块表定位最新版本：已提交版本从 SSD 读取，待提交版本从写缓冲区转发。缓冲区持有至写入完成；写失败使会话进入错误状态。
+
+## 6. KV consolidator
+
+首先实现 CPU encode/decode，验证交错布局与独立 K/V 布局的字节和 attention 输出。随后在模型加载阶段合并 K/V 投影权重，用一次投影生成交错输出，K 经过相应 RoPE 处理。
+
+attention 通过 stride/view 访问 K/V。适配时检查量化行边界、GQA head 映射和后端连续性要求；转换开销单独计时。布局消融固定 token 块大小、选择集合和 KV 精度，比较读请求数、传输字节、H2D 延迟及 attention 延迟。
+
+## 7. 历史预取与槽位管理
+
+每层保存上一 decode 轮的正式 selected 集合。下一轮在当前层 Q 就绪前发出 init/local 和历史 selected 读取。正式选择完成后更新历史。
+
+```text
+missing = actual - ready_resident
+unused = predicted - actual
+```
+
+`ready_resident` 以 layer、head、block、版本和传输完成状态匹配。在途的实际所需块继续等待；其余 missing 块发起补读，优先使用已释放的 unused 槽位。有效槽位保持原位，attention 使用逻辑块到物理槽位映射。
+
+槽位状态为 `FREE → LOADING → READY → PINNED → READY/FREE`。复用条件是旧 I/O 已完成或取消已确认、GPU/CPU 读者均已释放。每次租用递增 generation，完成通知核对 `(slot, generation, block_id, version)`；过期通知直接丢弃。
+
+取消请求提交后，槽位保持占用直至原操作完成或确认取消。generation 用于通知归属校验；物理写入完成状态控制缓冲区释放。预测数量按剩余容量裁剪，实际集合容量在提交前检查。
+
+## 8. SSD-aware 调度
+
+微任务包括 Q 投影、KV 投影、选择、SSD 读取、H2D、attention、D2H、SSD 回写和 FFN。每条任务依赖使用完成事件表达：
+
+```text
+q_proj → select → reconcile → missing_ssd_read → missing_h2d → attention
+prefetch_ssd_read → prefetch_h2d → attention
+kv_proj → rope_and_current_kv → attention
+kv_proj → d2h → write_buffer → ssd_store
+attention → ffn → next_layer_q_proj
+```
+
+H2D 还依赖目标 VRAM 槽释放；SSD 读取依赖目标 DRAM 槽释放；回写与后续读取通过块版本连接。就绪任务按关键路径优先，再按最晚开始时间排序；非关键 I/O 尽早提交。重点实现 missing load 与 KV projection 重叠、下一层读取与当前层 attention 重叠。
+
+同步复用分别比较 `naive`、`overlap`、`overlap+sync_reuse`。共享同步点覆盖所合并任务的全部前置事件。轨迹分别记录 SSD 完成、主机复制完成、GPU 事件完成及槽位释放。
+
+## 9. 模块接口
 
 ```text
 SelectionResult select(Query q, LayerHead lh, Position p, Budget b)
 PrefetchPlan predict(LayerHead lh, Position p, History h, Budget b)
-IoTicket read_block(BlockId id, SlotLease lease)
-IoTicket write_block(BlockId id, BufferLease source)
+IoTicket read_block(BlockId id, Version v, SlotLease lease)
+IoTicket write_block(BlockId id, Version v, BufferLease source)
 CorrectionPlan reconcile(PrefetchPlan predicted, SelectionResult actual, SlotTable slots)
 Event schedule(TaskDag dag, Resources resources)
 ```
 
-`SelectionResult` 保留每个块的 token 位置和有效长度；`SlotLease` 和 `BufferLease` 持有到事件完成。I/O 层不决定注意力选择，选择器不直接操作 SSD，调度器负责跨层事件依赖。所有异步接口返回可观察的完成或失败，日志记录 layer、轮次、块、槽位、generation 和阶段耗时，便于重放错误轨迹。
+选择器输出逻辑块、位置和有效长度，I/O 层负责版本化读写，调度器持有 lease 并管理事件。错误包含会话、轮次、layer、head、block、slot、generation 和操作类型。
 
-## 8. 正确性不变量与失败处理
+## 10. 配置
 
-1. 任何参与 attention 的逻辑块都有匹配的、已完成加载的物理槽位；K/V、位置与 mask 对应同一 token。
-2. 在途 I/O 不得修改仍被 GPU 或主机读取的缓冲区；槽位复用必须通过 generation 校验。
-3. 预取结果只影响等待时间和槽位安排，不改变实际选择集合或输出数值。
-4. 新生成的 KV 在标记 SSD 版本可读前已完成写入；读写错误可定位、可传播，不使用部分块。
-5. 预算、文件偏移、块长度、头数和 dtype 都经过边界检查；最后一块 padding 不进入注意力。
+| 配置组 | 字段 |
+| --- | --- |
+| 上游与模型 | 主仓库提交、上游基点、适配提交、模型 revision、GGUF 哈希、量化格式 |
+| 后端 | CUDA/驱动、GPU 层数、Flash Attention、KV dtype、RoPE 配置 |
+| 选择 | block_tokens、context_budget_tokens、init/local/selected_tokens、representative_count、head 聚合、取整规则 |
+| 内存 | DRAM 限额、VRAM 预算、各缓冲区容量、prefill microbatch/tile 大小 |
+| I/O | SSD 目录、模式、对齐、队列深度、线程绑定、写缓冲区大小 |
+| 测量 | 输入哈希、种子、采样、输出上限、缓存状态、重复次数 |
 
-故障注入覆盖短读、读失败、写失败、取消、乱序完成、预取全错、槽位不足和模型中断。实验结果记录失败与退化行为，不把异常路径混入正常性能统计。
-
-## 9. 评测与创新决策
-
-测量 token/s、端到端逐 token 平均/P50/P99 延迟、I/O 阻塞、读取字节、请求数、命中率、SSD 带宽、回写量、峰值 DRAM/VRAM、以及长上下文任务准确率。先依次打开交错、预取和调度，保持其他变量一致；再扫描块大小、预算、上下文长度和 I/O 干扰。论文最高 3.1×/98% 是参照数字，不作为首版验收硬指标。创新方向由复现后的瓶颈数据选择，明确区别于论文原机制，见 [ROADMAP](ROADMAP.md) 与 [TEST_PLAN](TEST_PLAN.md)。
-
-## 10. 配置与第一条实施路径
-
-配置文件至少需要 `model_path`、模型/权重哈希、llama.cpp commit、backend、`block_tokens`、`context_budget_tokens`、`init_tokens`、`local_tokens`、`selected_tokens`、`representative_count`、选择规则、SSD 文件目录、I/O 模式和队列深度。启动时检查预算之和、块大小、模型 KV 形状和缓冲区容量。所有结果输出同一份完整配置，避免参数写在源代码里无法复查。
-
-实际开发顺序：
-
-1. 锁定 llama.cpp 版本，画出 prefill/decode 的 KV 生产、写入和 attention 消费点；记录所选模型的层数、query/KV head、head 维度、dtype、RoPE 与 mask 规则。
-2. 写纯内存的布局编码器、选择器和代表构造器；通过确定性小张量测试和全注意力参考。
-3. 接入单会话 SSD 文件，先同步读写与无稀疏全量加载，再启用稀疏选块；在每步记录逻辑块、物理槽及实际参与 token。
-4. 验证交错布局与原布局数值一致，单独测 I/O 粒度、请求数和转换成本。
-5. 启用历史预取和纠错，先在受控延迟的模拟 I/O 下覆盖全错、乱序与容量边界，再接 liburing。
-6. 最后接异步调度；逐条解除串行屏障，每解除一条就跑数据依赖与故障注入测试。
-
-每一步的失败回退路径和验收项见 [测试计划](TEST_PLAN.md)。代码目录与具体 CMake 目标在选定 llama.cpp 版本后固定，避免此文档虚构上游接口。所有未决选择集中记录在 [DECISIONS](DECISIONS.md)，作出决定时附证据和影响范围。
+启动时校验模型形状、预算、文件容量、偏移和缓冲区容量。每次实验保存完整配置、命令、日志和原始逐 token 轨迹。
