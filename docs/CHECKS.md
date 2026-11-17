@@ -148,3 +148,9 @@ CUDA 编译与链接、37 项 CTest、59 项 Linux Python 检查及源码指纹�
 CUDA 编译与链接、37 项 CTest、60 项 Linux Python 检查及源码指纹通过。核心库 10 项 CTest 的地址、泄漏和未定义行为检查通过。
 
 核查跨 head selected 提交、两种布局、有限队列、正式请求提升、同级 FIFO、读取未结束时上传、第二次上传失败后的源租约回收，以及聚合任务的三路依赖汇合。三组实际 CPU GGML 图及独立轨迹核查通过。详细入口见 [块读取流水](implementation/BLOCK_READ_PIPELINE.md)。
+
+## 2026-11-18：历史块事件 DAG 与资源分派
+
+CUDA 编译与链接、38 项 CTest、61 项 Linux Python 检查及源码指纹通过。核心库 11 项 CTest 的地址、泄漏和未定义行为检查通过。
+
+容量 1 的实际提交偏移核对关键路径/LST 对顺序的影响；覆盖两段 K/V、复制票据、空历史、上传和读取交错失败及回收。三组 CPU GGML 图、内存/线程化 liburing 的两级轨迹与指标独立重算。离线核查拒绝取消 ACK、复制提交、缺失汇合及错位父层帧。完成记录见 [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md)。

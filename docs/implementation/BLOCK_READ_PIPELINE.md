@@ -40,7 +40,7 @@
 
 回调异常先释放临时 pin。已启动的复制继续持有各自源租约，由正常 finish 或异常 quiesce 排空。尾块版本更新仍先确认旧 producer，再保留不可变前缀并补齐新行。
 
-overlap 聚合 DAG 中，`history_h2d` 依赖正式选择，可与 `miss_read_and_reconcile` 重叠；`append_current_kv` 等待 KV 下载、纠错读取与历史 H2D 三路完成。naive 保留串行依赖。当前 DAG 继续记录每层 12 项聚合任务；块级成本、资源就绪队列及 LST 分派按 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md) 继续扩展。
+overlap 聚合 DAG 中，`history_h2d` 依赖正式选择，可与 `miss_read_and_reconcile` 重叠；`append_current_kv` 等待 KV 下载、纠错读取与历史 H2D 三路完成。naive 保留串行依赖。层级 DAG 继续记录每层 12 项聚合任务；2026-11-18 已加入 [历史工作集的块级成本、资源就绪及 LST 分派](BLOCK_EVENT_SCHEDULER.md)。预测期与跨层任务按 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md) 继续扩展。
 
 ## 4. 检查证据
 

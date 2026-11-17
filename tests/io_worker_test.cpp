@@ -173,6 +173,22 @@ void priority_progress() {
       require(control->submissions==std::vector<std::uint64_t>{1,3,4,5,2},"pending promotion or equal-priority FIFO failed"); }
     for (int n=0;n<5;++n) require(bytes[n]==n+1,"priority changed destination identity");
 }
+void scheduled_progress() {
+    auto control=std::make_shared<Control>(); control->engine_capacity=1;
+    auto io=solid::make_io_worker([control] { return std::make_unique<Reader>(control); },5); Release release{control};
+    std::array<unsigned char,5> bytes{};
+    require(io->submit(1,0,&bytes[0],1,0),"schedule gate submit");
+    require(control->wait([&] { return control->submissions.size()==1; }),"schedule gate did not enter kernel");
+    using P=solid::ReadPriority;
+    require(io->submit_scheduled(2,0,&bytes[1],1,0,{P::correction_selected,false,10}) &&
+            io->submit_scheduled(3,0,&bytes[2],1,0,{P::correction_deterministic,true,5}) &&
+            io->submit_scheduled(4,0,&bytes[3],1,0,{P::correction_selected,true,2}) &&
+            io->submit_scheduled(5,0,&bytes[4],1,0,{P::correction_selected,true,2}),"scheduled queue admission");
+    control->release(); solid::ReadCompletion result{};
+    for (int n=0;n<5;++n) require(io->poll(result,true),"scheduled completion lost");
+    { std::lock_guard<std::mutex> lock(control->mutex);
+      require(control->submissions==std::vector<std::uint64_t>{1,4,5,3,2},"I/O owner ignored critical/LST/FIFO keys"); }
+}
 void placement() {
     const auto original=solid::thread_cpus(); require(!original.empty(),"missing test CPU affinity");
     {
@@ -200,7 +216,7 @@ void placement() {
 } // namespace
 int main() {
 #ifdef __linux__
-    try { cancellation_and_drain(); backlog_progress(); priority_progress(); failures(); placement(); std::cout<<"I/O ownership, cancellation, drain and placement passed\n"; return 0; }
+    try { cancellation_and_drain(); backlog_progress(); priority_progress(); scheduled_progress(); failures(); placement(); std::cout<<"I/O ownership, cancellation, drain and placement passed\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 #else
     std::cout<<"Linux I/O worker checks\n"; return 77;

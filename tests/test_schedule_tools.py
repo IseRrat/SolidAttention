@@ -34,6 +34,19 @@ def jsonlines(path, rows):
     path.write_text("".join(json.dumps(row) + "\n" for row in rows), encoding="utf-8")
 
 
+def block_trace(mode):
+    if mode == "naive": return []
+    specs = [("block_read_h0_b1_v2", "ssd", []), ("block_h2d_h0_b1_v2", "h2d", [0]),
+             ("historical_blocks_ready", "host", [1])]
+    rows = [dict(event="define", frame=1, task=i, layer=0, position=3, mode=mode, name=name,
+                 resource=resource, predecessors=deps, estimate_ns=1, origin_ns=0, clock="steady_clock_ns")
+            for i, (name, resource, deps) in enumerate(specs)]
+    for i, proof in enumerate(("original_read_complete", "copy_ticket_complete", "all_block_copies_complete")):
+        rows.extend([dict(event="start", frame=1, task=i, timestamp_ns=2*i, fence=""),
+                     dict(event="complete", frame=1, task=i, timestamp_ns=2*i+1, fence=proof)])
+    return rows
+
+
 class ScheduleToolsTests(unittest.TestCase):
     def fixture(self, root):
         helper = fixtures.PrefetchToolsTests()
@@ -55,10 +68,14 @@ class ScheduleToolsTests(unittest.TestCase):
             value["selection_replay_sha256"] = manifest["selection_sha256"]
             jsonlines(folder / "schedule.jsonl", trace(variant["mode"]))
             audit = scheduling.audit_schedule(folder / "schedule.jsonl", variant["mode"])
-            metrics = {({"critical_path_ns": "observed_critical_path_sum_ms", "miss_projection_overlap_ns": "miss_projection_overlap_sum_ms"}.get(key, key)):
+            jsonlines(folder/"schedule.blocks.jsonl",block_trace(variant["mode"]))
+            audit.update(scheduling.audit_block_schedule(folder/"schedule.blocks.jsonl",variant["mode"]))
+            metrics = {({"critical_path_ns": "observed_critical_path_sum_ms", "miss_projection_overlap_ns": "miss_projection_overlap_sum_ms",
+                         "block_critical_path_ns": "block_observed_critical_path_sum_ms"}.get(key, key)):
                        value / 1e6 if key.endswith("_ns") else value for key, value in audit.items()}
             value["schedule"] = dict(metrics, mode=variant["mode"], trace_enabled=True)
             value["schedule_trace_sha256"] = digest(folder / "schedule.jsonl")
+            value["block_schedule_trace_sha256"] = digest(folder/"schedule.blocks.jsonl")
             write(folder / "result.json", value)
             helper.manifest(folder)
             run = json.loads((folder / "manifest.json").read_text())
@@ -125,6 +142,36 @@ class ScheduleToolsTests(unittest.TestCase):
             wrong[7]["predecessors"] = [4, 6]
             jsonlines(path, wrong)
             with self.assertRaises(ValueError): scheduling.audit_schedule(path, "overlap")
+
+    def test_block_audit_requires_read_copy_and_complete_join(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary)/"schedule.blocks.jsonl"
+            good = block_trace("overlap")
+            jsonlines(path,good)
+            self.assertEqual(scheduling.audit_block_schedule(path,"overlap"),
+                             dict(block_frames=1,block_tasks=3,block_critical_path_ns=3))
+            mutations=[]
+            wrong=copy.deepcopy(good); wrong[1]["predecessors"]=[]; mutations.append(wrong)
+            wrong=copy.deepcopy(good); wrong[2]["predecessors"]=[]; mutations.append(wrong)
+            wrong=copy.deepcopy(good); wrong[4]["fence"]="cancel_ack"; mutations.append(wrong)
+            wrong=copy.deepcopy(good); wrong[6]["fence"]="copy_submitted"; mutations.append(wrong)
+            wrong=copy.deepcopy(good); wrong[1]["name"]="block_h2d_h0_b2_v2"; mutations.append(wrong)
+            wrong=copy.deepcopy(good); wrong[0]["resource"]="gpu"; mutations.append(wrong)
+            mutations.append(good[:-1])
+            for rows in mutations:
+                jsonlines(path,rows)
+                with self.assertRaises(ValueError): scheduling.audit_block_schedule(path,"overlap")
+            parent=Path(temporary)/"schedule.jsonl"
+            jsonlines(parent,trace("overlap"))
+            jsonlines(path,good)
+            self.assertEqual(scheduling.audit_block_schedule(path,"overlap",parent)["block_frames"],1)
+            changed=copy.deepcopy(good)
+            for row in changed:
+                if row["event"]=="define": row["position"]+=1
+            for rows in ([],changed):
+                jsonlines(path,rows)
+                with self.assertRaisesRegex(ValueError,"block frames differ"):
+                    scheduling.audit_block_schedule(path,"overlap",parent)
 
     def test_deferred_pin_keeps_copy_and_attention_lifetimes_separate(self):
         with tempfile.TemporaryDirectory() as temporary:

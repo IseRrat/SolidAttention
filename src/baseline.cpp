@@ -431,6 +431,8 @@ int main(int argc, char ** argv) {
                 result["schedule"] = {
                     {"mode", config.attention.schedule}, {"trace_enabled", config.attention.schedule_trace},
                     {"frames", schedule.frames}, {"tasks", schedule.tasks}, {"worker_jobs", schedule.worker_jobs},
+                    {"block_frames",schedule.block_frames},{"block_tasks",schedule.block_tasks},
+                    {"block_observed_critical_path_sum_ms",schedule.block_critical_path_ns/1e6},
                     {"coordinator_cpu",schedule.coordinator_cpu},
                     {"observed_critical_path_sum_ms", schedule.critical_path_ns / 1e6},
                     {"miss_projection_overlap_sum_ms", schedule.miss_projection_overlap_ns / 1e6},
@@ -443,6 +445,8 @@ int main(int argc, char ** argv) {
                 };
                 const auto schedule_trace = config.output.parent_path() / "schedule.jsonl";
                 if (std::filesystem::exists(schedule_trace)) result["schedule_trace_sha256"] = solid::sha256_file(schedule_trace);
+                const auto block_trace=config.output.parent_path()/"schedule.blocks.jsonl";
+                if (std::filesystem::exists(block_trace)) result["block_schedule_trace_sha256"]=solid::sha256_file(block_trace);
             }
             if (config.attention.selection_trace) result["selection_trace_sha256"] = solid::sha256_file(config.output.parent_path() / "selection.jsonl");
             if (!config.attention.selection_replay.empty()) result["selection_replay_sha256"] = solid::sha256_file(config.attention.selection_replay);

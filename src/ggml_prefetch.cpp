@@ -136,6 +136,7 @@ struct LayerWork {
     std::vector<float> query;
     std::vector<HeadSelection> selection;
     TaskDag dag;
+    std::shared_ptr<BlockStage> blocks;
     bool consumed = false;
     LayerWork(std::uint32_t layer, std::uint64_t position, ScheduleMode mode, ScheduleTrace & trace,
                std::uint64_t id, const std::array<std::uint64_t, task_count> & estimates) :
@@ -167,16 +168,20 @@ struct GgmlPrefetch::Impl {
     TaskWorker worker;
     mutable std::mutex mutex;
     ScheduleTrace trace;
+    ScheduleTrace block_trace;
     GgmlTransport transport;
     DeviceCache device;
     ScheduleStats totals;
     std::array<std::uint64_t, task_count> estimates;
+    std::uint64_t block_read_estimate=1,block_copy_estimate=1;
     std::shared_ptr<LayerWork> work;
     std::uint64_t sequence = 0;
     bool quiesced = true;
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
           const std::filesystem::path & schedule,int cpu) :
-        session(s), mode(mode), worker(cpu), trace(schedule), transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode),
+        session(s), mode(mode), worker(cpu), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
+            schedule.parent_path()/(schedule.stem().string()+".blocks"+schedule.extension().string())),
+        transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode),
         device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) { estimates.fill(1); totals.coordinator_cpu=cpu; }
     std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position) {
         if (work && !work->dag.finished()) throw std::logic_error("new layer started before previous completion proof");
@@ -192,6 +197,17 @@ struct GgmlPrefetch::Impl {
         ++totals.frames; totals.tasks += work->dag.size();
         totals.critical_path_ns += work->dag.critical_path_ns();
         totals.miss_projection_overlap_ns += work->dag.overlap_ns(miss_read, kv_projection);
+        if (work->blocks) {
+            const auto stats=work->blocks->stats();
+            ++totals.block_frames; totals.block_tasks+=stats.tasks; totals.block_critical_path_ns+=stats.critical_path_ns;
+            const auto update=[](std::uint64_t & estimate,std::uint64_t total,std::uint64_t count) {
+                if (!count) return;
+                const auto measured=std::max<std::uint64_t>(1,total/count);
+                estimate=measured>=estimate?estimate+(measured-estimate)/8:estimate-(estimate-measured)/8;
+            };
+            update(block_read_estimate,stats.read_ns,stats.read_samples);
+            update(block_copy_estimate,stats.copy_ns,stats.copy_samples);
+        }
         for (std::uint32_t id = 0; id < task_count; ++id) {
             const auto task = work->dag.task(id);
             const auto duration = task.end_ns - task.start_ns;
@@ -254,7 +270,16 @@ void GgmlPrefetch::select_early(std::uint32_t layer, std::uint64_t position, con
             [&](const std::vector<BlockIdentity> & plan) { impl_->device.begin_stage(plan); },
             [&](const SlotLease & lease) {
                 if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
-                impl_->device.stage_ready(lease);
+                impl_->device.stage_ready(lease,work->blocks);
+            },[&](const std::vector<BlockWork> & plan) {
+                auto blocks=plan;
+                const auto ready=host.ready();
+                for (auto & block:blocks) {
+                    block.read_ns=std::any_of(ready.begin(),ready.end(),[&](const SlotLease & lease) { return lease.identity==block.identity; })?1:impl_->block_read_estimate;
+                    block.copy_ns=impl_->device.find(block.identity)?1:impl_->block_copy_estimate;
+                }
+                work->blocks=std::make_shared<BlockStage>(std::move(blocks),&impl_->block_trace,impl_->sequence,work->layer,work->position,impl_->mode);
+                return work->blocks;
             });
         work->dag.complete(miss_read, impl_->trace.now());
         if (!copying) work->dag.start(history_h2d, impl_->trace.now());
@@ -358,8 +383,14 @@ void GgmlPrefetch::quiesce() {
         if (impl_->device.attention_pending()) (void) impl_->device.attention_complete(impl_->device.attention_epoch());
     } catch (...) { if (!error) error = std::current_exception(); }
     try { impl_->device.finish(); } catch (...) { if (!error) error = std::current_exception(); }
-    if (impl_->work && !impl_->work->dag.finished()) impl_->work->dag.abort(impl_->trace.now());
+    try {
+        if (impl_->work && !impl_->work->dag.finished()) impl_->work->dag.abort(impl_->trace.now());
+    } catch (...) { if (!error) error=std::current_exception(); }
+    try {
+        if (impl_->work && impl_->work->blocks && !impl_->work->blocks->finished()) impl_->work->blocks->abort();
+    } catch (...) { if (!error) error=std::current_exception(); }
     try { impl_->trace.flush(); } catch (...) { if (!error) error = std::current_exception(); }
+    try { impl_->block_trace.flush(); } catch (...) { if (!error) error = std::current_exception(); }
     impl_->quiesced = true;
     if (error) std::rethrow_exception(error);
 }

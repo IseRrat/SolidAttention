@@ -49,7 +49,7 @@ public:
     TaskDag(std::vector<TaskSpec> tasks, ScheduleTrace * trace = nullptr, std::uint64_t frame = 0,
             std::uint32_t layer = 0, std::uint64_t position = 0, ScheduleMode mode = ScheduleMode::naive);
     std::vector<std::uint32_t> ready(const std::vector<std::uint32_t> & candidates = {}) const;
-    void start(std::uint32_t task, std::uint64_t now);
+    void start(std::uint32_t task, std::uint64_t now,const std::string & proof = {});
     void complete(std::uint32_t task, std::uint64_t now, const std::string & fence = {});
     void fence(const std::vector<std::uint32_t> & covered, std::uint64_t now, const std::string & proof);
     void abort(std::uint64_t now);
@@ -87,6 +87,7 @@ private:
 struct ScheduleStats {
     int coordinator_cpu=-1;
     std::uint64_t frames = 0, tasks = 0, worker_jobs = 0;
+    std::uint64_t block_frames=0,block_tasks=0,block_critical_path_ns=0;
     std::uint64_t critical_path_ns = 0, miss_projection_overlap_ns = 0;
     std::uint64_t query_reused_fences = 0, process_reused_fences = 0, attention_fences = 0;
     std::uint64_t fallback_fences = 0, event_waits = 0, batch_waits = 0, stream_waits = 0;

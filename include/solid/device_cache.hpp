@@ -32,7 +32,7 @@ public:
     void wait_transfers_coalesced();
     void stage(const std::vector<SlotLease> & host_leases);
     void begin_stage(const std::vector<BlockIdentity> & identities);
-    void stage_ready(const SlotLease & host_lease);
+    void stage_ready(const SlotLease & host_lease,const std::shared_ptr<BlockStage> & stage = {});
     std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
                               bool deferred_upload = false);
     // Called only after the backend confirms attention completion.
@@ -44,7 +44,7 @@ public:
     DeviceCacheStats stats() const;
     std::optional<SlotLease> find(const BlockIdentity & id) const { return slots_.find(id); }
 private:
-    struct Transfer { std::uint64_t ticket; SlotLease host; SlotLease device; };
+    struct Transfer { std::uint64_t ticket; SlotLease host; SlotLease device; std::shared_ptr<BlockStage> stage; };
     Prefetcher & host_;
     KvGeometry geometry_;
     std::uint32_t query_heads_;
@@ -57,7 +57,7 @@ private:
     std::uint64_t epoch_ = 0;
     void poll_transfers(bool wait);
     void retain(const std::vector<BlockIdentity> & identities);
-    SlotLease upload(const SlotLease & host);
+    SlotLease upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage = {});
     void event(const char * name, const SlotLease & lease);
 };
 } // namespace solid

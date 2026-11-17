@@ -110,8 +110,15 @@ bool TaskDag::dependencies_complete(std::uint32_t task) const {
 std::vector<std::uint32_t> TaskDag::ready(const std::vector<std::uint32_t> & candidates) const {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     std::vector<std::uint32_t> ids;
-    for (std::uint32_t id = 0; id < tasks_.size(); ++id) if (tasks_[id].state == TaskState::pending && dependencies_complete(id) &&
-        (candidates.empty() || std::find(candidates.begin(), candidates.end(), id) != candidates.end())) ids.push_back(id);
+    std::vector<bool> seen(tasks_.size(),false);
+    const auto consider=[&](std::uint32_t id) {
+        if (id<tasks_.size() && !seen[id]) {
+            seen[id]=true;
+            if (tasks_[id].state==TaskState::pending && dependencies_complete(id)) ids.push_back(id);
+        }
+    };
+    if (candidates.empty()) for (std::uint32_t id=0;id<tasks_.size();++id) consider(id);
+    else for (const auto id:candidates) consider(id);
     std::sort(ids.begin(), ids.end(), [&](auto a, auto b) {
         const auto & x = tasks_[a]; const auto & y = tasks_[b];
         if (x.critical != y.critical) return x.critical;
@@ -122,13 +129,13 @@ std::vector<std::uint32_t> TaskDag::ready(const std::vector<std::uint32_t> & can
     });
     return ids;
 }
-void TaskDag::start(std::uint32_t id, std::uint64_t now) {
+void TaskDag::start(std::uint32_t id, std::uint64_t now,const std::string & proof) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     auto & record = tasks_.at(id);
     if (record.state != TaskState::pending || !dependencies_complete(id)) throw std::logic_error("task started before dependencies completed");
     for (const auto before : record.spec.predecessors) if (now < tasks_[before].end_ns) throw std::logic_error("nonmonotonic task start");
     record.start_ns = now; record.state = TaskState::running;
-    if (trace_) trace_->event(frame_, id, "start", now);
+    if (trace_) trace_->event(frame_, id, "start", now,proof);
 }
 void TaskDag::complete(std::uint32_t id, std::uint64_t now, const std::string & proof) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);

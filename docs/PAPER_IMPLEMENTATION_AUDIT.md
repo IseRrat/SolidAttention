@@ -34,14 +34,16 @@
 
 - selected 跨 head 优先、正式请求提升与逐块 SSD/H2D 流水，完成记录见 [块读取流水](implementation/BLOCK_READ_PIPELINE.md)。
 
+- 历史工作集的块级 READ/H2D DAG、关键路径/LST 与完成票据，完成记录见 [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md)。
+
 ## 3. 论文路径与后续核心代码
 
 | 核查项 | 当前执行路径 | 后续代码与核查要求 |
 | --- | --- | --- |
 | GPU 算子覆盖，§3.1、§4、§7 | Q/KV 经主机前沿接入 [CUDA 代表构造](implementation/GPU_REPRESENTATIVES.md) 和 [评分/top-k](implementation/GPU_SELECTION.md)；CPU 维护候选与核查镜像；decode attention 复用 GGML GPU 算子 | 补齐直接消费设备 Q 与交错 KV 更新；逐算子记录输入输出、dtype、stride、设备和依赖 |
 | 长输入 prefill | [CUDA 分块 prefill](implementation/GPU_PREFILL.md) 在固定 Q/KV 池上累计因果 attention；代表使用 GPU 窗口构造；CPU 流式路径用于参考 | 继续接入设备 Q/K，核查模型级误差、峰值与性能 |
-| 算法 1 的调度范围，§6.1 | [scheduler.cpp](../src/scheduler.cpp) 提供关键路径/LST；[ggml_prefetch.cpp](../src/ggml_prefetch.cpp) 沿固定图与回调推进，每层聚合为 12 项任务；`ready()` 在回写/下一层预取之间选择 | 建立块级预测读、纠错读、H2D、D2H、回写的资源就绪队列，以真实完成事件解锁后继，按关键路径/LST 分派；合成执行轨迹证明优先级影响提交次序 |
-| selected 优先，§6.1 | [块读取流水](implementation/BLOCK_READ_PIPELINE.md) 先确定集合，再跨 head 按 selected 优先派发；正式所需请求提升，完成块逐个进入 H2D；受限队列核对实际次序及最终汇合 | 在类别优先级基础上连接块级成本、关键路径/LST 与资源就绪分派 |
+| 算法 1 的调度范围，§6.1 | [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 在历史工作集建立逐块 READ→H2D→汇合；关键路径/LST 传入独立 I/O 队列并决定就绪复制次序；外层保留 12 项任务 | 继续将预测期读取、当前 KV 的 D2H/回写及跨层槽位释放连接资源图；由设备事件解锁后继 |
+| selected 优先，§6.1 | [块读取流水](implementation/BLOCK_READ_PIPELINE.md) 先确定集合，再跨 head 按 selected 优先派发；正式所需请求提升，完成块逐个进入 H2D；受限队列核对实际次序及最终汇合 | 历史正式工作集已连接块级成本、关键路径/LST 和资源分派；继续把预测期成本与跨层依赖纳入图 |
 | I/O 与协调分工，§7 | [独立 I/O 所有者](implementation/IO_WORKERS.md) 执行 liburing 操作并自动续填内核队列，协调线程执行纠错、H2D、回写和后继预取；独立物理核与推理核分工 | 结合块级资源队列验证负载下的反压与优先级；设备事件解锁后继传输 |
 | 同步与时间观测，§6.2 | GGML 事件支持独立 H2D、批量确认和同步复用；DAG 的 GPU 区间采用主机观测边界，投影包含下载阶段 | 补齐设备事件记录和任务级完成关联，分别记录主机区间、设备执行与传输；由事件关系核查共享完成点和槽位复用 |
 | SYCL，§1、§8.1 | 主工程提供 CUDA 构建入口，GPU 路径依赖 GGML 通用接口 | 提供 SYCL 构建、具体算子与事件适配、统一内存路径和对应合成检查 |
@@ -51,7 +53,7 @@ prefill 的 GPU 分块方案属于长上下文工程补齐；论文 §7 对实�
 ## 4. 后续开发顺序与交付
 
 1. 在 CUDA 代表构造/评分/top-k、分块 prefill 基础上补齐直接消费设备 Q 和交错 KV 更新的数据流。
-2. 把聚合任务扩展为块级事件任务，连接资源就绪队列与关键路径/LST 分派，纳入 selected 类别优先。
+2. 在历史 READ/H2D 块图基础上纳入预测期读取、D2H/回写与跨层槽位事件。
 3. 在独立 I/O 与协调线程基础上完善异步传输与设备完成观测。
 4. 复核 CUDA 全路径，补齐 SYCL 与统一内存接入。
 5. 每项完成代码与检查后更新所属阶段记录，再进入模型及设备评测。

@@ -159,6 +159,8 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     require(device.stats().uploads > 0 && session.stats().prefetch.predicted_blocks > 0, "prefetch path was not exercised");
     const auto stats = device.schedule_stats();
     require(stats.frames == 12 && stats.tasks == 144, "microtask frames not fully completed");
+    require(mode==solid::ScheduleMode::naive ? stats.block_frames==0 : stats.block_frames==12 && stats.block_tasks>12,
+            "historical block DAG not completed through actual copy receipts");
     if (mode == solid::ScheduleMode::sync_reuse) require(stats.query_reused_fences == 6 && stats.process_reused_fences == 6 && stats.attention_fences == 0,
         "sync reuse did not remove per-attention host fences");
     else require(observer.completions == 12, "scheduler failed to confirm each layer's attention completion");
@@ -174,6 +176,10 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
             {"process_reused_fences", stats.process_reused_fences}, {"attention_fences", stats.attention_fences},
             {"fallback_fences", stats.fallback_fences}}).dump();
         require(output.good(), "graph trace stats write failed");
+        std::ofstream blocks(directory/"block-stats.json");
+        blocks<<nlohmann::json({{"block_frames",stats.block_frames},{"block_tasks",stats.block_tasks},
+            {"block_critical_path_ns",stats.block_critical_path_ns}}).dump();
+        require(blocks.good(),"block trace stats write failed");
     }
 }
 }

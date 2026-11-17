@@ -4,6 +4,7 @@ import argparse
 import copy
 import json
 import math
+import re
 from pathlib import Path
 import sys
 
@@ -24,7 +25,7 @@ def integer(value, positive=False):
     return value
 
 
-def audit_schedule(path, mode):
+def audit_schedule(path, mode, *, blocks=False):
     if mode not in MODES:
         raise ValueError("unknown scheduling mode")
     frames = {}
@@ -40,7 +41,8 @@ def audit_schedule(path, mode):
             if frame["identity"] is not None and frame["identity"] != identity:
                 raise ValueError("frame identity changed")
             frame["identity"] = identity
-            if task_id in tasks or item["mode"] != mode or item["name"] not in TASKS:
+            valid_name = (item["name"] == "historical_blocks_ready" or re.fullmatch(r"block_(read|h2d)_h\d+_b\d+_v[1-9]\d*", item["name"])) if blocks else item["name"] in TASKS
+            if task_id in tasks or item["mode"] != mode or not valid_name:
                 raise ValueError("duplicate task or unexpected task/mode")
             if item["clock"] != "steady_clock_ns" or item["resource"] not in ("host", "ssd", "h2d", "d2h", "gpu"):
                 raise ValueError("unknown schedule clock/resource")
@@ -50,7 +52,7 @@ def audit_schedule(path, mode):
             if not isinstance(deps, list) or len(deps) != len(set(deps)):
                 raise ValueError("duplicate or invalid dependencies")
             for dep in deps: integer(dep)
-            tasks[task_id] = {"name": item["name"], "deps": deps, "state": "pending", "origin": item["origin_ns"]}
+            tasks[task_id] = {"name": item["name"], "deps": deps, "state": "pending", "origin": item["origin_ns"], "resource": item["resource"]}
             continue
         if task_id not in tasks:
             raise ValueError("schedule event before task definition")
@@ -74,6 +76,8 @@ def audit_schedule(path, mode):
             raise ValueError("failed or unknown schedule event")
     if len(origins) > 1:
         raise ValueError("schedule trace mixes clock origins")
+    if blocks:
+        return audit_block_frames(frames)
     totals = {"frames": len(frames), "tasks": 0, "critical_path_ns": 0, "miss_projection_overlap_ns": 0,
               "query_reused_fences": 0, "process_reused_fences": 0, "attention_fences": 0, "fallback_fences": 0}
     proofs = {"query_dependency_reuse": "query_reused_fences", "process_synchronize_reuse": "process_reused_fences",
@@ -122,6 +126,56 @@ def audit_schedule(path, mode):
             raise ValueError("query reuse proof in a mode that requires attention completion")
         totals[proofs[proof]] += 1
     return totals
+
+
+def audit_block_frames(frames):
+    totals = {"block_frames": len(frames), "block_tasks": 0, "block_critical_path_ns": 0}
+    identities = set()
+    for frame in frames.values():
+        if frame["identity"] in identities:
+            raise ValueError("duplicate block frame layer/position")
+        identities.add(frame["identity"])
+        tasks = frame["tasks"]
+        if any(task["state"] != "complete" for task in tasks.values()):
+            raise ValueError("block trace ends with unfinished tasks")
+        names = {task["name"]: key for key, task in tasks.items()}
+        if len(names) != len(tasks) or "historical_blocks_ready" not in names:
+            raise ValueError("missing or duplicate block tasks")
+        join = tasks[names["historical_blocks_ready"]]
+        copies = []
+        costs = []
+        for name, key in names.items():
+            if not name.startswith("block_read_"):
+                continue
+            read = tasks[key]
+            copy_key = names.get(name.replace("block_read_", "block_h2d_", 1))
+            if copy_key is None:
+                raise ValueError("block READ lacks a matching H2D task")
+            copy = tasks[copy_key]
+            if read["deps"] or read["resource"] != "ssd" or copy["deps"] != [key] or copy["resource"] != "h2d":
+                raise ValueError("block read/H2D dependencies or resources differ")
+            if read["fence"] not in ("original_read_complete", "host_resident", "host_forwarded") or copy["fence"] not in ("copy_ticket_complete", "device_resident"):
+                raise ValueError("block completion lacks an ownership proof")
+            copies.append(copy_key)
+            costs.append(read["end"] - read["start"] + copy["end"] - copy["start"])
+        if (len(tasks) != 2*len(copies)+1 or set(join["deps"]) != set(copies) or join["resource"] != "host" or
+                join["fence"] != ("all_block_copies_complete" if copies else "empty_history")):
+            raise ValueError("block join does not cover every H2D completion")
+        totals["block_tasks"] += len(tasks)
+        totals["block_critical_path_ns"] += max(costs, default=0) + join["end"] - join["start"]
+    return totals
+
+
+def audit_block_schedule(path, mode, parent=None):
+    result = audit_schedule(path, mode, blocks=True)
+    if parent is not None:
+        def identities(source):
+            rows = (json.loads(line) for line in Path(source).read_text(encoding="utf-8").splitlines())
+            return {(row["frame"], row["layer"], row["position"]) for row in rows if row["event"] == "define"}
+        expected = set() if mode == "naive" else identities(parent)
+        if identities(path) != expected:
+            raise ValueError("block frames differ from the parent layer schedule")
+    return result
 
 
 def create(reference, destination, results, queue_depth=64, slots_per_head=None):
@@ -187,12 +241,17 @@ def report(manifest_path, atol=1e-3, rtol=1e-4):
         if digest(trace_path) != value["schedule_trace_sha256"]:
             raise ValueError("schedule trace checksum differs")
         audit = audit_schedule(trace_path, mode)
+        block_path = path.parent / "schedule.blocks.jsonl"
+        if digest(block_path) != value["block_schedule_trace_sha256"]:
+            raise ValueError("block schedule trace checksum differs")
+        audit.update(audit_block_schedule(block_path, mode, trace_path))
         recorded = value["schedule"]
         if recorded["mode"] != mode or recorded["trace_enabled"] is not True:
             raise ValueError("scheduling metrics mode/trace setting differs")
         for key, actual in audit.items():
             metric = {"critical_path_ns": "observed_critical_path_sum_ms",
-                      "miss_projection_overlap_ns": "miss_projection_overlap_sum_ms"}.get(key, key)
+                      "miss_projection_overlap_ns": "miss_projection_overlap_sum_ms",
+                      "block_critical_path_ns": "block_observed_critical_path_sum_ms"}.get(key, key)
             expected = actual / 1e6 if key.endswith("_ns") else actual
             observed = recorded[metric]
             if type(observed) not in (int, float) or not math.isfinite(observed) or not math.isclose(observed, expected, rel_tol=1e-9, abs_tol=1e-8):

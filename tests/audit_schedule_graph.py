@@ -7,7 +7,7 @@ import tempfile
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "scripts"))
 from compare_prefetch import audit_residency
-from schedule_ablation import audit_schedule, MODES, NAMES
+from schedule_ablation import audit_schedule, audit_block_schedule, MODES, NAMES
 
 with tempfile.TemporaryDirectory(prefix="solid-schedule-audit-") as temporary:
     for name, mode in zip(NAMES, MODES):
@@ -20,4 +20,7 @@ with tempfile.TemporaryDirectory(prefix="solid-schedule-audit-") as temporary:
             if observed != expected:
                 raise ValueError(f"schedule trace differs from C++ metrics: {name}/{folder.name}: {observed} != {expected}")
             audit_residency(folder / "residency.jsonl", 2, 6)
+            blocks=audit_block_schedule(folder/"schedule.blocks.jsonl",mode,folder/"schedule.jsonl")
+            if blocks != json.loads((folder/"block-stats.json").read_text()):
+                raise ValueError(f"block schedule trace differs from C++ metrics: {name}/{folder.name}")
 print("all three modes: native GGML schedule/residency traces and metrics audited")

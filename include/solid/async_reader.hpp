@@ -6,6 +6,16 @@
 namespace solid {
 struct ReadCompletion { std::uint64_t id; std::int64_t result; };
 enum class ReadPriority : std::uint8_t { correction_selected, correction_deterministic, selected, deterministic };
+struct ReadDispatch {
+    ReadPriority priority=ReadPriority::deterministic;
+    bool critical=false;
+    std::uint64_t latest_start=UINT64_MAX;
+    bool before(const ReadDispatch & other) const {
+        if (critical!=other.critical) return critical;
+        if (latest_start!=other.latest_start) return latest_start<other.latest_start;
+        return priority<other.priority;
+    }
+};
 struct AsyncIoStats {
     std::uint64_t read_requests = 0;
     std::uint64_t read_bytes = 0;
@@ -31,6 +41,11 @@ public:
                                     std::uint64_t offset, ReadPriority) { return submit(id,fd,destination,bytes,offset); }
     // Promote admitted jobs that have not entered the kernel yet.
     virtual void prioritize(std::uint64_t, ReadPriority) {}
+    virtual bool submit_scheduled(std::uint64_t id,int fd,void * destination,std::size_t bytes,
+                                  std::uint64_t offset,ReadDispatch dispatch) {
+        return submit_prioritized(id,fd,destination,bytes,offset,dispatch.priority);
+    }
+    virtual void schedule(std::uint64_t id,ReadDispatch dispatch) { prioritize(id,dispatch.priority); }
     virtual void cancel(std::uint64_t id) = 0;
     virtual void flush() = 0;
     // Only original READ completion ends a buffer's kernel-write lifetime.

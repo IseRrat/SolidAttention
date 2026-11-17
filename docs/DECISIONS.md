@@ -37,6 +37,7 @@
 | D31 | CUDA prefill 按有界 Q/KV tile 累计 FP32 因果 attention，H2D 完成归还主机源，同流保护设备复用；prompt 完成后释放池，KV 与计算工作区分别记录峰值 | [GPU prefill](implementation/GPU_PREFILL.md)，tiled-prefill-contract |
 | D32 | 专用 I/O 线程拥有 liburing，以有界队列与协调线程交接；命令/CQE 事件驱动自动续填；预留两个不同物理核并排除推理核集合中的 SMT 同胞 | [I/O 线程](implementation/IO_WORKERS.md)，io-worker-ownership、uring-io |
 | D33 | 预测集合固定后跨 head 优先发出 selected；正式所需请求提升优先级；历史块 ready 后独立上传，追加等待读取与复制汇合 | [块读取流水](implementation/BLOCK_READ_PIPELINE.md)，prefetch-and-residency、io-worker-ownership、schedule-trace-audit |
+| D34 | 正式历史工作集使用每块 READ→H2D 和全部就绪汇合图；关键路径/LST 调度键传入 I/O 所有者，复制票据确认完成；块轨迹与父层帧独立核对 | [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md)，block-event-scheduler、schedule-trace-audit |
 
 ## 参数锁定任务
 
