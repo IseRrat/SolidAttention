@@ -17,8 +17,8 @@ def trace(mode):
     names = ["q_gpu_ready", "q_d2h_ready", "selection_ready" if serial else "selection", "kv_projection_to_host",
              "kv_d2h_ready", "miss_read_and_reconcile", "history_h2d", "append_and_selection" if serial else "append_current_kv",
              "current_h2d", "attention_until_boundary", "buffered_ssd_store", "next_layer_prefetch"]
-    deps = [[], [0], [7, 1] if serial else [1], [] if serial else [2], [3], [2], [5],
-            [4] if serial else [4, 6], [7, 6] if serial else [7], [8], [7], [8]]
+    deps = [[], [0], [7, 1] if serial else [1], [] if serial else [2], [3], [2], [5] if serial else [2],
+            [4] if serial else [4, 5, 6], [7, 6] if serial else [7], [8], [7], [8]]
     rows = [dict(event="define", frame=1, task=i, layer=0, position=3, mode=mode, name=name, resource="host",
                  predecessors=deps[i], estimate_ns=1, origin_ns=0, clock="steady_clock_ns") for i, name in enumerate(names)]
     # Use a topological serial trace for deterministic audit arithmetic.
@@ -111,6 +111,20 @@ class ScheduleToolsTests(unittest.TestCase):
                 with self.assertRaises(ValueError): scheduling.audit_schedule(path, "overlap")
             jsonlines(path, good)
             self.assertEqual(scheduling.audit_schedule(path, "overlap")["tasks"], 12)
+
+    def test_streamed_h2d_can_start_before_the_read_batch_finishes(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path = Path(temporary) / "schedule.jsonl"
+            rows = trace("overlap")
+            for row in rows:
+                if row["event"] == "start" and row["task"] == 6:
+                    row["timestamp_ns"] = 10
+            jsonlines(path, rows)
+            self.assertEqual(scheduling.audit_schedule(path, "overlap")["frames"], 1)
+            wrong = copy.deepcopy(rows)
+            wrong[7]["predecessors"] = [4, 6]
+            jsonlines(path, wrong)
+            with self.assertRaises(ValueError): scheduling.audit_schedule(path, "overlap")
 
     def test_deferred_pin_keeps_copy_and_attention_lifetimes_separate(self):
         with tempfile.TemporaryDirectory() as temporary:

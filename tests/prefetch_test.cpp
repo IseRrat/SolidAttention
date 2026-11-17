@@ -1,6 +1,7 @@
 #include "prefetch_fakes.hpp"
 #include <iostream>
 #include <numeric>
+#include <set>
 
 using namespace test_prefetch;
 namespace {
@@ -154,10 +155,69 @@ void deferred_device() {
     cache.finish(); host.finish();
 }
 }
+void selected_first(solid::KvLayout layout,std::size_t capacity) {
+    const solid::KvGeometry g{2,2,2,1,32,64,layout};
+    auto file=std::make_unique<File>(); auto reader=std::make_unique<Reader>(file.get(),capacity);
+    auto * observe=reader.get(); solid::FileKvStore store(g,std::move(file),16); fill(store,8);
+    solid::Prefetcher host(store,{6,1,2,1},6,std::move(reader));
+    const std::vector<solid::HeadSelection> prior{{{0,2,4,6,7,8},{}},{{0,3,5,6,7,8},{}}};
+    for (std::uint32_t layer=0;layer<2;++layer) {
+        host.begin(layer,8); store.append_interleaved(layer,8,token(g,layer,8));
+        const auto leases=host.resolve(layer,8,prior);
+        for (const auto & lease:leases) host.unpin(lease);
+    }
+    const auto first=observe->submitted.size();
+    host.begin(0,9);
+    const std::vector<solid::HeadSelection> actual{{{0,2,4,6,8,9},{}},{{0,3,5,6,8,9},{}}};
+    const auto leases=host.resolve_history(0,9,actual); verify(store,host,leases);
+    std::set<std::uint64_t> selected_offsets;
+    for (std::uint32_t head=0;head<2;++head) for (const auto block:head?std::vector<int>{3,5,6}:std::vector<int>{2,4,6}) {
+        solid::KvBlock data;
+        for (const auto & segment:store.plan_read(0,head,block,data)) selected_offsets.insert(segment.file_offset);
+    }
+    require(observe->submitted.size()>first+selected_offsets.size(),"priority test omitted deterministic reads");
+    for (std::size_t i=0;i<selected_offsets.size();++i) require(selected_offsets.count(observe->submitted[first+i].offset),"init/local passed a selected block from another head");
+    require(leases.size()==10,"priority dispatch changed predicted membership");
+    for (const auto & lease:leases) host.unpin(lease);
+    host.finish();
+}
+void streaming(bool fail_upload) {
+    const solid::KvGeometry g{1,1,2,1,16,64,solid::KvLayout::interleaved};
+    auto file=std::make_unique<File>(); auto reader=std::make_unique<Reader>(file.get(),1);
+    auto * observe=reader.get(); solid::FileKvStore store(g,std::move(file),8); fill(store,6);
+    solid::Prefetcher host(store,{4,1,1,1},4,std::move(reader));
+    Transport transport;
+    solid::DeviceCache cache(host,g,2,transport); host.begin(0,6);
+    const std::vector<solid::HeadSelection> actual{{{0,1,2,6},{}}};
+    bool overlapped=false; std::size_t callbacks=0;
+    const auto resolve=[&] {
+        return host.resolve_history(0,6,actual,
+            [&](const std::vector<solid::BlockIdentity> & plan) { cache.begin_stage(plan); },
+            [&](const solid::SlotLease & lease) {
+                ++callbacks; overlapped|=!observe->pending.empty();
+                transport.fail_upload=fail_upload && callbacks==2;
+                cache.stage_ready(lease);
+            });
+    };
+    if (fail_upload) rejects([&] { (void) resolve(); });
+    else {
+        const auto leases=resolve();
+        require(callbacks==leases.size() && overlapped && !transport.copies.empty(),"ready blocks waited for the full SSD batch");
+        for (const auto & lease:leases) host.unpin(lease);
+        cache.wait_transfers();
+        for (const auto & lease:leases) {
+            const auto device=cache.find(lease.identity); require(device.has_value(),"streamed device block lost");
+            require(transport.memory.at(device->slot)==host.block(lease).data,"streamed copy used released source");
+        }
+    }
+    cache.finish(); host.finish();
+}
 int main() {
     try {
         slots(); prefix(); wrong_predictions(); read_error(solid::KvLayout::interleaved);
         read_error(solid::KvLayout::separate); capacity(); device(); deferred_device();
+        for (const auto layout:{solid::KvLayout::separate,solid::KvLayout::interleaved}) for (const auto capacity:{1u,64u}) selected_first(layout,capacity);
+        streaming(false); streaming(true);
         std::cout << "prefetch, correction, cancellation races, versions, host/device leases and stable slots passed\n";
         return 0;
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }

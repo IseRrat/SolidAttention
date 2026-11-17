@@ -106,6 +106,14 @@ void DeviceCache::stage(const std::vector<SlotLease> & host_leases) {
     retain(actual);
     for (const auto & lease : host_leases) (void) upload(lease);
 }
+void DeviceCache::begin_stage(const std::vector<BlockIdentity> & identities) {
+    if (!attention_.empty()) throw std::logic_error("streamed stage before previous attention completed");
+    wait_transfers(); retain(identities);
+}
+void DeviceCache::stage_ready(const SlotLease & lease) {
+    if (!attention_.empty()) throw std::logic_error("streamed upload while attention owns slots");
+    poll_transfers(false); (void) upload(lease);
+}
 std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection, bool deferred_upload) {
     if (!attention_.empty()) throw std::logic_error("previous device attention has not completed");
     if (selection.size() != geometry_.heads) throw std::invalid_argument("device selection head count");

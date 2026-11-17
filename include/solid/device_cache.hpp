@@ -31,6 +31,8 @@ public:
     void wait_transfers();
     void wait_transfers_coalesced();
     void stage(const std::vector<SlotLease> & host_leases);
+    void begin_stage(const std::vector<BlockIdentity> & identities);
+    void stage_ready(const SlotLease & host_lease);
     std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
                               bool deferred_upload = false);
     // Called only after the backend confirms attention completion.

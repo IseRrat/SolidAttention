@@ -95,8 +95,8 @@ def audit_schedule(path, mode):
                  selection: [append, "q_d2h_ready"] if serial else ["q_d2h_ready"],
                  "kv_projection_to_host": [] if serial else [selection],
                  "kv_d2h_ready": ["kv_projection_to_host"], "miss_read_and_reconcile": [selection],
-                 "history_h2d": ["miss_read_and_reconcile"],
-                 append: ["kv_d2h_ready"] if serial else ["kv_d2h_ready", "history_h2d"],
+                 "history_h2d": ["miss_read_and_reconcile"] if serial else [selection],
+                 append: ["kv_d2h_ready"] if serial else ["kv_d2h_ready", "miss_read_and_reconcile", "history_h2d"],
                  "current_h2d": [append, "history_h2d"] if serial else [append],
                  "attention_until_boundary": ["current_h2d"], "buffered_ssd_store": [append],
                  "next_layer_prefetch": ["current_h2d"]}

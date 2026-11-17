@@ -36,6 +36,7 @@
 | D30 | CUDA 代表构造使用 local 大小的 K/分数环和固定 R 候选；query 边界移交完整 CPU 状态，定稿块直接写入 GPU bank；构造工作区在选择总分配中计入一次 | [GPU 代表构造](implementation/GPU_REPRESENTATIVES.md)，representative-builder-contract |
 | D31 | CUDA prefill 按有界 Q/KV tile 累计 FP32 因果 attention，H2D 完成归还主机源，同流保护设备复用；prompt 完成后释放池，KV 与计算工作区分别记录峰值 | [GPU prefill](implementation/GPU_PREFILL.md)，tiled-prefill-contract |
 | D32 | 专用 I/O 线程拥有 liburing，以有界队列与协调线程交接；命令/CQE 事件驱动自动续填；预留两个不同物理核并排除推理核集合中的 SMT 同胞 | [I/O 线程](implementation/IO_WORKERS.md)，io-worker-ownership、uring-io |
+| D33 | 预测集合固定后跨 head 优先发出 selected；正式所需请求提升优先级；历史块 ready 后独立上传，追加等待读取与复制汇合 | [块读取流水](implementation/BLOCK_READ_PIPELINE.md)，prefetch-and-residency、io-worker-ownership、schedule-trace-audit |
 
 ## 参数锁定任务
 

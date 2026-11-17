@@ -123,33 +123,47 @@ void Prefetcher::event(const char * name, const SlotLease & lease) {
 }
 void Prefetcher::pump() {
     while (!queued_.empty()) {
-        const auto job = queued_.front();
+        const auto next=std::min_element(queued_.begin(),queued_.end(),[](const Job & a,const Job & b) { return a.priority<b.priority; });
+        const auto job = *next;
         if (next_id_ >= (std::uint64_t{1} << 63)) throw std::overflow_error("read request identity exhausted");
-        if (!reader_->submit(next_id_, store_.native_handle(), reinterpret_cast<unsigned char *>(blocks_[job.lease.slot].data.data()) +
-                             job.segment.buffer_offset, job.segment.bytes, job.segment.file_offset)) break;
+        if (!reader_->submit_prioritized(next_id_, store_.native_handle(), reinterpret_cast<unsigned char *>(blocks_[job.lease.slot].data.data()) +
+                             job.segment.buffer_offset, job.segment.bytes, job.segment.file_offset,job.priority)) break;
         requests_.emplace(next_id_++, job);
-        queued_.erase(queued_.begin());
+        queued_.erase(next);
+        event("read_submit",job.lease);
     }
     reader_->flush();
 }
-void Prefetcher::issue(const SlotLease & lease, std::uint32_t prefix) {
+void Prefetcher::issue(const SlotLease & lease, std::uint32_t prefix, ReadPriority priority) {
     const auto & id = lease.identity;
     const auto segments = store_.plan_read(id.layer, id.head, id.block, blocks_[lease.slot], prefix);
     if (blocks_[lease.slot].version != id.version) throw std::logic_error("read plan version changed before submission");
     pending_[lease.slot] = segments.size();
-    for (const auto & segment : segments) queued_.push_back({lease, segment});
+    for (const auto & segment : segments) queued_.push_back({lease, segment, priority});
     if (segments.empty()) { slots_.complete(lease); event("ready", lease); }
     pump();
 }
-SlotLease Prefetcher::load(const BlockIdentity & id) {
+SlotLease Prefetcher::load(const BlockIdentity & id, ReadPriority priority) {
     auto lease = slots_.acquire(id);
     while (!lease) {
         if (requests_.empty() && queued_.empty()) throw std::runtime_error("host slot capacity held by readers or required blocks");
         poll(true);
         lease = slots_.acquire(id);
     }
-    issue(*lease);
+    issue(*lease,0,priority);
     return *lease;
+}
+void Prefetcher::promote(const SlotLease & lease, ReadPriority priority) {
+    for (auto & job:queued_) if (job.lease==lease && priority<job.priority) job.priority=priority;
+    for (auto & item:requests_) if (item.second.lease==lease && priority<item.second.priority) {
+        reader_->prioritize(item.first,priority); item.second.priority=priority;
+    }
+}
+bool Prefetcher::selected(std::uint64_t block) const {
+    const auto & g=store_.geometry();
+    const auto first=block*g.block_tokens;
+    const auto local_first=position_+1-std::min<std::uint64_t>(budget_.local,position_+1);
+    return position_+1>budget_.total && first<local_first && first+g.block_tokens>budget_.initial;
 }
 void Prefetcher::retire(const SlotLease & lease) {
     if (!slots_.matches(lease)) return;
@@ -223,8 +237,15 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position) {
         const auto lease = slots_.lease(i);
         if (slots_.entry(i).state != SlotState::free && std::find(predicted.begin(), predicted.end(), lease.identity) == predicted.end()) retire(lease);
     }
+    const auto priority=[&](const BlockIdentity & id) {
+        const auto & history=history_[layer][id.head];
+        return selected(id.block) && std::find(history.begin(),history.end(),id.block)!=history.end() ? ReadPriority::selected : ReadPriority::deterministic;
+    };
+    // Membership is bounded above using deterministic blocks first. Dispatch
+    // selected blocks across all heads before init/local without changing it.
+    std::stable_sort(predicted.begin(),predicted.end(),[&](const BlockIdentity & a,const BlockIdentity & b) { return priority(a)<priority(b); });
     for (const auto & id : predicted) {
-        if (!slots_.find(id)) { const auto lease = load(id); event("predict", lease); }
+        if (!slots_.find(id)) { const auto lease = load(id,priority(id)); event("predict", lease); }
         ++stats_.predicted_blocks;
     }
     pump();
@@ -232,15 +253,17 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position) {
 std::vector<SlotLease> Prefetcher::resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual) {
     return resolve_impl(layer, position, actual, false);
 }
-std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual) {
+std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
+                                                const StagePlan & plan, const ReadyBlock & ready) {
     auto past = actual;
     for (auto & head : past) {
         if (!head.positions.empty() && head.positions.back() == position) head.positions.pop_back();
     }
-    return resolve_impl(layer, position, past, true);
+    return resolve_impl(layer, position, past, true,plan,ready);
 }
 std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64_t position,
-                                            const std::vector<HeadSelection> & actual, bool historical) {
+                                            const std::vector<HeadSelection> & actual, bool historical,
+                                            const StagePlan & plan, const ReadyBlock & ready) {
     const auto start = std::chrono::steady_clock::now();
     check();
     const auto & g = store_.geometry();
@@ -260,6 +283,15 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
         if (ids.size() > slots_.slots_per_head()) throw std::invalid_argument("actual selection exceeds slots_per_head");
         for (const auto id : ids) needed.push_back({layer, head, id, std::min<std::uint64_t>(g.block_tokens, available - id * g.block_tokens)});
     }
+    const auto priority=[&](const BlockIdentity & id) {
+        const auto local_first=position+1-std::min<std::uint64_t>(budget_.local,position+1);
+        for (const auto p:actual[id.head].positions) if (position+1>budget_.total && p/g.block_tokens==id.block && p>=budget_.initial && p<local_first) return ReadPriority::correction_selected;
+        return ReadPriority::correction_deterministic;
+    };
+    std::stable_sort(needed.begin(),needed.end(),[&](const BlockIdentity & a,const BlockIdentity & b) { return priority(a)<priority(b); });
+    if (plan) plan(needed);
+    // Promote all existing required jobs before waiting for any old producer.
+    for (const auto & id:needed) if (const auto lease=slots_.find(id)) promote(*lease,priority(id));
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
         const auto lease = slots_.lease(i);
         const auto matching_block = [&](const BlockIdentity & id) { return id.layer == lease.identity.layer && id.head == lease.identity.head && id.block == lease.identity.block; };
@@ -284,18 +316,30 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
                 while (slots_.entry(prefix->slot).state == SlotState::loading) poll(true);
                 const auto count = blocks_[prefix->slot].valid_tokens;
                 lease = slots_.refresh(*prefix, id);
-                issue(*lease, count);
+                issue(*lease, count,priority(id));
                 ++stats_.refreshed_blocks;
                 event("refresh", *lease);
             } else {
-                lease = load(id);
+                lease = load(id,priority(id));
                 ++stats_.missing_blocks;
                 event("missing", *lease);
             }
         }
         result.push_back(*lease);
     }
-    for (const auto & lease : result) while (slots_.entry(lease.slot).state == SlotState::loading) poll(true);
+    std::vector<bool> delivered(result.size(),false);
+    std::size_t remaining=result.size();
+    while (remaining) {
+        for (std::size_t i=0;i<result.size();++i) if (!delivered[i] && slots_.entry(result[i].slot).state!=SlotState::loading) {
+            if (ready) {
+                slots_.pin(result[i]);
+                try { ready(result[i]); } catch (...) { slots_.unpin(result[i]); throw; }
+                slots_.unpin(result[i]);
+            }
+            delivered[i]=true; --remaining;
+        }
+        if (remaining) poll(true);
+    }
     if (!historical) for (std::uint32_t head = 0; head < g.heads; ++head) {
         auto & history = history_[layer][head];
         history.clear();

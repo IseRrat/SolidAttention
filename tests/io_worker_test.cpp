@@ -28,6 +28,7 @@ struct Control {
     std::size_t engine_capacity=2;
     std::thread::id owner;
     std::vector<int> cpus;
+    std::vector<std::uint64_t> submissions;
     void signal() {
         std::lock_guard<std::mutex> lock(mutex);
         if (event>=0) { std::uint64_t n=1; require(write(event,&n,sizeof(n))==static_cast<ssize_t>(sizeof(n)),"test completion signal"); }
@@ -68,7 +69,9 @@ public:
                 control->cv.wait(lock,[&] { return control->allow_submit; });
             }
         }
-        requests.emplace(id,Request{destination,bytes}); ++counters.read_requests; return true;
+        requests.emplace(id,Request{destination,bytes}); ++counters.read_requests;
+        { std::lock_guard<std::mutex> lock(control->mutex); control->submissions.push_back(id); }
+        control->cv.notify_all(); return true;
     }
     void cancel(std::uint64_t) override {
         owned(); ++counters.cancel_requests; ++counters.cancel_completions; ++counters.cancel_busy;
@@ -153,6 +156,23 @@ void backlog_progress() {
     require(io->poll(result,true) && io->poll(result,true) && a[0]==1 && b[0]==2,"worker did not refill engine after a completion");
     require(io->stats().worker_capacity==2,"worker capacity metadata");
 }
+void priority_progress() {
+    auto control=std::make_shared<Control>(); control->engine_capacity=1;
+    auto io=solid::make_io_worker([control] { return std::make_unique<Reader>(control); },5); Release release{control};
+    std::array<unsigned char,5> bytes{};
+    require(io->submit(1,0,&bytes[0],1,0),"priority gate submit");
+    require(control->wait([&] { return control->submissions.size()==1; }),"priority gate did not enter kernel");
+    require(io->submit(2,0,&bytes[1],1,0) && io->submit(3,0,&bytes[2],1,0) &&
+            io->submit_prioritized(4,0,&bytes[3],1,0,solid::ReadPriority::selected) &&
+            io->submit_prioritized(5,0,&bytes[4],1,0,solid::ReadPriority::selected),"priority admission");
+    io->prioritize(3,solid::ReadPriority::correction_selected);
+    control->release();
+    solid::ReadCompletion result{};
+    for (int n=0;n<5;++n) require(io->poll(result,true),"priority completion lost");
+    { std::lock_guard<std::mutex> lock(control->mutex);
+      require(control->submissions==std::vector<std::uint64_t>{1,3,4,5,2},"pending promotion or equal-priority FIFO failed"); }
+    for (int n=0;n<5;++n) require(bytes[n]==n+1,"priority changed destination identity");
+}
 void placement() {
     const auto original=solid::thread_cpus(); require(!original.empty(),"missing test CPU affinity");
     {
@@ -180,7 +200,7 @@ void placement() {
 } // namespace
 int main() {
 #ifdef __linux__
-    try { cancellation_and_drain(); backlog_progress(); failures(); placement(); std::cout<<"I/O ownership, cancellation, drain and placement passed\n"; return 0; }
+    try { cancellation_and_drain(); backlog_progress(); priority_progress(); failures(); placement(); std::cout<<"I/O ownership, cancellation, drain and placement passed\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 #else
     std::cout<<"Linux I/O worker checks\n"; return 77;

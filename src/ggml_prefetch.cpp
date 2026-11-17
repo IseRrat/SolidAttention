@@ -148,9 +148,9 @@ struct LayerWork {
                 {"kv_projection_to_host", TaskResource::gpu, serial ? std::vector<std::uint32_t>{} : std::vector<std::uint32_t>{select_task}, 1},
                 {"kv_d2h_ready", TaskResource::d2h, {kv_projection}, 1},
                 {"miss_read_and_reconcile", TaskResource::ssd, {select_task}, 1},
-                {"history_h2d", TaskResource::h2d, {miss_read}, 1},
+                {"history_h2d", TaskResource::h2d, serial ? std::vector<std::uint32_t>{miss_read} : std::vector<std::uint32_t>{select_task}, 1},
                 {serial ? "append_and_selection" : "append_current_kv", TaskResource::host,
-                    serial ? std::vector<std::uint32_t>{kv_d2h} : std::vector<std::uint32_t>{kv_d2h,history_h2d}, 1},
+                    serial ? std::vector<std::uint32_t>{kv_d2h} : std::vector<std::uint32_t>{kv_d2h,miss_read,history_h2d}, 1},
                 {"current_h2d", TaskResource::h2d, serial ? std::vector<std::uint32_t>{append,history_h2d} : std::vector<std::uint32_t>{append}, 1},
                 {"attention_until_boundary", TaskResource::gpu, {current_h2d}, 1},
                 {"buffered_ssd_store", TaskResource::ssd, {append}, 1},
@@ -249,11 +249,15 @@ void GgmlPrefetch::select_early(std::uint32_t layer, std::uint64_t position, con
         work->dag.start(miss_read, impl_->trace.now());
         impl_->device.wait_transfers();
         auto & host = impl_->session.prefetcher();
-        const auto leases = host.resolve_history(work->layer, work->position, work->selection);
+        bool copying=false;
+        const auto leases = host.resolve_history(work->layer, work->position, work->selection,
+            [&](const std::vector<BlockIdentity> & plan) { impl_->device.begin_stage(plan); },
+            [&](const SlotLease & lease) {
+                if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
+                impl_->device.stage_ready(lease);
+            });
         work->dag.complete(miss_read, impl_->trace.now());
-        work->dag.start(history_h2d, impl_->trace.now());
-        try { impl_->device.stage(leases); }
-        catch (...) { for (const auto & lease : leases) host.unpin(lease); throw; }
+        if (!copying) work->dag.start(history_h2d, impl_->trace.now());
         for (const auto & lease : leases) host.unpin(lease);
     });
 }

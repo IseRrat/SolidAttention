@@ -67,12 +67,15 @@ struct PrefetchStats {
 };
 class Prefetcher {
 public:
+    using ReadyBlock = std::function<void(const SlotLease &)>;
+    using StagePlan = std::function<void(const std::vector<BlockIdentity> &)>;
     Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t slots_per_head,
                std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace = {});
     ~Prefetcher();
     void begin(std::uint32_t layer, std::uint64_t position);
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
-    std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
+    std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
+                                         const StagePlan & plan = {}, const ReadyBlock & ready = {});
     void poll(bool wait = false);
     const KvBlock & block(const SlotLease & lease) const;
     void pin(const SlotLease & lease) { slots_.pin(lease); }
@@ -83,7 +86,7 @@ public:
     std::uint32_t slots_per_head() const { return slots_.slots_per_head(); }
     std::optional<std::uint32_t> active_layer() const { return layer_; }
 private:
-    struct Job { SlotLease lease; KvReadSegment segment; };
+    struct Job { SlotLease lease; KvReadSegment segment; ReadPriority priority; };
     KvStore & store_;
     SparseBudget budget_;
     SlotTable slots_;
@@ -100,12 +103,15 @@ private:
     PrefetchStats stats_;
     bool failed_ = false;
     void check() const;
-    void issue(const SlotLease & lease, std::uint32_t prefix = 0);
-    SlotLease load(const BlockIdentity & identity);
+    void issue(const SlotLease & lease, std::uint32_t prefix, ReadPriority priority);
+    SlotLease load(const BlockIdentity & identity, ReadPriority priority);
+    void promote(const SlotLease & lease, ReadPriority priority);
+    bool selected(std::uint64_t block) const;
     void retire(const SlotLease & lease);
     void pump();
     void event(const char * name, const SlotLease & lease);
     std::vector<SlotLease> resolve_impl(std::uint32_t layer, std::uint64_t position,
-                                       const std::vector<HeadSelection> & actual, bool historical);
+                                       const std::vector<HeadSelection> & actual, bool historical,
+                                       const StagePlan & plan = {}, const ReadyBlock & ready = {});
 };
 } // namespace solid

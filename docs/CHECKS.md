@@ -142,3 +142,9 @@ CUDA 内核与运行器链接、36 项 CTest、57 项 Linux Python 检查及源�
 CUDA 编译与链接、37 项 CTest、59 项 Linux Python 检查及源码指纹通过。核心库 10 项 CTest 的地址、泄漏和未定义行为检查通过。
 
 受控完成描述符核查线程归属、自动续填、提交前取消、取消 ACK 与原 READ、drain 后复用、异常排空及物理核预留/恢复。微小临时文件检查直接和线程化 liburing；三种实际 CPU GGML 预取图对照同步数值参考。配置工具覆盖线程设置保留和同步消融转换。完成记录见 [I/O 线程](implementation/IO_WORKERS.md)。
+
+## 2026-11-18：selected 优先与逐块 SSD/H2D 流水
+
+CUDA 编译与链接、37 项 CTest、60 项 Linux Python 检查及源码指纹通过。核心库 10 项 CTest 的地址、泄漏和未定义行为检查通过。
+
+核查跨 head selected 提交、两种布局、有限队列、正式请求提升、同级 FIFO、读取未结束时上传、第二次上传失败后的源租约回收，以及聚合任务的三路依赖汇合。三组实际 CPU GGML 图及独立轨迹核查通过。详细入口见 [块读取流水](implementation/BLOCK_READ_PIPELINE.md)。

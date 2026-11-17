@@ -125,6 +125,8 @@ H2D 还依赖目标 VRAM 槽释放；SSD 读取依赖目标 DRAM 槽释放；回
 
 sync_reuse 通过实际图祖先核查，以后继 Q 下载完成证明释放前层 attention 读者；末层使用请求已有同步。上传中的设备槽位允许登记未来读者，producer 和 reader 均完成后复用。详细轨迹采用主机观测区间，逐 kernel 观测使用单独的串行 profile 配置。实现、指标和三组固定集合核查见 [阶段 4 完成记录](phases/PHASE_4.md)。
 
+selected 预测在集合固定后跨 head 优先派发，正式所需请求提升；每块读完后独立进入 H2D。overlap 的追加前沿等待 KV 下载、历史读取与历史复制共同完成。类别、在途请求及源租约检查见 [块读取流水](implementation/BLOCK_READ_PIPELINE.md)。
+
 ## 9. 模块接口
 
 ```text

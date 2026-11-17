@@ -5,6 +5,7 @@
 
 namespace solid {
 struct ReadCompletion { std::uint64_t id; std::int64_t result; };
+enum class ReadPriority : std::uint8_t { correction_selected, correction_deterministic, selected, deterministic };
 struct AsyncIoStats {
     std::uint64_t read_requests = 0;
     std::uint64_t read_bytes = 0;
@@ -26,6 +27,10 @@ class AsyncReader {
 public:
     virtual ~AsyncReader() = default;
     virtual bool submit(std::uint64_t id, int fd, void * destination, std::size_t bytes, std::uint64_t offset) = 0;
+    virtual bool submit_prioritized(std::uint64_t id, int fd, void * destination, std::size_t bytes,
+                                    std::uint64_t offset, ReadPriority) { return submit(id,fd,destination,bytes,offset); }
+    // Promote admitted jobs that have not entered the kernel yet.
+    virtual void prioritize(std::uint64_t, ReadPriority) {}
     virtual void cancel(std::uint64_t id) = 0;
     virtual void flush() = 0;
     // Only original READ completion ends a buffer's kernel-write lifetime.

@@ -26,6 +26,8 @@
 
 18. [独立 I/O 与协调线程](docs/implementation/IO_WORKERS.md)：有界提交、完成通知、取消排空、物理核预留和实际线程记录。
 
+19. [selected 优先读取与逐块上传](docs/implementation/BLOCK_READ_PIPELINE.md)：跨 head 提交顺序、正式请求提升、SSD/H2D 流水和完成汇合。
+
 ## 系统机制
 
 - KV consolidator：按 token 交错存储 K/V，以一次传输读取成对数据。

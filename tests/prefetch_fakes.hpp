@@ -40,6 +40,7 @@ public:
     std::function<void()> before_wait;
     solid::AsyncIoStats counters;
     std::vector<Pending> pending;
+    std::vector<Pending> submitted;
     bool submit(std::uint64_t id, int, void * dst, std::size_t bytes, std::uint64_t offset) override {
         if (pending.size() >= capacity) return false;
         require(file != nullptr, "unexpected file read");
@@ -49,6 +50,7 @@ public:
             require(address + bytes <= prior || prior + old.bytes <= address, "reused destination before original completion");
         }
         pending.push_back({id, static_cast<unsigned char *>(dst), bytes, offset, false});
+        submitted.push_back(pending.back());
         ++counters.read_requests;
         return true;
     }

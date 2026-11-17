@@ -23,3 +23,4 @@
 | CUDA 后续窗口代表构造 | [GPU 代表构造](../implementation/GPU_REPRESENTATIVES.md) | 阶段 1 的代表构造、prefill/decode 交接、阶段 4 图接入 |
 | 有界 CUDA 分块 prefill | [GPU prefill](../implementation/GPU_PREFILL.md) | 阶段 1 的长输入 attention、存储读取及工作区上限 |
 | 独立 I/O 与协调线程 | [I/O 线程](../implementation/IO_WORKERS.md) | 阶段 3 的请求/完成及取消；阶段 4 的线程分工和 CPU 核预留 |
+| selected 优先与逐块 SSD/H2D 流水 | [块读取流水](../implementation/BLOCK_READ_PIPELINE.md) | 阶段 3 的预测/纠错、阶段 4 的读复制重叠和依赖汇合 |

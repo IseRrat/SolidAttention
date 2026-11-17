@@ -10,6 +10,7 @@
 #include <stdexcept>
 #include <system_error>
 #include <thread>
+#include <tuple>
 #ifdef __linux__
 #include <poll.h>
 #include <sys/eventfd.h>
@@ -25,6 +26,7 @@ class IoWorker final:public AsyncReader {
         int fd; void * destination; std::size_t bytes; std::uint64_t offset,sequence;
         Phase phase=Phase::queued;
         bool cancelled=false,cancel_sent=false;
+        ReadPriority priority=ReadPriority::deterministic;
     };
 public:
     IoWorker(std::function<std::unique_ptr<AsyncReader>()> factory,std::uint32_t depth,int cpu):
@@ -44,6 +46,9 @@ public:
         notify(); thread_.join(); close(wake_);
     }
     bool submit(std::uint64_t id,int fd,void * destination,std::size_t bytes,std::uint64_t offset) override {
+        return submit_prioritized(id,fd,destination,bytes,offset,ReadPriority::deterministic);
+    }
+    bool submit_prioritized(std::uint64_t id,int fd,void * destination,std::size_t bytes,std::uint64_t offset,ReadPriority priority) override {
         {
             std::lock_guard<std::mutex> lock(mutex_); check();
             if (!id || id>=(std::uint64_t{1}<<63) || fd<0 || !destination || !bytes || bytes>INT_MAX ||
@@ -51,9 +56,15 @@ public:
             if (draining_) throw std::logic_error("read submitted during I/O drain");
             if (requests_.size()>=depth_) return false;
             if (sequence_==UINT64_MAX) throw std::overflow_error("I/O submission sequence exhausted");
-            requests_.emplace(id,Request{fd,destination,bytes,offset,++sequence_});
+            auto request=Request{fd,destination,bytes,offset,++sequence_}; request.priority=priority;
+            requests_.emplace(id,request);
         }
         notify(); return true;
+    }
+    void prioritize(std::uint64_t id,ReadPriority priority) override {
+        { std::lock_guard<std::mutex> lock(mutex_); check(); const auto found=requests_.find(id);
+          if (found!=requests_.end() && found->second.phase!=Phase::complete && priority<found->second.priority) found->second.priority=priority; }
+        notify();
     }
     void cancel(std::uint64_t id) override {
         { std::lock_guard<std::mutex> lock(mutex_); check(); const auto found=requests_.find(id);
@@ -144,7 +155,8 @@ private:
                         std::lock_guard<std::mutex> lock(mutex_);
                         auto best=requests_.end();
                         for (auto it=requests_.begin();it!=requests_.end();++it) if (it->second.phase==Phase::queued && !it->second.cancelled &&
-                            (best==requests_.end() || it->second.sequence<best->second.sequence)) best=it;
+                            (best==requests_.end() || std::tie(it->second.priority,it->second.sequence)<
+                                                     std::tie(best->second.priority,best->second.sequence))) best=it;
                         if (best==requests_.end()) break;
                         id=best->first; request=best->second; best->second.phase=Phase::active;
                     }

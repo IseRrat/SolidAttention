@@ -167,3 +167,5 @@ python3 scripts/schedule_ablation.py compare results/schedule-configs/schedule-a
 | 离线工具 | 固定输入、三组配置、来源、指标变更、依赖违规、失败/未闭合及提前释放拒绝 |
 
 本机输入为合成张量与临时文件，数学计算使用 CPU 后端。模型数值、CUDA 复制与计算并发、设备延迟、显存峰值及论文实验在实验环境按上述入口核查。阶段索引见 [完成记录](README.md)，后续实验见 [阶段 5](../ROADMAP.md#阶段-5论文实验)。
+
+2026-11-18 接入逐块历史 H2D。overlap 的历史上传依赖选择，与纠错读取重叠；追加等待 KV 下载、纠错读取和历史上传共同完成。当前仍记录 12 项聚合任务，完成记录见 [块读取流水](../implementation/BLOCK_READ_PIPELINE.md)。

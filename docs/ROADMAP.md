@@ -4,7 +4,7 @@
 
 每个阶段完成代码与检查后，在 [阶段完成记录](phases/README.md) 新增该阶段的实现与核查说明。
 
-当前阶段记录描述首版代码及其检查结果。论文核心路径的后续开发见 [论文实现核查](PAPER_IMPLEMENTATION_AUDIT.md)：GPU 执行、块级事件调度、selected 优先及 I/O/协调线程分工。先完成这些代码，再推进正式评测与阶段 6。
+当前阶段记录描述首版代码及其检查结果。论文核心路径的后续开发见 [论文实现核查](PAPER_IMPLEMENTATION_AUDIT.md)：设备 Q/K 直接接入、块级事件调度、设备完成观测及 SYCL。先完成这些代码，再推进正式评测与阶段 6。
 
 已完成的核心补齐：[CUDA 块评分与动态选块](implementation/GPU_SELECTION.md)、[CUDA 窗口代表构造](implementation/GPU_REPRESENTATIVES.md)、[有界 GPU 分块 prefill](implementation/GPU_PREFILL.md)。[独立 I/O 与协调线程](implementation/IO_WORKERS.md) 也已完成。后续推进块级调度、设备事件与设备 Q/K 直接接入。
 
@@ -52,7 +52,7 @@
 
 建立任务 DAG，拆分 SSD、H2D、D2H 和 GPU 完成事件。依次打开 miss load/KV projection 重叠、下一层读取和同步点复用，复用单层工作集。
 
-代码产物：DAG/LST 调度、单个有界 worker、独立复制后端、Q 依赖与请求边界复用、事件轨迹和 `naive/overlap/overlap+sync_reuse` 对照工具。
+代码产物：DAG/LST 调度、有界协调与独立 I/O 线程、独立复制后端、Q 依赖与请求边界复用、事件轨迹和 `naive/overlap/overlap+sync_reuse` 对照工具。
 
 代码验收：数据依赖与槽位释放时序正确；三种模式的合成图输出通过串行对照；实际轨迹的同步次数、临界路径和重叠可独立重算。完成记录见 [阶段 4](phases/PHASE_4.md)。
 
