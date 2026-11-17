@@ -278,7 +278,8 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     impl_->model = model;
     impl_->gpu_decode = options.gpu_decode;
     impl_->prefill_tokens = prefill_tokens;
-    impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens, trace,
+    impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens,
+        options.selection_trace ? trace : std::filesystem::path{},
         options.selection_replay, options.prefetch ? make_uring_reader(options.prefetch_queue_depth) : nullptr,
         options.prefetch_slots_per_head, options.prefetch_trace ? trace.parent_path() / "prefetch.jsonl" : std::filesystem::path{});
     if (options.prefetch_trace) impl_->residency_trace = trace.parent_path() / "residency.jsonl";

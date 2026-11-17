@@ -56,7 +56,7 @@ if(SOLID_BUILD_RUNNER)
     add_subdirectory(third_party/llama.cpp EXCLUDE_FROM_ALL)
     include(cmake/Adapter.cmake)
     add_executable(solid-baseline src/baseline.cpp src/profile.cpp)
-    target_include_directories(solid-baseline PRIVATE third_party/llama.cpp/vendor "${CMAKE_BINARY_DIR}/generated")
+    target_include_directories(solid-baseline PRIVATE third_party/llama.cpp/vendor third_party/llama.cpp/src "${CMAKE_BINARY_DIR}/generated")
     target_link_libraries(solid-baseline PRIVATE solid_config llama)
     target_compile_definitions(solid-baseline PRIVATE SOLID_UPSTREAM_COMMIT="${SOLID_UPSTREAM_COMMIT}")
 endif()
@@ -109,6 +109,12 @@ if(SOLID_BUILD_TESTS)
         set_tests_properties(schedule-trace-audit PROPERTIES TIMEOUT 150)
         add_test(NAME baseline-help COMMAND solid-baseline --help)
         add_test(NAME baseline-build-info COMMAND solid-baseline --build-info)
+        add_test(NAME vocabulary-only-tokenizer COMMAND "${Python3_EXECUTABLE}"
+            "${PROJECT_SOURCE_DIR}/tests/tokenize_fixture.py" $<TARGET_FILE:solid-baseline>)
+        set_tests_properties(vocabulary-only-tokenizer PROPERTIES TIMEOUT 90)
+        add_test(NAME experiment-config-matrix COMMAND "${Python3_EXECUTABLE}"
+            "${PROJECT_SOURCE_DIR}/tests/validate_experiment_configs.py" $<TARGET_FILE:solid-baseline>)
+        set_tests_properties(experiment-config-matrix PROPERTIES TIMEOUT 180)
         add_test(NAME locked-model-config COMMAND solid-baseline --validate-config
             "${PROJECT_SOURCE_DIR}/configs/qwen2.5-7b-q4_k_m.json")
         foreach(SOLID_MODE offload offload-sparse indram-sparse indram-reference

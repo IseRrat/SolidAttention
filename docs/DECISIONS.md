@@ -26,6 +26,12 @@
 | D20 | 独立 GGML 复制后端与单层 pinned 暂存；同流最新已记录事件覆盖批量复制 | 阶段 4，GgmlTransport、DeviceCache |
 | D21 | 检查后继 Q 的实际图祖先后复用完成证明；末层复用已有请求同步，显式 fallback 单独计数 | 阶段 4，graph_depends_on、after_process |
 | D22 | DAG 按关键路径/LST 安排就绪 I/O；主机完成区间、逐 kernel 观测和端到端计时分别记录 | 阶段 4，TaskDag、schedule_ablation.py |
+| D23 | 性能输入从固定文本对应的模型 token 序列取精确前缀；容量覆盖 prompt 与生成输入 | 阶段 5，--tokenize、prompt_token_ids、experiments.py |
+| D24 | 预热与测量分开，独立结果目录、保存随机种子；已完成项核查后跳过，失败与中断保留终态 | 阶段 5，execution.json、POSIX 锁、collect |
+| D25 | decode 吞吐率使用 decode_steps；阶段计数、单轮延迟与跨重复统计分别保存 | 阶段 5，attention_phases、run_metrics |
+| D26 | 干扰使用已有文件的只读 fio；观测完成 read 后开始推理，记录请求速率和实测报告 | 阶段 5，experiment_runtime.py、cuda-io.json |
+| D27 | 准确率连接固定框架版本；原生 Q4_0 KV 对照，自定义 F16 KV；生成与 teacher-forced NLL 均保存来源 | 阶段 5，RunnerClient、OpenCompass、官方 LongBench scorer |
+| D28 | 图表独立重算来源，要求完整测量；中位数与最小/最大误差条共用 PNG/PDF 数据 | 阶段 5，plot_experiments.py、figure.json |
 
 ## 参数锁定任务
 

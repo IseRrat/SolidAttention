@@ -6,6 +6,8 @@
 
 微任务调度使用 [阶段 4](phases/PHASE_4.md) 的三组固定集合对照。检查覆盖 DAG/LST、Q 提前选择、worker 并发、延迟 pin、后继 Q 完成证明，以及真实合成图轨迹与统计的跨语言核对。
 
+论文实验代码入口见 [阶段 5](phases/PHASE_5.md)。CUDA 矩阵模板覆盖精确长度、内存、预取、块/预算、SSD 差异和干扰；准确率接口连接固定版本的 OpenCompass 与 LongBench，汇总和图表保留运行来源。
+
 ## 1. 参考路径与数值对照
 
 | 路径 | KV 位置与选择 | 用途 |
@@ -80,13 +82,15 @@ LongBench 八任务使用 2WikiMQA、TriviaQA、HotpotQA、MultiFieldQA、MuSiQu
 
 ## 5. 计时、内存与 SSD 口径
 
-分别记录模型加载、prefill、首 token、decode 和整请求耗时。decode token/s 为实际生成 token 数除以对应 decode 时间；同时保存计数与起止事件。遇到 prefill 直接产生首 token 的接口，单独记录该 token 的归属。
+分别记录模型加载、prefill、首 token、decode 和整请求耗时。decode token/s 为 `decode_steps * 1000 / decode_loop_ms`；首个来自 prefill logits 的输出单独计数。性能矩阵固定 512 个输出，对应 511 个 decode 步。准确率任务采用各数据集配置的生成与停止规则。
 
 逐 token 延迟给出平均、P50、P90、P99；重复运行报告中位数和范围。初始使用 5 次独立测量，预热次数和样本量写入配置。I/O 阻塞取 attention 等待 KV 就绪的临界路径区间，使用事件时间轴计算重叠区间。
 
 调度轨迹使用主机 `steady_clock_ns`，其任务区间包含到相应完成边界为止的执行与等待。`observed_critical_path_sum_ms` 按各帧任务时长计算最长依赖链，区间间的调度空隙保留在时间轴；`miss_projection_overlap_sum_ms` 计算历史纠错与 KV 到主机区间的交集。逐 kernel 成本使用 `profile.nodes` 的串行观测配置，端到端性能配置关闭全部详细轨迹与 profile。
 
 使用 cgroup v2 设置 DRAM 限额并记录 `memory.max`、`memory.peak`、`memory.stat` 和 swap 设置；CUDA 显存单独统计。页缓存、pinned memory、代表向量、读写缓冲区、模型与工作区分别计量。
+
+`attention_phases` 分别记录 prefill、decode 和最终回写。`memory.kv_system_tracked_bytes` 汇总实际 KV 系统分配，原生后端 buffer 与自定义 store/代表/预取/设备/复制暂存各有明细；跟踪工作区与额外投影权重单列。重复测量、单轮 token 延迟与 fio 实际速率分别保留。
 
 buffered I/O 分冷缓存与热缓存两组，记录缓存准备步骤。direct I/O 记录对齐、队列深度和提交批量。设备计数与进程 I/O 计数并列，后台负载单独记录。prefill 新写入数据在 decode 时的页缓存驻留纳入测量。
 

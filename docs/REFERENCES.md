@@ -31,3 +31,6 @@ CUDA 参照环境：Ultra 9 185H、RTX 4070 Laptop 8 GB、Linux 6.8、CUDA 12.8�
 - [liburing](https://github.com/axboe/liburing)：异步 SSD I/O。
 - [fio](https://github.com/axboe/fio)：SSD 微基准和干扰负载。
 - [NVIDIA CUDA 事件接口](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__EVENT.html)、[异步执行](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html)：事件记录、流等待及跨流完成边界，阶段 4 通过锁定版本的 GGML 后端接口接入。
+- [OpenCompass BaseModel](https://github.com/open-compass/opencompass/blob/main/opencompass/models/base.py)、[HF 评分接口](https://github.com/open-compass/opencompass/blob/main/opencompass/models/huggingface.py)：阶段 5 的生成和平均 NLL 接口；正式评测锁定完整框架提交。
+- [LongBench 评测器](https://github.com/THUDM/LongBench/blob/main/LongBench/eval.py)：预测格式、数据集 scorer 和多答案聚合，阶段 5 从固定提交加载官方实现。
+- [systemd-run](https://www.freedesktop.org/software/systemd/man/latest/systemd-run.html)、[cgroup v2](https://www.kernel.org/doc/html/latest/admin-guide/cgroup-v2.html)：实验进程启动前的资源限制及观测范围。

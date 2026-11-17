@@ -34,6 +34,8 @@
 
 阶段 4 的 `schedule` 控制 `naive`、`overlap`、`overlap+sync_reuse`。Q 选择前沿提前触发历史补读，独立复制后端上传单层工作集，worker 继续满缓冲回写和下一层读取。`schedule_trace` 输出任务依赖与完成区间；配置、同步证明及三组核查见 [阶段 4 完成记录](phases/PHASE_4.md)。
 
+阶段 5 增加固定 `prompt_token_ids`、可关闭的 `selection_trace`、prefill/decode/最终回写分段计数和实际内存分项。CUDA 矩阵、准确率与结果工具见 [阶段 5 完成记录](phases/PHASE_5.md)。自定义 KV 保持 F16，原生 Q4_0 路径供准确率对照。
+
 入口支持 Llama、Qwen2 的单序列文本 decode、统一层形状和 FP16 KV。模型形状在 adapter 构造时检查。每个模型绑定一个会话，位置从 0 连续追加。
 
 ## KV 文件格式

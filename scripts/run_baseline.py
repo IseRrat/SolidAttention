@@ -9,6 +9,7 @@ from pathlib import Path
 import platform
 import re
 import shutil
+import signal
 import subprocess
 import sys
 import time
@@ -96,13 +97,22 @@ def process_memory(pid):
     return values
 
 
-def cgroup_memory(pid):
+def process_io(pid):
     try:
-        relative = next(line[3:] for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines()
-                        if line.startswith("0::"))
-        group = Path("/sys/fs/cgroup") / relative.lstrip("/")
+        return {key: int(value) for key,value in (line.split(":",1) for line in Path(f"/proc/{pid}/io").read_text().splitlines())}
+    except (FileNotFoundError, PermissionError):
+        return {}
+
+
+def cgroup_memory(pid=None, group=None):
+    try:
+        if group is None:
+            relative = next(line[3:] for line in Path(f"/proc/{pid}/cgroup").read_text().splitlines()
+                            if line.startswith("0::"))
+            group = Path("/sys/fs/cgroup") / relative.lstrip("/")
+        group = Path(group)
         values = {"path": str(group)}
-        for name in ("memory.max", "memory.peak", "memory.current", "memory.swap.max", "memory.stat"):
+        for name in ("memory.max", "memory.peak", "memory.current", "memory.swap.max", "memory.stat", "memory.events", "io.stat", "cpuset.cpus.effective"):
             path = group / name
             if path.exists():
                 values[name] = path.read_text().strip()
@@ -184,6 +194,7 @@ def main():
         "environment": {key: os.environ.get(key) for key in
                         ("CUDA_VISIBLE_DEVICES", "GGML_CUDA_DISABLE_GRAPHS", "OMP_NUM_THREADS")},
         "memory_sample_interval_seconds": 0.1,
+        "launcher_sha256": digest(Path(__file__)),
     }
     try:
         manifest["gpu"] = command_output(["nvidia-smi", "--query-gpu=name,driver_version,memory.total", "--format=csv,noheader"])
@@ -199,13 +210,17 @@ def main():
         start = time.monotonic()
         manifest["status"] = "running"
         manifest["cgroup_start"] = cgroup_memory(process.pid)
+        manifest["proc_io_start"] = process_io(process.pid)
         atomic_json(run_dir / "manifest.json", manifest)
         peak_rss = 0
+        def interrupt(signum, frame):
+            raise KeyboardInterrupt(f"received signal {signum}")
+        previous_handler = signal.signal(signal.SIGTERM, interrupt)
         try:
             while process.poll() is None:
                 sample = process_memory(process.pid)
                 peak_rss = max(peak_rss, sample.get("VmHWM_bytes", sample.get("VmRSS_bytes", 0)))
-                memory.write(json.dumps({"seconds": time.monotonic() - start, **sample}) + "\n")
+                memory.write(json.dumps({"seconds": time.monotonic() - start, **sample, "proc_io":process_io(process.pid)}) + "\n")
                 manifest["cgroup_last"] = cgroup_memory(process.pid)
                 time.sleep(0.1)
         except BaseException:
@@ -219,12 +234,19 @@ def main():
             manifest["returncode"] = process.returncode
             atomic_json(run_dir / "manifest.json", manifest)
             raise
+        finally:
+            signal.signal(signal.SIGTERM, previous_handler)
+            group = manifest["cgroup_start"].get("path")
+            manifest["cgroup_end"] = cgroup_memory(group=group) if group else {}
+            atomic_json(run_dir / "manifest.json", manifest)
         manifest["returncode"] = process.returncode
         manifest["elapsed_seconds"] = time.monotonic() - start
         manifest["sampled_peak_rss_bytes"] = peak_rss
         manifest["status"] = "complete" if process.returncode == 0 and output.is_file() else "failed"
         if manifest["status"] == "complete":
             manifest["result_sha256"] = digest(output)
+        stdout.flush(); stderr.flush(); memory.flush()
+        manifest["artifacts_sha256"] = {name:digest(run_dir/name) for name in ("stdout.txt","stderr.txt","memory.jsonl")}
         atomic_json(run_dir / "manifest.json", manifest)
     print(run_dir)
     return 0 if manifest["status"] == "complete" else 1

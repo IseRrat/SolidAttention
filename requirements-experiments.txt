@@ -1,0 +1,2 @@
+# Figure generation; inference and scoring use the pinned experiment environment.
+matplotlib>=3.8,<4

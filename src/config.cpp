@@ -47,7 +47,7 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     const std::set<std::string> keys = {
         "schema_version", "model", "model_sha256", "additional_model_files", "prompt", "output", "context_tokens",
         "batch_tokens", "microbatch_tokens", "max_new_tokens", "threads", "gpu_layers",
-        "flash_attention", "kv_on_gpu", "ignore_eos", "sampling", "kv_dtype", "attention", "dump_logits", "replay_token_ids"
+        "flash_attention", "kv_on_gpu", "ignore_eos", "sampling", "kv_dtype", "attention", "dump_logits", "replay_token_ids", "prompt_token_ids"
     };
     if (!j.is_object()) {
         throw std::invalid_argument("config must be an object");
@@ -57,8 +57,9 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
             throw std::invalid_argument("unknown config key: " + item.key());
         }
     }
-    if (j.at("schema_version") != 1 || j.at("sampling") != "greedy" || j.at("kv_dtype") != "f16") {
-        throw std::invalid_argument("expected schema_version=1, sampling=greedy and kv_dtype=f16");
+    if (j.at("schema_version") != 1 || j.at("sampling") != "greedy" ||
+        (j.at("kv_dtype") != "f16" && j.at("kv_dtype") != "q4_0")) {
+        throw std::invalid_argument("expected schema_version=1, sampling=greedy and kv_dtype=f16 or q4_0");
     }
     RunConfig result;
     const auto base = std::filesystem::absolute(path).parent_path();
@@ -116,6 +117,20 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     result.flash_attention = j.at("flash_attention").get<bool>();
     result.kv_on_gpu = j.at("kv_on_gpu").get<bool>();
     result.ignore_eos = j.at("ignore_eos").get<bool>();
+    result.kv_dtype = j.at("kv_dtype").get<std::string>();
+    if (result.kv_dtype == "q4_0" && !result.flash_attention) throw std::invalid_argument("q4_0 KV requires flash attention");
+    if (j.contains("prompt_token_ids")) {
+        const auto & ids = j.at("prompt_token_ids");
+        if (!ids.is_array() || ids.empty() || ids.size() + static_cast<std::uint64_t>(result.max_new_tokens) - 1 > result.context_tokens) {
+            throw std::invalid_argument("prompt_token_ids must be nonempty and fit the context with generated inputs");
+        }
+        for (const auto & id : ids) {
+            if (!id.is_number_integer() || id.get<std::int64_t>() < 0 || id.get<std::uint64_t>() > INT32_MAX) {
+                throw std::invalid_argument("prompt token ID must be a nonnegative int32");
+            }
+            result.prompt_token_ids.push_back(id.get<std::int32_t>());
+        }
+    }
     if (j.contains("dump_logits")) result.dump_logits = j.at("dump_logits").get<bool>();
     if (j.contains("replay_token_ids")) {
         const auto & ids = j.at("replay_token_ids");
@@ -133,11 +148,13 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         const auto & a = j.at("attention");
         const std::set<std::string> allowed = {"storage", "sparse", "gpu_decode", "layout", "fuse_kv_projection", "profile", "block_tokens", "context_budget_tokens",
             "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "selection_replay",
-            "prefetch", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head", "schedule", "schedule_trace"};
+            "prefetch", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head", "schedule", "schedule_trace", "selection_trace"};
         if (!a.is_object()) throw std::invalid_argument("attention must be an object");
         for (const auto & item : a.items()) if (allowed.count(item.key()) == 0) throw std::invalid_argument("unknown attention key: " + item.key());
         auto & target = result.attention;
         target.enabled = true;
+        if (result.kv_dtype != "f16") throw std::invalid_argument("custom attention requires f16 KV");
+        if (a.contains("selection_trace")) target.selection_trace = a.at("selection_trace").get<bool>();
         const auto storage = a.at("storage").get<std::string>();
         if (storage != "memory" && storage != "ssd") throw std::invalid_argument("attention storage must be memory or ssd");
         target.in_memory = storage == "memory";

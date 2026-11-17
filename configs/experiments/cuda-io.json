@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "models": [
+    {"name": "qwen2.5-7b", "config": "../qwen2.5-7b-q4_k_m.json", "corpus": "../../data/wikitext-2.txt", "tokens": "../../data/wikitext2-qwen.tokens.json"}
+  ],
+  "conditions": [
+    {"name": "ssd-high", "session_root": "/mnt/ssd-high/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": null},
+    {"name": "ssd-low", "session_root": "/mnt/ssd-low/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": null},
+    {"name": "seq-1gb", "session_root": "/mnt/ssd-high/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": {"kind": "sequential-read", "file": "/mnt/ssd-high/solid-fio.data", "rate": 1000000000, "iodepth": 64}},
+    {"name": "seq-2gb", "session_root": "/mnt/ssd-high/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": {"kind": "sequential-read", "file": "/mnt/ssd-high/solid-fio.data", "rate": 2000000000, "iodepth": 64}},
+    {"name": "seq-3gb", "session_root": "/mnt/ssd-high/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": {"kind": "sequential-read", "file": "/mnt/ssd-high/solid-fio.data", "rate": 3000000000, "iodepth": 64}},
+    {"name": "seq-4gb", "session_root": "/mnt/ssd-high/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": {"kind": "sequential-read", "file": "/mnt/ssd-high/solid-fio.data", "rate": 4000000000, "iodepth": 64}},
+    {"name": "rand-200k", "session_root": "/mnt/ssd-high/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": {"kind": "random-read", "file": "/mnt/ssd-high/solid-fio.data", "rate": 200000, "iodepth": 64}},
+    {"name": "rand-400k", "session_root": "/mnt/ssd-high/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": {"kind": "random-read", "file": "/mnt/ssd-high/solid-fio.data", "rate": 400000, "iodepth": 64}},
+    {"name": "rand-600k", "session_root": "/mnt/ssd-high/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": {"kind": "random-read", "file": "/mnt/ssd-high/solid-fio.data", "rate": 600000, "iodepth": 64}},
+    {"name": "rand-800k", "session_root": "/mnt/ssd-high/solid-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": {"kind": "random-read", "file": "/mnt/ssd-high/solid-fio.data", "rate": 800000, "iodepth": 64}}
+  ],
+  "repeats": 5,
+  "warmups": 1,
+  "seed": 2026,
+  "max_new_tokens": 512,
+  "suites": [
+    {"name": "ssd-comparison", "lengths": [1024, 4096, 16384, 65536], "variants": ["solid"], "blocks": [32], "budgets": [1024, 4096], "conditions": ["ssd-high", "ssd-low"]},
+    {"name": "interference", "lengths": [16384], "variants": ["offload-sparse", "solid"], "blocks": [32], "budgets": [1024], "conditions": ["ssd-high", "seq-1gb", "seq-2gb", "seq-3gb", "seq-4gb", "rand-200k", "rand-400k", "rand-600k", "rand-800k"]}
+  ]
+}

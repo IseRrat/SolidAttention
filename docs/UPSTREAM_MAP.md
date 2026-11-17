@@ -56,6 +56,7 @@ solid-baseline
 6. `build_qkv` 在融合模式进入 `adapter_qkv`，K RoPE 结果写回融合张量；`ggml-backend.cpp` 的同步复制与预取复制位置提供观测钩子。
 7. 预取模式在 `AdapterInput::set_input` 启动首层读取；`AttentionNode` 追加与正式选择后补读，将物理槽位 mask 接入 Flash Attention。`ggml_backend_sched_eval_callback` 确认每层 attention 完成并释放设备租约，context 清理前排空复制。详细接口见 [阶段 3](phases/PHASE_3.md)。
 8. overlap 模式在 `adapter_attention` 显式展开 Q-only 选择节点后遍历 KV；`GgmlPrefetch` 用独立 GGML 后端执行复制，worker 执行历史纠错、满缓冲回写和后继预取。sync_reuse 模式通过 `graph_depends_on` 核查 Q 的 Flash Attention 祖先，`after_process` 复用已有 `llama_synchronize`。详细完成依据见 [阶段 4](phases/PHASE_4.md)。
+9. 实验入口用 `llama_model_params.vocab_only` 提取实际词表 token，原生 `cp.type_k/type_v` 可配置 Q4_0；`llama_get_memory()->memory_breakdown()` 报告实际原生内存分配，自定义路径单列物理缓冲。阶段计数在 prefill、decode 和清理三个边界保存，详见 [阶段 5](phases/PHASE_5.md)。
 
 ## 计时边界
 

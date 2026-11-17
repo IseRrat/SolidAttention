@@ -24,6 +24,7 @@ struct AttentionConfig {
     bool prefetch_trace = false;
     std::string schedule = "naive";
     bool schedule_trace = false;
+    bool selection_trace = true;
     std::uint32_t prefetch_queue_depth = 64;
     std::uint32_t prefetch_slots_per_head = 0;
     std::uint32_t block_tokens = 32;
@@ -52,6 +53,8 @@ struct RunConfig {
     bool flash_attention = true;
     bool kv_on_gpu = true;
     bool ignore_eos = false;
+    std::string kv_dtype = "f16";
+    std::vector<std::int32_t> prompt_token_ids;
     AttentionConfig attention;
     bool dump_logits = false;
     bool replay = false;

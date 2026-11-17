@@ -28,6 +28,8 @@ def prepare(reference, template, output):
     config["output"] = str(Path(output).resolve())
     config["max_new_tokens"] = len(ids)
     config["replay_token_ids"] = inputs
+    if "prompt_token_ids" in reference:
+        config["prompt_token_ids"] = reference["prompt_token_ids"]
     config["dump_logits"] = True
     return config
 

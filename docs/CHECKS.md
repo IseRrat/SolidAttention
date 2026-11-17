@@ -87,3 +87,22 @@ bash scripts/check.sh --cuda
 `bash scripts/check.sh --cuda` 通过 CUDA 编译与链接、27 项 CTest、23 项 Python 检查和源码指纹核对。`bash scripts/check.sh --sanitize` 通过 6 项核心 CTest 与地址、泄漏和未定义行为检查。输入为合成张量与临时文件，数学计算使用 CPU 后端。任务指标采用主机观测完成区间；模型、CUDA 实际并发和设备性能的实验环境入口见 [阶段 4 完成记录](phases/PHASE_4.md)。
 
 17 篇 Markdown 的本地链接、标题锚点、代码块与文风检查通过，配置 JSON 解析及差异格式检查通过。
+
+## 2026-11-17：论文实验代码与评测入口
+
+| 检查范围 | 证据 |
+| --- | --- |
+| 词表与固定输入 | 零张量、纯元数据的合成 GGUF；两次 token 化一致、源/模型哈希、ID 类型和容量 |
+| 模式配置 | 十种矩阵 variant 全部通过真实运行器配置解析；原生 Q4_0 与自定义 F16 约束 |
+| 实验计划 | 精确 token 前缀、生成容量、预热与重复、关闭详细轨迹、源文件变更与非法轴拒绝 |
+| 执行与恢复 | 假进程推进、独占锁、已完成项核查与跳过；失败和 pending 重复单独保留 |
+| 统计与来源 | decode 步数、首 token 归属、逐 token 分位数、重复分布、代码/二进制混用及哈希变更拒绝 |
+| 干扰接口 | 只读 fio 参数、已有文件限制、输入身份检查、连续 JSON 与未完成状态处理 |
+| 准确率 | teacher-forced NLL、稳定 log-sum-exp、目标对齐、显式中间截断、预测覆盖及模型身份 |
+| 官方接口 | OpenCompass 生成/PPL 契约、LongBench scorer revision 与字段、八任务导出合并、官方 CSV 导入 |
+| 选择稳定性 | init/local 区域排除、按层/head 比较、相邻 selected 块重合率 |
+| 绘图 | 合成文件夹具、summary 独立重算、完整重复要求、PNG/PDF 导出、误差条和来源清单 |
+
+`bash scripts/check.sh --cuda` 通过 CUDA 编译与链接、29 项 CTest、42 项 Python 检查和最终源码指纹核对。`--sanitize` 的 6 项核心 CTest、地址、泄漏与未定义行为检查通过。18 篇 Markdown 的链接、标题锚点、代码块、文风及配置 JSON 检查通过。
+
+新增验证使用零张量 GGUF、合成 token/logits、假进程与临时文件。绘图依赖安装在已忽略的构建目录，合成 PNG/PDF 完成可视核查。模型、设备与 fio 实验在实验环境按 [阶段 5](phases/PHASE_5.md) 执行。

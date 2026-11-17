@@ -4,6 +4,7 @@
 #include "solid/profile.hpp"
 #include "solid_build_info.hpp"
 #include "llama.h"
+#include "llama-memory.h"
 #include "ggml-backend.h"
 #include "nlohmann/json.hpp"
 
@@ -89,6 +90,25 @@ Json metadata(const llama_model * model) {
     }
     return result;
 }
+Json counters(const solid::SessionStats & s, const solid::DeviceCacheStats & d) {
+    return {{"read_requests", s.io.read_requests + s.prefetch.io.read_requests},
+        {"read_bytes", s.io.read_bytes + s.prefetch.io.read_bytes}, {"write_requests", s.io.write_requests},
+        {"write_bytes", s.io.write_bytes}, {"io_read_ms", s.io.read_ns / 1e6}, {"io_write_ms", s.io.write_ns / 1e6},
+        {"attention_queries", s.attention_queries}, {"selected_tokens", s.selected_tokens},
+        {"append_ms", s.append_ns / 1e6}, {"selection_ms", s.selection_ns / 1e6},
+        {"gather_inclusive_ms", s.gather_ns / 1e6}, {"gather_copy_bytes", s.gather_copy_bytes},
+        {"streaming_attention_inclusive_ms", s.streaming_attention_ns / 1e6},
+        {"prefetch_wait_ms", s.prefetch.wait_ns / 1e6}, {"prefetch_resolve_ms", s.prefetch.resolve_ns / 1e6},
+        {"device_uploads", d.uploads}, {"device_upload_bytes", d.upload_bytes}};
+}
+Json difference(const Json & after, const Json & before) {
+    Json out = Json::object();
+    for (const auto & entry : after.items()) {
+        if (entry.value().is_number_unsigned()) out[entry.key()] = entry.value().get<std::uint64_t>() - before.at(entry.key()).get<std::uint64_t>();
+        else out[entry.key()] = entry.value().get<double>() - before.at(entry.key()).get<double>();
+    }
+    return out;
+}
 struct BackendLifetime {
     BackendLifetime() { ggml_backend_load_all(); llama_backend_init(); }
     ~BackendLifetime() { llama_backend_free(); }
@@ -120,23 +140,24 @@ struct AdapterContextLifetime {
 int main(int argc, char ** argv) {
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
-            std::cout << "solid-baseline --config FILE\nsolid-baseline --validate-config FILE\nsolid-baseline --build-info\n";
+            std::cout << "solid-baseline --config FILE\nsolid-baseline --validate-config FILE\nsolid-baseline --tokenize FILE\nsolid-baseline --build-info\n";
             return 0;
         }
         if (argc == 2 && std::string(argv[1]) == "--build-info") {
             std::cout << solid_build_info << '\n';
             return 0;
         }
-        if (argc != 3 || (std::string(argv[1]) != "--config" && std::string(argv[1]) != "--validate-config")) {
-            throw std::invalid_argument("use --config FILE or --validate-config FILE");
+        if (argc != 3 || (std::string(argv[1]) != "--config" && std::string(argv[1]) != "--validate-config" && std::string(argv[1]) != "--tokenize")) {
+            throw std::invalid_argument("use --config FILE, --validate-config FILE or --tokenize FILE");
         }
         const auto config = solid::RunConfig::load(argv[2]);
         if (std::string(argv[1]) == "--validate-config") return 0;
+        const bool tokenize_only = std::string(argv[1]) == "--tokenize";
         if (solid::sha256_file(config.model) != config.model_sha256) throw std::runtime_error("GGUF SHA256 mismatch");
         for (const auto & part : config.additional_model_files) {
             if (solid::sha256_file(part.path) != part.sha256) throw std::runtime_error("GGUF shard SHA256 mismatch: " + part.path.string());
         }
-        if (std::filesystem::exists(config.output)) throw std::runtime_error("output already exists");
+        if (!tokenize_only && std::filesystem::exists(config.output)) throw std::runtime_error("output already exists");
         if (std::filesystem::equivalent(config.model, config.prompt)) throw std::runtime_error("model and prompt must differ");
         const auto prompt = read_file(config.prompt);
         if (prompt.size() > static_cast<std::size_t>(std::numeric_limits<int32_t>::max())) {
@@ -145,11 +166,12 @@ int main(int argc, char ** argv) {
         const auto request_start = Clock::now();
         BackendLifetime backend;
         solid::ExecutionProfile profile(config.attention.profile);
-        if (config.gpu_layers > 0 && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
+        if (!tokenize_only && config.gpu_layers > 0 && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
             throw std::runtime_error("GPU layers requested but no GPU backend is available");
         }
         auto mp = llama_model_default_params();
-        mp.n_gpu_layers = config.gpu_layers;
+        mp.n_gpu_layers = tokenize_only ? 0 : config.gpu_layers;
+        mp.vocab_only = tokenize_only;
         const auto load_start = Clock::now();
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
             llama_model_load_from_file(config.model.string().c_str(), mp), llama_model_free);
@@ -160,13 +182,24 @@ int main(int argc, char ** argv) {
         for (const auto token : config.replay_token_ids) {
             if (token >= llama_vocab_n_tokens(vocab)) throw std::invalid_argument("replay token ID exceeds model vocabulary");
         }
-        int n = llama_tokenize(vocab, prompt.data(), static_cast<int32_t>(prompt.size()), nullptr, 0, true, true);
-        if (n >= 0 || n == std::numeric_limits<int>::min()) throw std::runtime_error("tokenizer sizing failed");
-        std::vector<llama_token> tokens(static_cast<std::size_t>(-n));
-        n = llama_tokenize(vocab, prompt.data(), static_cast<int32_t>(prompt.size()), tokens.data(),
-                           static_cast<int32_t>(tokens.size()), true, true);
-        if (n <= 0) throw std::runtime_error("tokenization failed or prompt is empty");
-        tokens.resize(static_cast<std::size_t>(n));
+        std::vector<llama_token> tokens(config.prompt_token_ids.begin(),config.prompt_token_ids.end());
+        if (tokenize_only || tokens.empty()) {
+            int n = llama_tokenize(vocab, prompt.data(), static_cast<int32_t>(prompt.size()), nullptr, 0, true, true);
+            if (n >= 0 || n == std::numeric_limits<int>::min()) throw std::runtime_error("tokenizer sizing failed");
+            tokens.resize(static_cast<std::size_t>(-n));
+            n = llama_tokenize(vocab, prompt.data(), static_cast<int32_t>(prompt.size()), tokens.data(),
+                               static_cast<int32_t>(tokens.size()), true, true);
+            if (n <= 0) throw std::runtime_error("tokenization failed or prompt is empty");
+            tokens.resize(static_cast<std::size_t>(n));
+        }
+        if (tokenize_only) {
+            Json parts = Json::array({config.model_sha256});
+            for (const auto & part : config.additional_model_files) parts.push_back(part.sha256);
+            std::cout << Json({{"schema_version", 1}, {"model_parts_sha256", parts}, {"source_sha256", solid::sha256_file(config.prompt)},
+                {"add_special", true}, {"parse_special", true}, {"token_ids", tokens}, {"build_info", Json::parse(solid_build_info)}}).dump() << '\n';
+            return 0;
+        }
+        for (const auto token : tokens) if (token >= llama_vocab_n_tokens(vocab)) throw std::invalid_argument("prompt token ID exceeds model vocabulary");
         if (tokens.size() + static_cast<std::uint64_t>(config.max_new_tokens) - 1 > config.context_tokens) {
             throw std::runtime_error("prompt plus generated inputs exceed context_tokens");
         }
@@ -179,7 +212,7 @@ int main(int argc, char ** argv) {
         cp.n_outputs_max_per_seq = 1;
         cp.n_threads = config.threads;
         cp.n_threads_batch = config.threads;
-        cp.type_k = cp.type_v = GGML_TYPE_F16;
+        cp.type_k = cp.type_v = config.kv_dtype == "f16" ? GGML_TYPE_F16 : GGML_TYPE_Q4_0;
         cp.flash_attn_type = config.flash_attention ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cp.offload_kqv = config.kv_on_gpu;
         cp.no_perf = false;
@@ -212,6 +245,7 @@ int main(int argc, char ** argv) {
         }
         if (adapter) adapter->flush();
         const double prefill_ms = milliseconds(prefill_start);
+        const auto prefill_counters = adapter ? counters(adapter->stats(), adapter->device_stats()) : Json::object();
         profile.set_decode();
         std::ofstream logits_file;
         const auto logits_path = config.output.parent_path() / "logits.f32";
@@ -225,6 +259,7 @@ int main(int argc, char ** argv) {
         std::vector<llama_token> generated;
         std::vector<llama_token> decode_inputs;
         std::string text;
+        std::string raw_text;
         std::string stop = "length";
         double decode_ms = 0;
         for (std::uint32_t i = 0; i < config.max_new_tokens; ++i) {
@@ -250,7 +285,8 @@ int main(int argc, char ** argv) {
             const bool eos = llama_vocab_is_eog(vocab, token);
             const auto bytes = piece(vocab, token);
             generated.push_back(token);
-            text += bytes;
+            raw_text += bytes;
+            if (!eos && !llama_vocab_is_control(vocab, token)) text += bytes;
             const double total_ms = milliseconds(start);
             if (i > 0) decode_ms += total_ms;
             trace.push_back({{"index", i}, {"token_id", token}, {"source", i == 0 ? "prefill" : "decode"},
@@ -259,6 +295,7 @@ int main(int argc, char ** argv) {
         }
         if (config.replay) stop = "replay_length";
         if (config.dump_logits) { logits_file.close(); if (!logits_file) throw std::runtime_error("logits close failed"); }
+        const auto decode_counters = adapter ? counters(adapter->stats(), adapter->device_stats()) : Json::object();
         const auto final_flush_start = Clock::now();
         if (adapter) adapter->finish();
         const double final_flush_ms = milliseconds(final_flush_start);
@@ -269,7 +306,8 @@ int main(int argc, char ** argv) {
             {"model", config.model.string()}, {"model_sha256", config.model_sha256},
             {"model_metadata", metadata(model.get())}, {"prompt_token_ids", tokens}, {"generated_token_ids", generated},
             {"decode_input_token_ids", decode_inputs}, {"replay", config.replay},
-            {"text", text}, {"stop_reason", stop}, {"trace", trace},
+            {"text", text}, {"raw_text", raw_text}, {"stop_reason", stop}, {"trace", trace}, {"kv_dtype", config.kv_dtype},
+            {"prompt_source", config.prompt_token_ids.empty() ? "tokenized_text" : "token_ids"},
             {"model_shape", {{"layers", llama_model_n_layer(model.get())}, {"query_heads", llama_model_n_head(model.get())},
                              {"kv_heads", llama_model_n_head_kv(model.get())}, {"embedding", llama_model_n_embd(model.get())}}},
             {"effective_context_tokens", llama_n_ctx(ctx.get())},
@@ -283,6 +321,16 @@ int main(int argc, char ** argv) {
                                 {"prefill_ms", perf.t_p_eval_ms}, {"decode_ms", perf.t_eval_ms}}}
         };
         result["model_parts_sha256"] = Json::array({config.model_sha256});
+        result["memory"] = {{"native_memory_buffers", Json::array()}, {"kv_system_tracked_bytes", 0}};
+        if (!adapter) {
+            std::uint64_t bytes = 0;
+            if (const auto * memory = llama_get_memory(ctx.get())) for (const auto & entry : memory->memory_breakdown()) {
+                bytes += entry.second;
+                result["memory"]["native_memory_buffers"].push_back({{"type", ggml_backend_buft_name(entry.first)},
+                    {"bytes", entry.second}, {"host", ggml_backend_buft_is_host(entry.first)}});
+            }
+            result["memory"]["kv_system_tracked_bytes"] = bytes;
+        }
         for (const auto & part : config.additional_model_files) result["model_parts_sha256"].push_back(part.sha256);
         if (config.dump_logits) {
             result["logits"] = {{"file", "logits.f32"}, {"dtype", "float32-le"}, {"rows", generated.size()},
@@ -292,11 +340,20 @@ int main(int argc, char ** argv) {
             const auto stats = adapter->stats();
             const auto budget = adapter->budget();
             const auto device = adapter->device_stats();
+            const auto staging = adapter->schedule_stats().staging_bytes;
+            result["memory"]["kv_system_tracked_bytes"] = stats.kv_resident_bytes + stats.representative_bytes +
+                stats.prefetch.host_bytes + device.resident_bytes + staging;
+            result["memory"]["custom_buffers"] = {{"store_bytes", stats.kv_resident_bytes}, {"representatives_bytes", stats.representative_bytes},
+                {"prefetch_host_bytes", stats.prefetch.host_bytes}, {"device_kv_bytes", device.resident_bytes}, {"copy_staging_bytes", staging},
+                {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"extra_projection_weight_bytes", adapter->projection_buffer_bytes()}};
+            result["attention_phases"] = {{"prefill", prefill_counters}, {"decode", difference(decode_counters, prefill_counters)},
+                {"final_flush", difference(counters(stats, device), decode_counters)}};
             result["attention"] = {
                 {"storage", config.attention.in_memory ? "memory" : "ssd"}, {"sparse", config.attention.sparse},
                 {"layout", config.attention.interleaved ? "interleaved" : "separate"},
                 {"fuse_kv_projection", config.attention.fuse_kv_projection},
                 {"prefetch", config.attention.prefetch},
+                {"selection_trace_enabled", config.attention.selection_trace},
                 {"schedule", config.attention.schedule},
                 {"projection_extra_weight_bytes", adapter->projection_buffer_bytes()},
                 {"projection_initialization_ms", adapter->projection_initialization_ns() / 1e6},
@@ -360,7 +417,7 @@ int main(int argc, char ** argv) {
                 const auto schedule_trace = config.output.parent_path() / "schedule.jsonl";
                 if (std::filesystem::exists(schedule_trace)) result["schedule_trace_sha256"] = solid::sha256_file(schedule_trace);
             }
-            result["selection_trace_sha256"] = solid::sha256_file(config.output.parent_path() / "selection.jsonl");
+            if (config.attention.selection_trace) result["selection_trace_sha256"] = solid::sha256_file(config.output.parent_path() / "selection.jsonl");
             if (!config.attention.selection_replay.empty()) result["selection_replay_sha256"] = solid::sha256_file(config.attention.selection_replay);
         }
         if (config.attention.profile) {
