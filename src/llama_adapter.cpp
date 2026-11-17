@@ -314,7 +314,7 @@ SessionStats AttentionAdapter::stats() const { check(); return impl_->session->s
 SparseBudget AttentionAdapter::budget() const { return impl_->session->budget(); }
 std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionFrame> frame, std::uint32_t layer, float scale,
                                                     bool gathered, ggml_backend_t backend) {
-    if (gathered && impl_->configure_ranker) {
+    if (impl_->configure_ranker) {
         bool configured = false;
 #ifdef SOLID_HAVE_CUDA_SELECTION
         if (backend && ggml_backend_is_cuda(backend)) {
@@ -322,7 +322,7 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
             for (std::size_t ordinal = 0; ordinal < ggml_backend_reg_dev_count(registry); ++ordinal) {
                 if (ggml_backend_reg_dev_get(registry, ordinal) != ggml_backend_get_device(backend)) continue;
                 impl_->session->set_ranker(make_cuda_block_ranker(impl_->session->geometry(), impl_->session->query_heads(),
-                    impl_->session->budget().representatives, impl_->session->budget().total, static_cast<int>(ordinal)));
+                    impl_->session->budget().representatives, impl_->session->budget().total, static_cast<int>(ordinal), impl_->session->budget().local));
                 configured = true;
                 break;
             }

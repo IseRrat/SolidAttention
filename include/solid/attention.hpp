@@ -30,6 +30,7 @@ public:
     void set_ranker(std::unique_ptr<BlockRanker> ranker);
     RankerStats ranker_stats() const { return ranker_ ? ranker_->stats() : RankerStats{}; }
     const char * ranker_name() const { return ranker_ ? ranker_->name() : "cpu"; }
+    const char * builder_name() const { return ranker_ ? ranker_->builder_name() : "cpu"; }
     std::vector<std::vector<std::uint64_t>> rank_blocks(std::uint32_t layer, const std::vector<float> & query,
                                                        const BlockCandidates & candidates) const;
 private:
@@ -45,6 +46,8 @@ private:
     std::vector<bool> query_pending_;
     std::unique_ptr<BlockRanker> ranker_;
     void publish(BlockRanker & ranker, std::uint32_t layer, std::uint64_t first, std::uint64_t count) const;
+    RepresentativeSeed builder_seed(std::uint32_t layer) const;
+    void accept_built(std::uint32_t layer, std::uint64_t position, const std::optional<BuiltRepresentatives> & built);
     std::size_t index(std::uint32_t layer, std::uint32_t head) const;
 };
 

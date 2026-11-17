@@ -124,3 +124,9 @@ CUDA 编译与链接、30 项 CTest、Linux 54 项 Python 检查及源码指纹�
 新增相关度与预算 top-k 两个 CUDA 内核，接入动态稀疏选择、增量代表发布和运行器。CUDA 12.6、sm_89 编译与链接通过；最终 31 项 CTest、56 项 Linux Python 检查、`.cu` 文件在内的源码指纹通过。核心库 7 项 CTest 的地址、泄漏和未定义行为检查通过。
 
 合成检查覆盖多层/GQA、多代表、并列规则、增量与延迟发布、局部预算、尾块、后端错误结果和会话失败传播；共享归约规则用 CPU tournament 对照完整排序。CUDA 设备检查程序完成编译与链接，执行入口保留在实验环境。代码入口、数据流和检查范围见 [GPU 选择完成记录](implementation/GPU_SELECTION.md)。
+
+## 2026-11-18：CUDA 窗口代表构造
+
+新增 GQA 均值、后续窗口分数更新和块内代表定稿三个 CUDA 内核，接入 prefill/decode 代表构造及现有评分 bank。CUDA 编译与链接、35 项 CTest、56 项 Linux Python 检查、源码指纹通过；核心库 8 项 CTest 的地址、泄漏和未定义行为检查通过。
+
+CPU 执行共用数学并对照既有参考，覆盖完整状态接管、窗口绕回、块/尾块、GQA、多代表和常驻设备容量；故障注入覆盖第二层初始化失败及构造结果错误。三组实际 CPU GGML 图核对预取、Flash Attention 和同步复用。设备检查程序已编译，执行保留在实验环境。完整记录见 [GPU 代表构造](implementation/GPU_REPRESENTATIVES.md)。

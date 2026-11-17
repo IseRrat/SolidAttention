@@ -2,6 +2,8 @@
 
 代码与本机检查完成于 2026-11-17。本轮交付为 CUDA 块相关度评分、预算约束 top-k、代表增量上传及运行器接入。论文依据为 §3.1 图 4 的 Q/代表向量相关度和 top-k；GQA 聚合与多个代表的处理沿用项目的 CPU 参考。
 
+2026-11-18 接入 [CUDA 窗口代表构造](GPU_REPRESENTATIVES.md)，在首个 attention 图初始化后端，覆盖 prefill 与 decode 的代表更新。
+
 ## 1. 代码入口
 
 | 模块 | 入口 | 行为 |
@@ -10,7 +12,7 @@
 | CUDA 内核 | [block_ranker.cu](../../src/cuda/block_ranker.cu) | 相关度评分、并行归约 top-k、固定容量设备工作区、独立 stream 与设备恢复 |
 | 排序规则 | [ranking_math.hpp](../../include/solid/ranking_math.hpp) | 分数降序、逻辑块编号升序、空候选处理 |
 | 代表与选择 | [attention.cpp](../../src/attention.cpp) | 初始化发布、增量发布、候选去重、剩余 token 预算、后端输出核查 |
-| 会话与图接入 | [session.cpp](../../src/session.cpp)、[llama_adapter.cpp](../../src/llama_adapter.cpp) | 首个 decode 图配置实际后端，串行和 Q-only 选择调用共用入口，错误使会话结束 |
+| 会话与图接入 | [session.cpp](../../src/session.cpp)、[llama_adapter.cpp](../../src/llama_adapter.cpp) | 首个 attention 图配置实际后端，串行和 Q-only 选择调用共用入口，错误使会话结束 |
 | 结果与构建 | [baseline.cpp](../../src/baseline.cpp)、[Adapter.cmake](../../cmake/Adapter.cmake) | 后端身份、内存和阶段计数；CUDA 库编译与链接 |
 
 ## 2. 计算规则
@@ -26,18 +28,18 @@ top-k 每个 KV head 使用一个 256 线程 CTA，按相关度归约出下一�
 ## 3. 代表发布与执行顺序
 
 ```text
-CPU 参考构造代表 → 完整块定稿 → 发布该块全部 head 的代表
+CPU 参考/ CUDA 窗口构造 → 完整块定稿 → 提交该块全部 head 的代表
                                        ↓
-当前 Q 就绪 → CPU 更新代表定稿和候选集合
+当前 Q 就绪 → 更新窗口代表、形成候选集合
           → CUDA 评分 → CUDA top-k → 返回逻辑块 ID
           → 主机核对候选、唯一性与覆盖量 → 预取纠错/attention
 ```
 
-首次附加后端时，按层上传已有的定稿前缀。后续每个完整块发布一次；设备端要求发布范围紧接已有前缀，代表发布后保持固定。尚在 local 评分窗口中的 token 和部分尾块继续由 CPU 构造器管理。
+首次附加后端时，按层上传已有的定稿前缀。后续每个完整块发布一次；设备端要求发布范围紧接已有前缀，代表发布后保持固定。CUDA 窗口构造直接写入选块 bank；CPU 构造路径通过发布接口上传。
 
 CUDA 后端使用独立 non-blocking stream。代表上传完成后归还主机 payload；一次 rank 在输入上传、两个内核和 ID 下载完成后返回。每个入口保存并恢复调用线程原有 CUDA device。CUDA 失败会完成流清理，再沿既有 attention 错误路径传播。
 
-当前 Q 通过已有 CPU 选择前沿到达该后端。后续 GPU 核心工作包括代表构造、直接消费设备 Q、GPU 分块 prefill，见 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md)。
+当前 Q 通过已有 CPU 选择前沿到达该后端。后续 GPU 核心工作包括直接消费设备 Q、GPU 分块 prefill，见 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md)。
 
 ## 4. 配置与结果
 
@@ -49,7 +51,7 @@ CUDA 后端使用独立 non-blocking stream。代表上传完成后归还主机 
 
 | 值 | 执行策略 |
 | --- | --- |
-| `auto`，默认 | 首个 decode attention 后端为 CUDA 时启用 CUDA 评分；其余使用 CPU |
+| `auto`，默认 | 首个 attention 后端为 CUDA 时启用 CUDA 代表构造与评分；其余使用 CPU |
 | `cpu` | CPU 评分与排名，用于参考对照 |
 | `cuda` | 要求 CUDA 构建、CUDA decode 后端和动态稀疏选择，条件在配置和接入时核查 |
 

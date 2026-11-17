@@ -72,6 +72,8 @@ liburing 历史预取、同步参考对照与轨迹核查见 [阶段 3](phases/P
 
 精确 token、实验准备/执行/续跑/汇总、cgroup 与只读 fio、OpenCompass/LongBench 接口、准确率表和绘图命令见 [阶段 5](phases/PHASE_5.md)。`--tokenize CONFIG` 读取词表并输出 token JSON；原生 `kv_dtype=q4_0` 供准确率对照，自定义 attention 使用 F16。
 
-异常路径、独立复制排空、SIGTERM/子进程清理和实验完成状态的检查见 [工程审查记录](ENGINEERING_REVIEW.md)。当前完整入口覆盖 31 项 CTest 和 56 项 Python 检查；合成进程组检查在 Linux 执行。
+异常路径、独立复制排空、SIGTERM/子进程清理和实验完成状态的检查见 [工程审查记录](ENGINEERING_REVIEW.md)。当前完整入口覆盖 35 项 CTest 和 56 项 Python 检查；合成进程组检查在 Linux 执行。
 
 CUDA 评分与 top-k 的内核接入、`selection_backend`、分配计数及实验环境设备检查见 [GPU 选择完成记录](implementation/GPU_SELECTION.md)。本机完整检查编译设备检查程序，数学执行使用 CPU 合成数据。
+
+CUDA 窗口构造、完整状态接管和预取调度图衔接见 [GPU 代表构造完成记录](implementation/GPU_REPRESENTATIVES.md)。核心库 8 项 CTest 覆盖地址、泄漏和未定义行为检查。

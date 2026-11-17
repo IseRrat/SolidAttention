@@ -14,6 +14,7 @@ struct SessionStats {
     std::uint64_t representative_bytes = 0;
     RankerStats ranking;
     std::string selection_backend = "cpu";
+    std::string representative_backend = "cpu";
     IoStats io;
     std::uint64_t append_ns = 0;
     std::uint64_t selection_ns = 0;

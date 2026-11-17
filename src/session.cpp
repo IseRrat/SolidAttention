@@ -323,6 +323,7 @@ SessionStats AttentionSession::stats() const {
     if (representatives_) {
         result.ranking = representatives_->ranker_stats();
         result.selection_backend = replay_.is_open() ? "replay" : representatives_->ranker_name();
+        result.representative_backend = representatives_->builder_name();
     }
     result.io = store_->io_stats();
     if (prefetch_) result.prefetch = prefetch_->stats();

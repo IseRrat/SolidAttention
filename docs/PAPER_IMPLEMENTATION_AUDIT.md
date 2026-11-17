@@ -27,12 +27,13 @@
 - Q-only CPU 选择前沿、历史补读与 KV 投影重叠、独立 H2D 后端、跨层完成证明复用。
 - 实验矩阵、固定 token/选择回放、准确率接口、来源核查与绘图工具。
 - CUDA 块相关度评分与预算 top-k、定稿代表增量上传、后端身份与设备内存记录，完成记录见 [GPU 选择](implementation/GPU_SELECTION.md)。
+- CUDA 后续窗口代表构造、环形评分工作区、CPU 状态接管与定稿块直接发布，完成记录见 [GPU 代表构造](implementation/GPU_REPRESENTATIVES.md)。
 
 ## 3. 论文路径与后续核心代码
 
 | 核查项 | 当前执行路径 | 后续代码与核查要求 |
 | --- | --- | --- |
-| GPU 算子覆盖，§3.1、§4、§7 | [llama_adapter.cpp](../src/llama_adapter.cpp) 把 Q/KV 下载到 CPU；CPU 维护代表和候选；[CUDA 评分/top-k](implementation/GPU_SELECTION.md) 接入动态选择；decode attention 复用 GGML GPU 算子 | 补齐 GPU 代表构造、直接消费设备 Q 与交错 KV 更新；逐算子记录输入输出、dtype、stride、设备和依赖 |
+| GPU 算子覆盖，§3.1、§4、§7 | Q/KV 经主机前沿接入 [CUDA 代表构造](implementation/GPU_REPRESENTATIVES.md) 和 [评分/top-k](implementation/GPU_SELECTION.md)；CPU 维护候选与核查镜像；decode attention 复用 GGML GPU 算子 | 补齐直接消费设备 Q 与交错 KV 更新；逐算子记录输入输出、dtype、stride、设备和依赖 |
 | 长输入 prefill | [session.cpp](../src/session.cpp) 对每个 token 调用 CPU `streamed_attention`，逐块读取历史；图投影使用上游后端 | 建立有界 GPU 分块 prefill 与增量 KV/代表构造；检查 causal mask、RoPE、GQA、尾块与内存上限。CPU 路径继续承担数值参考 |
 | 算法 1 的调度范围，§6.1 | [scheduler.cpp](../src/scheduler.cpp) 提供关键路径/LST；[ggml_prefetch.cpp](../src/ggml_prefetch.cpp) 沿固定图与回调推进，每层聚合为 12 项任务；`ready()` 在回写/下一层预取之间选择 | 建立块级预测读、纠错读、H2D、D2H、回写的资源就绪队列，以真实完成事件解锁后继，按关键路径/LST 分派；合成执行轨迹证明优先级影响提交次序 |
 | selected 优先，§6.1 | [prefetch.cpp](../src/prefetch.cpp) 的 `begin()` 按 head 加入 init、local、历史 selected，再按插入次序启动读取 | 给块请求保留类别、依赖和估算成本，让关键纠错依赖的 selected 请求获得优先级；用受限队列检查实际发出顺序和饥饿边界 |
@@ -44,7 +45,7 @@ prefill 的 GPU 分块方案属于长上下文工程补齐；论文 §7 对实�
 
 ## 4. 后续开发顺序与交付
 
-1. 在 CUDA 评分/top-k 基础上补齐 GPU 代表构造、直接消费设备 Q、分块 prefill 和交错 KV 更新的数据流。
+1. 在 CUDA 代表构造/评分/top-k 基础上补齐直接消费设备 Q、分块 prefill 和交错 KV 更新的数据流。
 2. 把聚合任务扩展为块级事件任务，连接资源就绪队列与关键路径/LST 分派，落实 selected 优先。
 3. 拆分 I/O 与协调线程、配置 CPU 绑定，完善异步传输与设备完成观测。
 4. 复核 CUDA 全路径，补齐 SYCL 与统一内存接入。

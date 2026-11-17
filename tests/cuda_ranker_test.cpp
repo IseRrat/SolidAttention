@@ -1,4 +1,5 @@
 #include "solid/block_ranker.hpp"
+#include "representative_builder_cases.hpp"
 #include <algorithm>
 #include <cmath>
 #include <iostream>
@@ -97,6 +98,9 @@ int main(int argc, char ** argv) {
         if (argc > 3) throw std::invalid_argument("unexpected device-check argument");
         const auto device = argc == 3 ? std::stoi(argv[2]) : 0;
         run(device);
+        test_builder::run_cases([&](auto geometry,auto query_heads,auto budget) {
+            return solid::make_cuda_block_ranker(geometry,query_heads,budget.representatives,budget.total,device,budget.local);
+        });
         std::cout << "CUDA block ranking device checks passed\n";
         return 0;
     } catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }

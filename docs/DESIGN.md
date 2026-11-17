@@ -68,6 +68,8 @@ DRAM 与 VRAM 缓冲区分别管理生命周期。当前层 attention 期间，D
 
 CUDA 选择后端接收定稿代表的增量发布，执行块相关度和预算 top-k；候选与 init/local 去重使用同一入口。`selection_backend=auto/cpu/cuda` 控制后端，结果保存实际身份、发布/评分计数和设备分配。算子布局、执行顺序及核查见 [GPU 选择](implementation/GPU_SELECTION.md)。
 
+CUDA 后端同时通过固定 local 窗口计算代表分数，保留每块 R 个候选并直接提交完整代表块。CPU 接管状态包含 pending K/分数及半完成块的候选；全部层初始化后释放 CPU pending 工作集。边界、分配公式和图检查见 [GPU 代表构造](implementation/GPU_REPRESENTATIVES.md)。
+
 ## 5. Prefill 与新增 KV
 
 prefill 使用上游投影和有界 microbatch，在 CPU 上逐块读取历史 KV 并在线累计 softmax。decode 收集预算内的 FP16 K/V，接入 GGML Flash Attention。`gpu_decode=false` 提供 CPU 流式参考。固定 token 的 logits 对照入口见 [同步 SSD 路径](SSD_PATH.md)。

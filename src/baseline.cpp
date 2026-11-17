@@ -98,6 +98,8 @@ Json counters(const solid::SessionStats & s, const solid::DeviceCacheStats & d) 
         {"append_ms", s.append_ns / 1e6}, {"selection_ms", s.selection_ns / 1e6},
         {"selection_rank_calls", s.ranking.calls}, {"selection_scored_blocks", s.ranking.scored_blocks},
         {"selection_published_blocks", s.ranking.published_blocks},
+        {"representative_builder_queries", s.ranking.builder_queries}, {"representative_builder_appends", s.ranking.builder_appends},
+        {"representative_builder_blocks", s.ranking.built_blocks},
         {"gather_inclusive_ms", s.gather_ns / 1e6}, {"gather_copy_bytes", s.gather_copy_bytes},
         {"streaming_attention_inclusive_ms", s.streaming_attention_ns / 1e6},
         {"prefetch_wait_ms", s.prefetch.wait_ns / 1e6}, {"prefetch_resolve_ms", s.prefetch.resolve_ns / 1e6},
@@ -349,6 +351,8 @@ int main(int argc, char ** argv) {
                 {"prefetch_host_bytes", stats.prefetch.host_bytes}, {"device_kv_bytes", device.resident_bytes}, {"copy_staging_bytes", staging},
                 {"selection_device_bytes", stats.ranking.device_bytes}, {"selection_host_bytes", stats.ranking.host_bytes},
                 {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"extra_projection_weight_bytes", adapter->projection_buffer_bytes()}};
+            result["memory"]["selection_device_breakdown"] = {{"representative_builder_bytes", stats.ranking.builder_device_bytes},
+                {"ranking_and_bank_bytes", stats.ranking.device_bytes-stats.ranking.builder_device_bytes}};
             result["attention_phases"] = {{"prefill", prefill_counters}, {"decode", difference(decode_counters, prefill_counters)},
                 {"final_flush", difference(counters(stats, device), decode_counters)}};
             result["attention"] = {
@@ -365,6 +369,8 @@ int main(int argc, char ** argv) {
                 {"selection_backend", stats.selection_backend}, {"selection_backend_requested", config.attention.selection_backend},
                 {"selection_rank_calls", stats.ranking.calls}, {"selection_scored_blocks", stats.ranking.scored_blocks},
                 {"selection_published_blocks", stats.ranking.published_blocks},
+                {"representative_backend", stats.representative_backend}, {"representative_builder_queries", stats.ranking.builder_queries},
+                {"representative_builder_appends", stats.ranking.builder_appends}, {"representative_builder_blocks", stats.ranking.built_blocks},
                 {"block_tokens", config.attention.block_tokens}, {"context_budget_tokens", budget.total},
                 {"init_tokens", budget.initial}, {"local_tokens", budget.local}, {"representative_count", budget.representatives},
                 {"head_aggregation", "mean"}, {"position_policy", "absolute_native_rope"},

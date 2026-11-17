@@ -33,6 +33,7 @@
 | D27 | 准确率连接固定框架版本；原生 Q4_0 KV 对照，自定义 F16 KV；生成与 teacher-forced NLL 均保存来源 | 阶段 5，RunnerClient、OpenCompass、官方 LongBench scorer |
 | D28 | 图表独立重算来源，要求完整测量；中位数与最小/最大误差条共用 PNG/PDF 数据 | 阶段 5，plot_experiments.py、figure.json |
 | D29 | CUDA 代表块使用 FP16；相关度按 CPU 顺序 FP64 累加，关闭 FMA 收缩；top-k 按剩余 token 成本结束，同分按逻辑 ID 升序 | [GPU 选择](implementation/GPU_SELECTION.md)，block_ranker.cu、block-ranking-contract |
+| D30 | CUDA 代表构造使用 local 大小的 K/分数环和固定 R 候选；query 边界移交完整 CPU 状态，定稿块直接写入 GPU bank；构造工作区在选择总分配中计入一次 | [GPU 代表构造](implementation/GPU_REPRESENTATIVES.md)，representative-builder-contract |
 
 ## 参数锁定任务
 

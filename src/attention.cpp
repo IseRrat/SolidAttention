@@ -44,6 +44,11 @@ void RepresentativeIndex::observe_query(std::uint32_t layer, std::uint64_t posit
         throw std::invalid_argument("representative observation shape or position mismatch");
     }
     finite_query(query);
+    if (ranker_ && ranker_->builder_window()) {
+        accept_built(layer, position, ranker_->build_query(layer, position, query));
+        query_pending_[layer] = true;
+        return;
+    }
     const auto group = query_heads_ / geometry_.heads;
     std::vector<double> mean_query(static_cast<std::size_t>(geometry_.heads) * geometry_.dimension, 0);
     for (std::uint32_t head = 0; head < query_heads_; ++head) {
@@ -85,7 +90,8 @@ void RepresentativeIndex::append_keys(std::uint32_t layer, std::uint64_t positio
         throw std::invalid_argument("representative append requires its query first");
     }
     for (const auto key : keys) if (!std::isfinite(from_half(key))) throw std::invalid_argument("non-finite key");
-    pending_[layer].push_back({position, keys, std::vector<double>(geometry_.heads, 0)});
+    if (ranker_ && ranker_->builder_window()) ranker_->build_append(layer, position, keys);
+    else pending_[layer].push_back({position, keys, std::vector<double>(geometry_.heads, 0)});
     query_pending_[layer] = false;
     ++lengths_[layer];
 }
@@ -127,12 +133,82 @@ void RepresentativeIndex::publish(BlockRanker & ranker, std::uint32_t layer, std
 }
 void RepresentativeIndex::set_ranker(std::unique_ptr<BlockRanker> ranker) {
     if (!ranker || ranker_) throw std::logic_error("representative ranker already configured or empty");
+    if (std::any_of(query_pending_.begin(), query_pending_.end(), [](bool value) { return value; })) {
+        throw std::logic_error("representative ranker requires a query boundary");
+    }
+    if (ranker->builder_window() && ranker->builder_window() != budget_.local) throw std::invalid_argument("representative builder window differs");
     for (std::uint32_t layer = 0; layer < geometry_.layers; ++layer) {
         std::uint64_t count = 0;
         while (count < geometry_.blocks_per_head() && ready(layer, count)) ++count;
         publish(*ranker, layer, 0, count);
+        if (ranker->builder_window()) ranker->seed_builder(layer, builder_seed(layer));
     }
     ranker_ = std::move(ranker);
+    if (ranker_->builder_window()) for (std::uint32_t layer = 0; layer < geometry_.layers; ++layer) {
+        pending_[layer].clear();
+        const auto matured = lengths_[layer] - std::min<std::uint64_t>(lengths_[layer], budget_.local);
+        for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
+            auto & partial = blocks_[index(layer, head)].at(matured/geometry_.block_tokens);
+            partial.tokens.clear(); partial.finalized = 0;
+        }
+    }
+}
+RepresentativeSeed RepresentativeIndex::builder_seed(std::uint32_t layer) const {
+    RepresentativeSeed seed;
+    seed.length = lengths_.at(layer);
+    for (const auto & token : pending_[layer]) {
+        seed.pending_keys.insert(seed.pending_keys.end(), token.keys.begin(), token.keys.end());
+        seed.pending_scores.insert(seed.pending_scores.end(), token.scores.begin(), token.scores.end());
+    }
+    const auto count = static_cast<std::size_t>(geometry_.heads)*budget_.representatives;
+    seed.partial_positions.assign(count, UINT64_MAX);
+    seed.partial_scores.assign(count, 0);
+    seed.partial_keys.assign(count*geometry_.dimension, 0);
+    const auto matured = seed.length - std::min<std::uint64_t>(seed.length, budget_.local);
+    for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
+        const auto & block = blocks_[index(layer, head)].at(matured/geometry_.block_tokens);
+        for (std::size_t r = 0; r < block.tokens.size(); ++r) {
+            const auto offset = static_cast<std::size_t>(head)*budget_.representatives+r;
+            seed.partial_positions[offset] = block.tokens[r].position;
+            seed.partial_scores[offset] = block.tokens[r].score;
+            std::copy(block.tokens[r].key.begin(), block.tokens[r].key.end(), seed.partial_keys.begin()+offset*geometry_.dimension);
+        }
+    }
+    validate_representative_seed(geometry_, budget_.representatives, budget_.local, seed);
+    return seed;
+}
+void RepresentativeIndex::accept_built(std::uint32_t layer, std::uint64_t position, const std::optional<BuiltRepresentatives> & built) {
+    const bool complete = position >= budget_.local && (position-budget_.local+1)%geometry_.block_tokens == 0;
+    if (built.has_value() != complete) throw std::runtime_error("representative builder completion boundary");
+    if (!built) return;
+    const auto block = (position-budget_.local)/geometry_.block_tokens;
+    const auto count = static_cast<std::size_t>(geometry_.heads)*budget_.representatives;
+    if (built->block != block || built->keys.size() != count*geometry_.dimension || built->positions.size() != count || built->scores.size() != count) {
+        throw std::runtime_error("representative builder output shape or block");
+    }
+    for (const auto key : built->keys) if (!std::isfinite(from_half(key))) throw std::runtime_error("non-finite built representative key");
+    for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
+        std::set<std::uint64_t> unique;
+        for (std::uint32_t r = 0; r < budget_.representatives; ++r) {
+            const auto i = static_cast<std::size_t>(head)*budget_.representatives+r;
+            const auto p = built->positions[i]; const auto score = built->scores[i];
+            if (p/geometry_.block_tokens != block || !unique.insert(p).second || !std::isfinite(score) || (r &&
+                (score > built->scores[i-1] || (score == built->scores[i-1] && p < built->positions[i-1])))) {
+                throw std::runtime_error("built representative position, score or order");
+            }
+        }
+    }
+    for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
+        auto & target = blocks_[index(layer, head)].at(block);
+        if (target.finalized == geometry_.block_tokens) throw std::runtime_error("representative builder repeated a complete block");
+        target.tokens.clear();
+        for (std::uint32_t r = 0; r < budget_.representatives; ++r) {
+            const auto i = static_cast<std::size_t>(head)*budget_.representatives+r;
+            const auto begin = built->keys.begin()+i*geometry_.dimension;
+            target.tokens.push_back({built->positions[i], built->scores[i], {begin, begin+geometry_.dimension}});
+        }
+        target.finalized = geometry_.block_tokens;
+    }
 }
 std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
     std::uint32_t layer, const std::vector<float> & query, const BlockCandidates & candidates) const {

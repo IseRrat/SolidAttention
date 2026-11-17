@@ -1,4 +1,5 @@
 #include "prefetch_fakes.hpp"
+#include "representative_builder_cases.hpp"
 #include "solid/ggml_prefetch.hpp"
 #include "solid/llama_adapter.hpp"
 #include "ggml.h"
@@ -46,7 +47,7 @@ struct OverlapBarrier {
         std::memcpy(dst->data, dst->src[0]->data, ggml_nbytes(dst));
     }
 };
-void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces) {
+void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces, bool builder) {
     constexpr int dimension = 128, kv_heads = 2, query_heads = 4;
     const solid::KvGeometry geometry{2, kv_heads, dimension, 2, 32, 64, solid::KvLayout::interleaved};
     const solid::SparseBudget budget{6, 1, 1, 1};
@@ -69,6 +70,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     }
     solid::AttentionSession session(std::move(store), query_heads, budget, true, 6, {}, {}, std::move(reader), 6);
     solid::AttentionSession reference(std::make_unique<solid::MemoryKvStore>(geometry), query_heads, budget, true, 6);
+    if (builder) session.set_ranker(std::make_unique<test_builder::Emulator>(geometry, query_heads, budget));
     const float scale = 1 / std::sqrt(static_cast<float>(dimension));
     std::vector<float> query(query_heads * dimension), key(kv_heads * dimension), value(key.size());
     const auto inputs = [&](int layer, int p) {
@@ -162,6 +164,8 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     else require(observer.completions == 12, "scheduler failed to confirm each layer's attention completion");
     if (controlled) require(stats.miss_projection_overlap_ns > 0, "missing I/O and KV projection did not overlap");
     if (disk) require(session.stats().prefetch.io.completed_reads > 0, "GGML path did not complete liburing reads");
+    if (builder) require(session.stats().ranking.builder_queries == 24 && session.stats().ranking.builder_appends == 24 &&
+        session.stats().ranking.built_blocks == 10, "graph did not execute representative builder across prefill and decode");
     device.quiesce(); session.finish();
     if (!directory.empty()) {
         std::ofstream output(directory / "stats.json");
@@ -176,9 +180,11 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
 int main(int argc, char ** argv) {
     try {
         const auto mode = solid::parse_schedule_mode(argc > 1 ? argv[1] : "naive");
-        const std::filesystem::path traces = argc > 2 ? argv[2] : "";
-        run(false, mode, traces);
-        if (solid::uring_available()) run(true, mode, traces);
+        const bool builder = argc > 2 && std::string(argv[2]) == "--builder";
+        const auto index = builder ? 3 : 2;
+        const std::filesystem::path traces = argc > index ? argv[index] : "";
+        run(false, mode, traces, builder);
+        if (solid::uring_available()) run(true, mode, traces, builder);
         std::cout << "multi-layer prefetch, liburing, GQA slot masks and CPU Flash Attention parity passed\n";
         return 0;
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }
