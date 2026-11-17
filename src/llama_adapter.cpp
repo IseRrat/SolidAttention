@@ -234,9 +234,12 @@ struct AttentionAdapter::Impl {
     std::unique_ptr<GgmlPrefetch> device;
     std::string selection_backend;
     bool configure_ranker = false;
+    std::string prefill_backend;
+    bool configure_prefill = false;
+    std::uint32_t prefill_queries=128, prefill_tile_tokens=512;
 };
 AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionConfig & options,
-                                  std::uint32_t capacity, std::uint64_t prefill_tokens, const std::filesystem::path & trace) :
+                                  std::uint32_t capacity, std::uint64_t prefill_tokens, const std::filesystem::path & trace, std::uint32_t prefill_queries) :
     impl_(std::make_unique<Impl>()) {
     if (!model || !options.enabled || (model->arch != LLM_ARCH_LLAMA && model->arch != LLM_ARCH_QWEN2)) {
         throw std::invalid_argument("adapter requires a Llama or Qwen2 decoder");
@@ -289,6 +292,10 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     impl_->prefill_tokens = prefill_tokens;
     impl_->selection_backend = options.selection_backend;
     impl_->configure_ranker = options.sparse && options.gpu_decode && options.selection_replay.empty() && options.selection_backend != "cpu";
+    impl_->prefill_backend=options.prefill_backend;
+    impl_->configure_prefill=options.gpu_decode && options.prefill_backend!="cpu";
+    impl_->prefill_queries=std::min(prefill_queries,capacity);
+    impl_->prefill_tile_tokens=options.prefill_tile_tokens;
     impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens,
         options.selection_trace ? trace : std::filesystem::path{},
         options.selection_replay, options.prefetch ? make_uring_reader(options.prefetch_queue_depth) : nullptr,
@@ -307,6 +314,7 @@ void AttentionAdapter::check() const { impl_->failure->check(); }
 void AttentionAdapter::after_process() {
     try { if (impl_->device) impl_->device->process_complete(); } catch (...) { impl_->failure->capture(std::current_exception()); }
     check();
+    impl_->session->release_prefill_if_complete();
 }
 void AttentionAdapter::flush() { check(); impl_->session->flush(); }
 void AttentionAdapter::finish() { check(); quiesce(); impl_->session->finish(); }
@@ -314,6 +322,22 @@ SessionStats AttentionAdapter::stats() const { check(); return impl_->session->s
 SparseBudget AttentionAdapter::budget() const { return impl_->session->budget(); }
 std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionFrame> frame, std::uint32_t layer, float scale,
                                                     bool gathered, ggml_backend_t backend) {
+    if (impl_->configure_prefill) {
+        bool configured=false;
+#ifdef SOLID_HAVE_CUDA_SELECTION
+        if (backend && ggml_backend_is_cuda(backend)) {
+            auto * registry=ggml_backend_cuda_reg();
+            for (std::size_t ordinal=0;ordinal<ggml_backend_reg_dev_count(registry);++ordinal) {
+                if (ggml_backend_reg_dev_get(registry,ordinal)!=ggml_backend_get_device(backend)) continue;
+                impl_->session->set_prefill(make_cuda_tiled_prefill(impl_->session->geometry(),impl_->session->query_heads(),
+                    impl_->prefill_queries,impl_->prefill_tile_tokens,static_cast<int>(ordinal)));
+                configured=true; break;
+            }
+        }
+#endif
+        if (!configured && impl_->prefill_backend=="cuda") throw std::runtime_error("CUDA prefill requires a CUDA build and CUDA attention backend");
+        impl_->configure_prefill=false;
+    }
     if (impl_->configure_ranker) {
         bool configured = false;
 #ifdef SOLID_HAVE_CUDA_SELECTION

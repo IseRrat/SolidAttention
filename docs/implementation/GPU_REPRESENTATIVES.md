@@ -74,4 +74,4 @@ CUDA 编译与链接、35 项 CTest、56 项 Linux Python 检查和源码指纹�
 
 ## 6. 后续核心路径
 
-下一项为有界 GPU 分块 prefill，以及直接消费设备 Q/K 的接入。当前窗口构造按 token 调用，prefill attention 继续使用 CPU 流式参考。
+有界 attention 已接入 [GPU 分块 prefill](GPU_PREFILL.md)。窗口构造按 token 调用，后续继续接入设备 Q/K 和批处理更新。

@@ -57,6 +57,16 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_prefill_policy_survives_dense_and_sparse_variants(self):
+        template={"attention":{"prefill_backend":"cpu","prefill_tile_tokens":128}}
+        for variant in experiments.VARIANTS:
+            config=experiments.variant_config(template,variant,32,1024)
+            if "attention" in config:
+                self.assertEqual(config["attention"]["prefill_backend"],"cpu")
+                self.assertEqual(config["attention"]["prefill_tile_tokens"],128)
+        for bad in ({"prefill_backend":"unknown"},{"prefill_tile_tokens":0},{"prefill_tile_tokens":True}):
+            with self.assertRaises(ValueError): experiments.variant_config({"attention":bad},"offload",32,1024)
+
     def test_selection_backend_survives_sparse_variant_preparation(self):
         for selector in ("auto", "cpu", "cuda"):
             template = {"attention": {"selection_backend": selector}}

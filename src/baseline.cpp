@@ -100,6 +100,9 @@ Json counters(const solid::SessionStats & s, const solid::DeviceCacheStats & d) 
         {"selection_published_blocks", s.ranking.published_blocks},
         {"representative_builder_queries", s.ranking.builder_queries}, {"representative_builder_appends", s.ranking.builder_appends},
         {"representative_builder_blocks", s.ranking.built_blocks},
+        {"prefill_tiled_batches", s.prefill.batches}, {"prefill_tiled_queries", s.prefill.query_tokens},
+        {"prefill_tiles", s.prefill.tiles}, {"prefill_kv_tokens", s.prefill.kv_tokens},
+        {"prefill_upload_bytes", s.prefill.upload_bytes}, {"tiled_prefill_inclusive_ms", s.tiled_prefill_ns/1e6},
         {"gather_inclusive_ms", s.gather_ns / 1e6}, {"gather_copy_bytes", s.gather_copy_bytes},
         {"streaming_attention_inclusive_ms", s.streaming_attention_ns / 1e6},
         {"prefetch_wait_ms", s.prefetch.wait_ns / 1e6}, {"prefetch_resolve_ms", s.prefetch.resolve_ns / 1e6},
@@ -225,7 +228,7 @@ int main(int argc, char ** argv) {
         if (config.attention.enabled) {
             std::filesystem::create_directories(config.output.parent_path());
             adapter = std::make_unique<solid::AttentionAdapter>(model.get(), config.attention, config.context_tokens,
-                       tokens.size(), config.output.parent_path() / "selection.jsonl");
+                       tokens.size(), config.output.parent_path() / "selection.jsonl",config.microbatch_tokens);
         }
         const double adapter_ms = milliseconds(adapter_start);
         EvaluationBridge evaluation{adapter.get(), config.attention.profile ? &profile : nullptr};
@@ -346,13 +349,18 @@ int main(int argc, char ** argv) {
             const auto device = adapter->device_stats();
             const auto staging = adapter->schedule_stats().staging_bytes;
             result["memory"]["kv_system_tracked_bytes"] = stats.kv_resident_bytes + stats.representative_bytes +
-                stats.prefetch.host_bytes + device.resident_bytes + staging + stats.ranking.device_bytes + stats.ranking.host_bytes;
+                stats.prefetch.host_bytes + device.resident_bytes + staging + stats.ranking.device_bytes + stats.ranking.host_bytes +
+                stats.prefill.kv_device_bytes + stats.prefill_host_bytes;
             result["memory"]["custom_buffers"] = {{"store_bytes", stats.kv_resident_bytes}, {"representatives_bytes", stats.representative_bytes},
                 {"prefetch_host_bytes", stats.prefetch.host_bytes}, {"device_kv_bytes", device.resident_bytes}, {"copy_staging_bytes", staging},
                 {"selection_device_bytes", stats.ranking.device_bytes}, {"selection_host_bytes", stats.ranking.host_bytes},
+                {"prefill_kv_device_bytes", stats.prefill.kv_device_bytes}, {"prefill_kv_host_bytes", stats.prefill_host_bytes},
                 {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"extra_projection_weight_bytes", adapter->projection_buffer_bytes()}};
             result["memory"]["selection_device_breakdown"] = {{"representative_builder_bytes", stats.ranking.builder_device_bytes},
                 {"ranking_and_bank_bytes", stats.ranking.device_bytes-stats.ranking.builder_device_bytes}};
+            result["memory"]["prefill_workspace"]={{"device_bytes",stats.prefill.workspace_device_bytes},
+                {"device_peak_bytes",stats.prefill.workspace_device_peak_bytes},{"kv_device_peak_bytes",stats.prefill.kv_device_peak_bytes},
+                {"kv_host_peak_bytes",stats.prefill_host_peak_bytes}};
             result["attention_phases"] = {{"prefill", prefill_counters}, {"decode", difference(decode_counters, prefill_counters)},
                 {"final_flush", difference(counters(stats, device), decode_counters)}};
             result["attention"] = {
@@ -374,7 +382,9 @@ int main(int argc, char ** argv) {
                 {"block_tokens", config.attention.block_tokens}, {"context_budget_tokens", budget.total},
                 {"init_tokens", budget.initial}, {"local_tokens", budget.local}, {"representative_count", budget.representatives},
                 {"head_aggregation", "mean"}, {"position_policy", "absolute_native_rope"},
-                {"attention_backend", config.attention.gpu_decode ? "ggml_flash_decode+cpu_streaming_prefill" : "cpu_streaming_reference"},
+                {"attention_backend", config.attention.gpu_decode ? "ggml_flash_decode+"+stats.prefill_backend : "cpu_streaming_reference"},
+                {"prefill_backend",stats.prefill_backend},{"prefill_backend_requested",config.attention.prefill_backend},
+                {"prefill_query_capacity",stats.prefill.query_capacity},{"prefill_tile_capacity",stats.prefill.tile_capacity},
                 {"io_mode", "buffered"},
                 {"attention_queries", stats.attention_queries}, {"selected_tokens", stats.selected_tokens},
                 {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"kv_buffer_bytes", stats.kv_resident_bytes},

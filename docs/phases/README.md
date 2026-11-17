@@ -21,3 +21,4 @@
 | --- | --- | --- |
 | CUDA 块评分与预算 top-k | [GPU 选择](../implementation/GPU_SELECTION.md) | 阶段 1 的动态选择、阶段 4 的 Q-only 选择前沿 |
 | CUDA 后续窗口代表构造 | [GPU 代表构造](../implementation/GPU_REPRESENTATIVES.md) | 阶段 1 的代表构造、prefill/decode 交接、阶段 4 图接入 |
+| 有界 CUDA 分块 prefill | [GPU prefill](../implementation/GPU_PREFILL.md) | 阶段 1 的长输入 attention、存储读取及工作区上限 |

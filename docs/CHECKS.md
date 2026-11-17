@@ -130,3 +130,9 @@ CUDA 编译与链接、30 项 CTest、Linux 54 项 Python 检查及源码指纹�
 新增 GQA 均值、后续窗口分数更新和块内代表定稿三个 CUDA 内核，接入 prefill/decode 代表构造及现有评分 bank。CUDA 编译与链接、35 项 CTest、56 项 Linux Python 检查、源码指纹通过；核心库 8 项 CTest 的地址、泄漏和未定义行为检查通过。
 
 CPU 执行共用数学并对照既有参考，覆盖完整状态接管、窗口绕回、块/尾块、GQA、多代表和常驻设备容量；故障注入覆盖第二层初始化失败及构造结果错误。三组实际 CPU GGML 图核对预取、Flash Attention 和同步复用。设备检查程序已编译，执行保留在实验环境。完整记录见 [GPU 代表构造](implementation/GPU_REPRESENTATIVES.md)。
+
+## 2026-11-18：有界 CUDA 分块 prefill
+
+CUDA 内核与运行器链接、36 项 CTest、57 项 Linux Python 检查及源码指纹通过。核心库 9 项 CTest 的地址、泄漏与未定义行为检查通过。
+
+合成检查覆盖多 head 维度、GQA、因果前缀、NaN padding、源立即复用、在线 softmax 数值、两种存储布局、融合输入、prefill/decode 边界、池释放与峰值、GGML 图和异常排空。设备检查程序已编译，执行保留在实验环境。代码与核查入口见 [GPU prefill](implementation/GPU_PREFILL.md)。

@@ -56,6 +56,19 @@ std::vector<float> AttentionSession::process(std::uint32_t layer, std::uint64_t 
         (interleaved_inputs ? !values.empty() : values.size() != keys.size())) {
         throw std::invalid_argument("attention batch shape or capacity mismatch");
     }
+    if (prefill_ && first_position < prefill_tokens_) {
+        const auto count = std::min<std::uint64_t>(tokens, prefill_tokens_-first_position);
+        auto output = tiled_prefill(layer,first_position,count,queries,keys,values,scale,interleaved_inputs);
+        if (count < tokens) {
+            const auto q = queries.begin()+count*query_elements;
+            const auto k = keys.begin()+count*kv_elements*(interleaved_inputs ? 2 : 1);
+            std::vector<float> tail_values;
+            if (!interleaved_inputs) tail_values.assign(values.begin()+count*kv_elements,values.end());
+            auto tail = process(layer,first_position+count,tokens-count,{q,queries.end()},{k,keys.end()},tail_values,scale,interleaved_inputs);
+            output.insert(output.end(),tail.begin(),tail.end());
+        }
+        return output;
+    }
     std::vector<float> output(queries.size());
     std::vector<float> q(query_elements);
     try {
@@ -85,6 +98,59 @@ std::vector<float> AttentionSession::process(std::uint32_t layer, std::uint64_t 
             stats_.workspace_peak_bytes = std::max(stats_.workspace_peak_bytes, workspace);
         }
     } catch (...) { failed_ = true; throw; }
+    return output;
+}
+std::vector<float> AttentionSession::tiled_prefill(std::uint32_t layer, std::uint64_t first, std::size_t tokens,
+    const std::vector<float> & queries,const std::vector<float> & keys,const std::vector<float> & values,float scale,bool packed) {
+    const auto & g=geometry();
+    const auto qwidth=static_cast<std::size_t>(query_heads_)*g.dimension;
+    const auto kwidth=static_cast<std::size_t>(g.heads)*g.dimension;
+    std::vector<float> output(tokens*qwidth), query(qwidth);
+    try {
+        for (std::size_t start=0; start<tokens;) {
+            const auto count=static_cast<std::uint32_t>(std::min<std::size_t>(prefill_->query_capacity(),tokens-start));
+            std::vector<float> batch(queries.begin()+start*qwidth,queries.begin()+(start+count)*qwidth);
+            for (std::uint32_t i=0;i<count;++i) {
+                std::copy_n(batch.data()+i*qwidth,qwidth,query.data());
+                append_token(layer,first+start+i,query,keys.data()+(start+i)*kwidth*(packed?2:1),packed?nullptr:values.data()+(start+i)*kwidth);
+            }
+            const auto attention_start=Clock::now();
+            prefill_->begin(first+start,count,scale,batch);
+            const auto end=first+start+count;
+            KvBlock block;
+            for (std::uint64_t tile=0;tile<end;tile+=prefill_->tile_capacity()) {
+                const auto valid=static_cast<std::uint32_t>(std::min<std::uint64_t>(prefill_->tile_capacity(),end-tile));
+                for (std::uint32_t h=0;h<g.heads;++h) {
+                    for (std::uint32_t offset=0;offset<valid;offset+=g.block_tokens) {
+                        store_->read(layer,h,(tile+offset)/g.block_tokens,block);
+                        const auto rows=std::min(g.block_tokens,valid-offset);
+                        if (block.valid_tokens<rows) throw std::runtime_error("prefill read returned an incomplete KV block");
+                        for (std::uint32_t row=0;row<rows;++row) {
+                            auto * target=prefill_tile_.data()+(static_cast<std::size_t>(h)*prefill_->tile_capacity()+offset+row)*2*g.dimension;
+                            std::copy_n(block.key(row),g.dimension,target);
+                            std::copy_n(block.value(row),g.dimension,target+g.dimension);
+                        }
+                    }
+                }
+                prefill_->consume(tile,valid,prefill_tile_);
+            }
+            auto attended=prefill_->finish();
+            if (attended.size()!=batch.size()) throw std::runtime_error("tiled prefill output shape");
+            for (const auto value:attended) if (!std::isfinite(value)) throw std::runtime_error("non-finite tiled prefill output");
+            std::copy(attended.begin(),attended.end(),output.begin()+start*qwidth);
+            stats_.attention_queries+=count;
+            stats_.workspace_peak_bytes=std::max(stats_.workspace_peak_bytes,static_cast<std::uint64_t>(
+                (output.capacity()+batch.capacity()+query.capacity()+attended.capacity())*sizeof(float)+block.data.capacity()*sizeof(Half)));
+            // Inclusive host interval covers storage reads and the device frame.
+            stats_.tiled_prefill_ns+=elapsed(attention_start);
+            start+=count;
+        }
+    } catch (...) {
+        failed_=true;
+        const auto error=std::current_exception();
+        try { prefill_->abort(); } catch (...) {}
+        std::rethrow_exception(error);
+    }
     return output;
 }
 void AttentionSession::append_token(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
@@ -327,11 +393,32 @@ SessionStats AttentionSession::stats() const {
     }
     result.io = store_->io_stats();
     if (prefetch_) result.prefetch = prefetch_->stats();
+    if (prefill_) result.prefill=prefill_->stats();
+    result.prefill_host_bytes=prefill_tile_.capacity()*sizeof(Half);
     return result;
 }
 void AttentionSession::set_ranker(std::unique_ptr<BlockRanker> ranker) {
     if (failed_ || !representatives_ || replay_.is_open() || early_) throw std::logic_error("ranker requires a dynamic sparse session at a query boundary");
     try { representatives_->set_ranker(std::move(ranker)); }
     catch (...) { failed_ = true; throw; }
+}
+void AttentionSession::set_prefill(std::unique_ptr<TiledPrefill> prefill) {
+    if (failed_ || early_ || prefill_ || stats_.prefill_backend!="cpu_streaming" || !prefill || !prefill->query_capacity() ||
+        !prefill->tile_capacity() || prefill->tile_capacity()%geometry().block_tokens) throw std::invalid_argument("invalid tiled prefill attachment");
+    const auto width=static_cast<std::uint64_t>(2)*geometry().dimension;
+    if (prefill->tile_capacity()>SIZE_MAX/sizeof(Half)/width/geometry().heads) throw std::overflow_error("prefill host tile allocation");
+    const auto elements=static_cast<std::uint64_t>(geometry().heads)*prefill->tile_capacity()*width;
+    std::vector<Half> tile(static_cast<std::size_t>(elements));
+    stats_.prefill_backend=prefill->name();
+    stats_.prefill_host_peak_bytes=tile.capacity()*sizeof(Half);
+    prefill_tile_=std::move(tile); prefill_=std::move(prefill);
+}
+void AttentionSession::release_prefill_if_complete() {
+    if (failed_ || !prefill_) return;
+    for (std::uint32_t layer=0;layer<geometry().layers;++layer) if (store_->length(layer)<prefill_tokens_) return;
+    stats_.prefill=prefill_->stats();
+    stats_.prefill.kv_device_bytes=0; stats_.prefill.workspace_device_bytes=0;
+    prefill_.reset();
+    std::vector<Half>().swap(prefill_tile_);
 }
 } // namespace solid

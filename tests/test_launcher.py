@@ -137,6 +137,9 @@ class LauncherTests(unittest.TestCase):
         launcher.verify_features(config, {"features": {"cuda": True}})
         launcher.verify_features({"attention": {"selection_backend": "cpu"}}, {"features": {}})
         launcher.verify_features({"attention": {"selection_backend": "auto"}}, {"features": {}})
+        with self.assertRaisesRegex(ValueError,"CUDA prefill"):
+            launcher.verify_features({"attention":{"prefill_backend":"cuda"}},{"features":{"cuda":False}})
+        launcher.verify_features({"attention":{"prefill_backend":"cuda"}},{"features":{"cuda":True}})
 
 
 if __name__ == "__main__":

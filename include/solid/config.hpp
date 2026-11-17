@@ -26,6 +26,8 @@ struct AttentionConfig {
     bool schedule_trace = false;
     bool selection_trace = true;
     std::string selection_backend = "auto";
+    std::string prefill_backend = "auto";
+    std::uint32_t prefill_tile_tokens = 512;
     std::uint32_t prefetch_queue_depth = 64;
     std::uint32_t prefetch_slots_per_head = 0;
     std::uint32_t block_tokens = 32;

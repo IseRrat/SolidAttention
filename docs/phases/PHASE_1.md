@@ -28,6 +28,8 @@ decode 先追加当前 KV，再按当前 Q 选块；从 SSD 已提交数据和�
 
 CUDA 后续窗口构造、半完成状态接管、完整块提交和三种调度图对照见 [GPU 代表构造完成记录](../implementation/GPU_REPRESENTATIVES.md)。CUDA 后端从首个 attention 图初始化，代表更新覆盖 prefill 与 decode。
 
+有界 Q/KV 工作区、在线 softmax、批内因果 mask 和 prefill 池释放见 [GPU 分块 prefill 完成记录](../implementation/GPU_PREFILL.md)。CPU 流式 attention 继续提供数值参考。
+
 ## 检查
 
 阶段完成时通过 CUDA 编译、11 项 CTest、10 项 Python 检查及源码指纹核对。证据覆盖 FP16 舍入、布局与尾块、写缓冲转发、I/O 错误、独立 softmax 公式、GQA、microbatch 一致性和 CPU Flash Attention。详细记录见 [CHECKS](../CHECKS.md)。

@@ -72,7 +72,9 @@ CUDA 后端同时通过固定 local 窗口计算代表分数，保留每块 R �
 
 ## 5. Prefill 与新增 KV
 
-prefill 使用上游投影和有界 microbatch，在 CPU 上逐块读取历史 KV 并在线累计 softmax。decode 收集预算内的 FP16 K/V，接入 GGML Flash Attention。`gpu_decode=false` 提供 CPU 流式参考。固定 token 的 logits 对照入口见 [同步 SSD 路径](SSD_PATH.md)。
+prefill 使用上游投影和有界 microbatch，通过固定 Q/KV tile 在 CUDA 上累计因果 softmax；CPU 逐块路径提供数值参考。decode 收集预算内的 FP16 K/V，接入 GGML Flash Attention。`gpu_decode=false` 提供 CPU 流式参考。固定 token 的 logits 对照入口见 [同步 SSD 路径](SSD_PATH.md)。
+
+`prefill_backend=auto/cpu/cuda` 与 `prefill_tile_tokens` 控制路径和 KV 容量；query 容量来自 microbatch。H2D 完成事件归还主机源，同流顺序保护设备 tile。全部层完成 prompt 后释放池并保留峰值。代码、分配公式与检查见 [GPU prefill](implementation/GPU_PREFILL.md)。
 
 每个 microbatch 保留历史位置和 causal mask。代表构造器消费所需 Q/K，满足窗口条件后提交块元数据。decode 在 prefill 写入、元数据和尾块版本全部完成后开始。首次 decode 使用 init/local 预取及正式 selected 选择。
 

@@ -39,7 +39,7 @@ CPU 参考/ CUDA 窗口构造 → 完整块定稿 → 提交该块全部 head �
 
 CUDA 后端使用独立 non-blocking stream。代表上传完成后归还主机 payload；一次 rank 在输入上传、两个内核和 ID 下载完成后返回。每个入口保存并恢复调用线程原有 CUDA device。CUDA 失败会完成流清理，再沿既有 attention 错误路径传播。
 
-当前 Q 通过已有 CPU 选择前沿到达该后端。后续 GPU 核心工作包括直接消费设备 Q、GPU 分块 prefill，见 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md)。
+当前 Q 通过已有 CPU 选择前沿到达该后端。[GPU 分块 prefill](GPU_PREFILL.md) 已接入；后续直接消费设备 Q，见 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md)。
 
 ## 4. 配置与结果
 

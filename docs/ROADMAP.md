@@ -6,7 +6,7 @@
 
 当前阶段记录描述首版代码及其检查结果。论文核心路径的后续开发见 [论文实现核查](PAPER_IMPLEMENTATION_AUDIT.md)：GPU 执行、块级事件调度、selected 优先及 I/O/协调线程分工。先完成这些代码，再推进正式评测与阶段 6。
 
-已完成的核心补齐：[CUDA 块评分与动态选块](implementation/GPU_SELECTION.md)、[CUDA 窗口代表构造](implementation/GPU_REPRESENTATIVES.md)。后续依次推进 GPU 分块 prefill、块级调度及线程分工。
+已完成的核心补齐：[CUDA 块评分与动态选块](implementation/GPU_SELECTION.md)、[CUDA 窗口代表构造](implementation/GPU_REPRESENTATIVES.md)、[有界 GPU 分块 prefill](implementation/GPU_PREFILL.md)。后续推进块级调度、线程分工与设备 Q/K 直接接入。
 
 ## 阶段 0：上游与原版基线
 

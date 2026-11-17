@@ -71,6 +71,14 @@ int main() {
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":false,\"selection_backend\":\"cuda\"}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"gpu_decode\":false,\"selection_backend\":\"cuda\"}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"selection_replay\":\"r.jsonl\",\"selection_backend\":\"cuda\"}}");
+        for (const auto mode:{"cpu","cuda","auto"}) {
+            write(prefix+",\"attention\":{\"storage\":\"ssd\",\"sparse\":false,\"prefill_backend\":\""+mode+"\",\"prefill_tile_tokens\":17}}");
+            const auto parsed=solid::RunConfig::load(config).attention;
+            if (parsed.prefill_backend!=mode || parsed.prefill_tile_tokens!=17) throw std::runtime_error("prefill configuration parsing");
+        }
+        reject(prefix+",\"attention\":{\"storage\":\"ssd\",\"sparse\":false,\"prefill_backend\":\"unknown\"}}");
+        reject(prefix+",\"attention\":{\"storage\":\"ssd\",\"sparse\":false,\"prefill_backend\":\"cuda\",\"gpu_decode\":false}}");
+        for (const auto value:{"0","-1","true","1.5"}) reject(prefix+",\"attention\":{\"storage\":\"ssd\",\"sparse\":false,\"prefill_tile_tokens\":"+value+"}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"unknown\"}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"fuse_kv_projection\":1}}");
         const auto async_mode = ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"interleaved\",\"prefetch\":true";

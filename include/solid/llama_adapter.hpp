@@ -55,7 +55,7 @@ private:
 class AttentionAdapter {
 public:
     AttentionAdapter(const llama_model * model, const AttentionConfig & options, std::uint32_t capacity,
-                     std::uint64_t prefill_tokens, const std::filesystem::path & trace);
+                     std::uint64_t prefill_tokens, const std::filesystem::path & trace, std::uint32_t prefill_queries=128);
     ~AttentionAdapter();
     AttentionAdapter(const AttentionAdapter &) = delete;
     AttentionAdapter & operator=(const AttentionAdapter &) = delete;
