@@ -100,6 +100,23 @@ class LayoutAblationTests(unittest.TestCase):
             config_file.write_text("changed")
             with self.assertRaises(ValueError): ablation.report(manifest_path)
 
+    def test_prefetch_reference_drops_worker_placement(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            source, _ = self.fixture(root)
+            config_path = source / "config.json"
+            config = json.loads(config_path.read_text())
+            config["attention"].update({"prefetch": True, "io_cpu": 2, "coordinator_cpu": 4,
+                                        "schedule": "overlap", "prefetch_queue_depth": 8})
+            config_path.write_text(json.dumps(config))
+            manifest_path = ablation.create(source / "result.json", root / "configs", root / "runs")
+            manifest = json.loads(manifest_path.read_text())
+            for variant in manifest["variants"]:
+                attention = json.loads(Path(variant["config"]).read_text())["attention"]
+                self.assertFalse(attention["prefetch"])
+                for key in ("io_cpu", "coordinator_cpu", "schedule", "prefetch_queue_depth"):
+                    self.assertNotIn(key, attention)
+
     def test_changed_reference_is_rejected(self):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)

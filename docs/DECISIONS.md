@@ -35,6 +35,7 @@
 | D29 | CUDA 代表块使用 FP16；相关度按 CPU 顺序 FP64 累加，关闭 FMA 收缩；top-k 按剩余 token 成本结束，同分按逻辑 ID 升序 | [GPU 选择](implementation/GPU_SELECTION.md)，block_ranker.cu、block-ranking-contract |
 | D30 | CUDA 代表构造使用 local 大小的 K/分数环和固定 R 候选；query 边界移交完整 CPU 状态，定稿块直接写入 GPU bank；构造工作区在选择总分配中计入一次 | [GPU 代表构造](implementation/GPU_REPRESENTATIVES.md)，representative-builder-contract |
 | D31 | CUDA prefill 按有界 Q/KV tile 累计 FP32 因果 attention，H2D 完成归还主机源，同流保护设备复用；prompt 完成后释放池，KV 与计算工作区分别记录峰值 | [GPU prefill](implementation/GPU_PREFILL.md)，tiled-prefill-contract |
+| D32 | 专用 I/O 线程拥有 liburing，以有界队列与协调线程交接；命令/CQE 事件驱动自动续填；预留两个不同物理核并排除推理核集合中的 SMT 同胞 | [I/O 线程](implementation/IO_WORKERS.md)，io-worker-ownership、uring-io |
 
 ## 参数锁定任务
 

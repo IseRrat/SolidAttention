@@ -8,6 +8,8 @@
 #include <system_error>
 #ifdef SOLID_HAVE_URING
 #include <liburing.h>
+#include <sys/eventfd.h>
+#include <unistd.h>
 #endif
 
 namespace solid {
@@ -19,10 +21,15 @@ public:
         if (depth < 2 || depth > 16384) throw std::invalid_argument("uring queue depth must be in [2,16384]");
         const auto status = io_uring_queue_init(depth * 2, &ring_, 0);
         if (status < 0) throw std::system_error(-status, std::generic_category(), "io_uring_queue_init");
+        notification_=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
+        if (notification_<0) { const auto error=errno; io_uring_queue_exit(&ring_); throw std::system_error(error,std::generic_category(),"create uring completion event"); }
+        const auto registered=io_uring_register_eventfd(&ring_,notification_);
+        if (registered<0) { close(notification_); io_uring_queue_exit(&ring_); throw std::system_error(-registered,std::generic_category(),"register uring completion event"); }
     }
     ~UringReader() override {
         try { drain(); } catch (...) { std::terminate(); }
         io_uring_queue_exit(&ring_);
+        close(notification_);
     }
     bool submit(std::uint64_t id, int fd, void * destination, std::size_t bytes, std::uint64_t offset) override {
         if (!id || id >= cancel_bit || !destination || bytes == 0 || bytes > INT_MAX || fd < 0 ||
@@ -109,6 +116,17 @@ public:
         while (!reads_.empty() || !cancellations_.empty()) (void) poll(completion, true);
     }
     AsyncIoStats stats() const override { return stats_; }
+    int completion_handle() const override { return notification_; }
+    void acknowledge_notifications() override {
+        std::uint64_t count;
+        for (;;) {
+            const auto result=::read(notification_,&count,sizeof(count));
+            if (result==static_cast<ssize_t>(sizeof(count))) continue;
+            if (result<0 && errno==EINTR) continue;
+            if (result<0 && errno==EAGAIN) return;
+            throw std::system_error(result<0?errno:EIO,std::generic_category(),"consume uring notification");
+        }
+    }
 private:
     struct Request {
         int fd;
@@ -122,6 +140,7 @@ private:
     };
     static constexpr std::uint64_t cancel_bit = std::uint64_t{1} << 63;
     io_uring ring_{};
+    int notification_=-1;
     std::uint32_t limit_;
     std::map<std::uint64_t, Request> reads_;
     std::set<std::uint64_t> cancellations_;

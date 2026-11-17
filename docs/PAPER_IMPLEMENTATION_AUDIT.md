@@ -1,6 +1,6 @@
 # 论文实现核查
 
-核查日期：2026-11-17。代码基点：`afe4773bfcf6c92b2a80210e391f2356b0a961e6`。依据：SolidAttention §3.1、§4、§6、§7 和图 5、图 11、算法 1；[论文 PDF](https://www.usenix.org/system/files/fast26-zheng.pdf)，印刷页 70–74。
+核查日期：2026-11-18。代码基点：`afe4773bfcf6c92b2a80210e391f2356b0a961e6`。依据：SolidAttention §3.1、§4、§6、§7 和图 5、图 11、算法 1；[论文 PDF](https://www.usenix.org/system/files/fast26-zheng.pdf)，印刷页 70–74。
 
 ## 1. 实现规模与统计范围
 
@@ -30,6 +30,8 @@
 - CUDA 后续窗口代表构造、环形评分工作区、CPU 状态接管与定稿块直接发布，完成记录见 [GPU 代表构造](implementation/GPU_REPRESENTATIVES.md)。
 - 有界 CUDA 分块 prefill、在线 softmax、源租约及池释放，完成记录见 [GPU prefill](implementation/GPU_PREFILL.md)。
 
+- 独立 I/O 与协调线程、有界队列、物理核预留与取消排空，完成记录见 [I/O 线程](implementation/IO_WORKERS.md)。
+
 ## 3. 论文路径与后续核心代码
 
 | 核查项 | 当前执行路径 | 后续代码与核查要求 |
@@ -38,7 +40,7 @@
 | 长输入 prefill | [CUDA 分块 prefill](implementation/GPU_PREFILL.md) 在固定 Q/KV 池上累计因果 attention；代表使用 GPU 窗口构造；CPU 流式路径用于参考 | 继续接入设备 Q/K，核查模型级误差、峰值与性能 |
 | 算法 1 的调度范围，§6.1 | [scheduler.cpp](../src/scheduler.cpp) 提供关键路径/LST；[ggml_prefetch.cpp](../src/ggml_prefetch.cpp) 沿固定图与回调推进，每层聚合为 12 项任务；`ready()` 在回写/下一层预取之间选择 | 建立块级预测读、纠错读、H2D、D2H、回写的资源就绪队列，以真实完成事件解锁后继，按关键路径/LST 分派；合成执行轨迹证明优先级影响提交次序 |
 | selected 优先，§6.1 | [prefetch.cpp](../src/prefetch.cpp) 的 `begin()` 按 head 加入 init、local、历史 selected，再按插入次序启动读取 | 给块请求保留类别、依赖和估算成本，让关键纠错依赖的 selected 请求获得优先级；用受限队列检查实际发出顺序和饥饿边界 |
-| I/O 与协调分工，§7 | 一个常驻 `TaskWorker` 执行纠错读、H2D 提交、满缓冲回写和下一层预取，liburing 由调用方推进 | 拆分专用 I/O 与 SSD-GPU 协调线程，配置独立 CPU 绑定；用有界队列传递请求及完成事件，核查关停、反压和租约释放 |
+| I/O 与协调分工，§7 | [独立 I/O 所有者](implementation/IO_WORKERS.md) 执行 liburing 操作并自动续填内核队列，协调线程执行纠错、H2D、回写和后继预取；独立物理核与推理核分工 | 结合块级资源队列验证负载下的反压与优先级；设备事件解锁后继传输 |
 | 同步与时间观测，§6.2 | GGML 事件支持独立 H2D、批量确认和同步复用；DAG 的 GPU 区间采用主机观测边界，投影包含下载阶段 | 补齐设备事件记录和任务级完成关联，分别记录主机区间、设备执行与传输；由事件关系核查共享完成点和槽位复用 |
 | SYCL，§1、§8.1 | 主工程提供 CUDA 构建入口，GPU 路径依赖 GGML 通用接口 | 提供 SYCL 构建、具体算子与事件适配、统一内存路径和对应合成检查 |
 
@@ -48,7 +50,7 @@ prefill 的 GPU 分块方案属于长上下文工程补齐；论文 §7 对实�
 
 1. 在 CUDA 代表构造/评分/top-k、分块 prefill 基础上补齐直接消费设备 Q 和交错 KV 更新的数据流。
 2. 把聚合任务扩展为块级事件任务，连接资源就绪队列与关键路径/LST 分派，落实 selected 优先。
-3. 拆分 I/O 与协调线程、配置 CPU 绑定，完善异步传输与设备完成观测。
+3. 在独立 I/O 与协调线程基础上完善异步传输与设备完成观测。
 4. 复核 CUDA 全路径，补齐 SYCL 与统一内存接入。
 5. 每项完成代码与检查后更新所属阶段记录，再进入模型及设备评测。
 

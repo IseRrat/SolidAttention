@@ -1,4 +1,5 @@
 #include "solid/scheduler.hpp"
+#include "solid/thread_affinity.hpp"
 #include "nlohmann/json.hpp"
 #include <algorithm>
 #include <chrono>
@@ -187,7 +188,17 @@ std::uint64_t TaskDag::overlap_ns(std::uint32_t a, std::uint32_t b) const {
     const auto begin = std::max(x.start_ns, y.start_ns), end = std::min(x.end_ns, y.end_ns);
     return end > begin ? end - begin : 0;
 }
-TaskWorker::TaskWorker() : thread_(&TaskWorker::run, this) {}
+TaskWorker::TaskWorker(int cpu) {
+    thread_=std::thread([this,cpu] {
+        std::exception_ptr error;
+        try { bind_thread_cpu(cpu); } catch (...) { error=std::current_exception(); }
+        { std::lock_guard<std::mutex> lock(mutex_); initialization_error_=error; initialized_=true; }
+        cv_.notify_all();
+        if (!error) run();
+    });
+    std::unique_lock<std::mutex> lock(mutex_); cv_.wait(lock,[&] { return initialized_; });
+    if (initialization_error_) { const auto error=initialization_error_; lock.unlock(); thread_.join(); std::rethrow_exception(error); }
+}
 TaskWorker::~TaskWorker() {
     try { join(); } catch (...) {}
     { std::lock_guard<std::mutex> lock(mutex_); stopping_ = true; }

@@ -103,6 +103,8 @@ unused = predicted - actual
 
 liburing 路径以原 READ CQE 结束内核写入期。主机槽位和设备槽位分别管理 producer/readers；H2D 完成事件释放主机源租约，attention 完成证明释放设备读者。尾块等待旧读取完成后保留不可变前缀并补齐新行，设备 mask 按实际物理槽位构建。代码与容量公式见 [阶段 3](phases/PHASE_3.md)，同步复用见 [阶段 4](phases/PHASE_4.md)。
 
+liburing 由独立 I/O 线程创建并拥有，协调线程通过有界队列交接请求与完成。I/O 线程在 CQE 到达后自动续填内核 SQ；提交前取消直接结束逻辑请求，提交后取消等待原 READ。命令与完成使用 eventfd 唤醒。两工作线程绑定不同物理核，推理线程继承排除这两个核及其 SMT 同胞的允许集合。配置、关停与检查见 [I/O 线程](implementation/IO_WORKERS.md)。
+
 ## 8. SSD-aware 调度
 
 微任务包括 Q 投影、KV 投影、选择、SSD 读取、H2D、attention、D2H、SSD 回写和 FFN。每条任务依赖使用完成事件表达：

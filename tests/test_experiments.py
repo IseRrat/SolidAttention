@@ -57,6 +57,16 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_worker_cpu_settings_are_applied_only_to_prefetch_variants(self):
+        template={"attention":{"io_cpu":6,"coordinator_cpu":7}}
+        for variant in experiments.VARIANTS:
+            config=experiments.variant_config(template,variant,32,1024)
+            a=config.get("attention",{})
+            if a.get("prefetch"):
+                self.assertEqual((a["io_cpu"],a["coordinator_cpu"]),(6,7))
+            else:
+                self.assertNotIn("io_cpu",a); self.assertNotIn("coordinator_cpu",a)
+
     def test_prefill_policy_survives_dense_and_sparse_variants(self):
         template={"attention":{"prefill_backend":"cpu","prefill_tile_tokens":128}}
         for variant in experiments.VARIANTS:

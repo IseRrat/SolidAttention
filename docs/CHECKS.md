@@ -136,3 +136,9 @@ CPU 执行共用数学并对照既有参考，覆盖完整状态接管、窗口�
 CUDA 内核与运行器链接、36 项 CTest、57 项 Linux Python 检查及源码指纹通过。核心库 9 项 CTest 的地址、泄漏与未定义行为检查通过。
 
 合成检查覆盖多 head 维度、GQA、因果前缀、NaN padding、源立即复用、在线 softmax 数值、两种存储布局、融合输入、prefill/decode 边界、池释放与峰值、GGML 图和异常排空。设备检查程序已编译，执行保留在实验环境。代码与核查入口见 [GPU prefill](implementation/GPU_PREFILL.md)。
+
+## 2026-11-18：独立 I/O 与协调线程
+
+CUDA 编译与链接、37 项 CTest、59 项 Linux Python 检查及源码指纹通过。核心库 10 项 CTest 的地址、泄漏和未定义行为检查通过。
+
+受控完成描述符核查线程归属、自动续填、提交前取消、取消 ACK 与原 READ、drain 后复用、异常排空及物理核预留/恢复。微小临时文件检查直接和线程化 liburing；三种实际 CPU GGML 预取图对照同步数值参考。配置工具覆盖线程设置保留和同步消融转换。完成记录见 [I/O 线程](implementation/IO_WORKERS.md)。

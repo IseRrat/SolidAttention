@@ -56,6 +56,8 @@ def variant_config(template, variant, block, budget):
     if prefetch:
         attention.update(prefetch_trace=False, prefetch_queue_depth=64, schedule_trace=False,
                          schedule={"prefetch":"naive","overlap":"overlap","solid":"overlap+sync_reuse"}[variant])
+        for key in ("io_cpu","coordinator_cpu"):
+            if key in template.get("attention",{}): attention[key]=template["attention"][key]
     if sparse and budget:
         deterministic = max(1,budget//2)
         initial = min(block,deterministic//2)

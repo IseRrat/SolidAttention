@@ -1,6 +1,7 @@
 #include "solid/llama_adapter.hpp"
 #include "solid/projection.hpp"
 #include "solid/ggml_prefetch.hpp"
+#include "solid/thread_affinity.hpp"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-graph.h"
@@ -222,6 +223,7 @@ void AttentionNode::complete_attention() { if (impl_->prefetch) impl_->prefetch-
 
 struct AttentionAdapter::Impl {
     const llama_model * model;
+    std::unique_ptr<WorkerPlacement> placement;
     std::unique_ptr<AttentionSession> session;
     std::shared_ptr<AttentionFailure> failure = std::make_shared<AttentionFailure>();
     bool gpu_decode;
@@ -296,9 +298,14 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     impl_->configure_prefill=options.gpu_decode && options.prefill_backend!="cpu";
     impl_->prefill_queries=std::min(prefill_queries,capacity);
     impl_->prefill_tile_tokens=options.prefill_tile_tokens;
+    if (options.prefetch) impl_->placement=std::make_unique<WorkerPlacement>(options.io_cpu,options.coordinator_cpu);
+    const auto slots=options.prefetch_slots_per_head ? options.prefetch_slots_per_head : std::min<std::uint64_t>(geometry.blocks_per_head(),
+        (static_cast<std::uint64_t>(budget.total)+geometry.block_tokens-1)/geometry.block_tokens+3);
+    const auto admission=std::max<std::uint64_t>(options.prefetch_queue_depth,static_cast<std::uint64_t>(geometry.heads)*slots*2);
+    if (options.prefetch && admission>16384) throw std::invalid_argument("prefetch worker admission exceeds 16384 requests");
     impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens,
         options.selection_trace ? trace : std::filesystem::path{},
-        options.selection_replay, options.prefetch ? make_uring_reader(options.prefetch_queue_depth) : nullptr,
+        options.selection_replay, options.prefetch ? make_threaded_uring_reader(options.prefetch_queue_depth,impl_->placement->io_cpu(),static_cast<std::uint32_t>(admission)) : nullptr,
         options.prefetch_slots_per_head, options.prefetch_trace ? trace.parent_path() / "prefetch.jsonl" : std::filesystem::path{});
     if (options.prefetch_trace) impl_->residency_trace = trace.parent_path() / "residency.jsonl";
     impl_->schedule = parse_schedule_mode(options.schedule);
@@ -358,7 +365,8 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
     if (gathered && prefetch_enabled()) {
         if (!backend) throw std::logic_error("prefetch decode backend is required");
         if (!impl_->device) {
-            impl_->device = std::make_unique<GgmlPrefetch>(*impl_->session, backend, impl_->residency_trace, impl_->schedule, impl_->schedule_trace);
+            impl_->device = std::make_unique<GgmlPrefetch>(*impl_->session, backend, impl_->residency_trace, impl_->schedule, impl_->schedule_trace,
+                impl_->placement->coordinator_cpu());
             impl_->prefetch_backend = backend;
         } else if (impl_->prefetch_backend != backend) throw std::logic_error("prefetch decode backend changed");
     }
@@ -384,6 +392,7 @@ bool AttentionAdapter::observe(ggml_tensor * tensor, bool ask) noexcept {
 void AttentionAdapter::quiesce() { if (impl_->device) impl_->device->quiesce(); }
 DeviceCacheStats AttentionAdapter::device_stats() const { return impl_->device ? impl_->device->stats() : DeviceCacheStats{}; }
 ScheduleStats AttentionAdapter::schedule_stats() const { return impl_->device ? impl_->device->schedule_stats() : ScheduleStats{}; }
+std::vector<int> AttentionAdapter::inference_cpus() const { return impl_->placement ? impl_->placement->inference_cpus() : std::vector<int>{}; }
 bool AttentionAdapter::gathered_decode(std::uint64_t position) const { return impl_->gpu_decode && position >= impl_->prefill_tokens; }
 bool AttentionAdapter::fused_projection() const { return !impl_->projections.empty(); }
 const KvProjection & AttentionAdapter::projection(std::uint32_t layer) const { return *impl_->projections.at(layer); }

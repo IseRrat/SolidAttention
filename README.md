@@ -2,7 +2,7 @@
 
 复现 FAST 2026 论文 **SolidAttention: Low-Latency SSD-based Serving on Memory-Constrained PCs**，在 llama.cpp 上实现 SSD KV cache、动态稀疏注意力、历史预取和计算/I/O 重叠。
 
-首条路线采用 Linux + CUDA，单请求 decode，INT4 模型权重和 FP16 KV cache。当前交付包括交错布局、CUDA 代表构造/块评分/top-k、有界 GPU 分块 prefill、历史预取、固定图重叠和实验工具。后续核心代码按 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md) 补齐块级调度与线程分工，再开展模型与设备评测。
+首条路线采用 Linux + CUDA，单请求 decode，INT4 模型权重和 FP16 KV cache。当前交付包括交错布局、CUDA 代表构造/块评分/top-k、有界 GPU 分块 prefill、历史预取、独立 I/O 与协调线程、固定图重叠和实验工具。后续核心代码按 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md) 补齐块级调度与设备事件，再开展模型与设备评测。
 
 ## 开发入口
 
@@ -23,6 +23,8 @@
 15. [CUDA 块评分与动态选块](docs/implementation/GPU_SELECTION.md)：新增 GPU 内核、代表发布、预算 top-k、实际后端与内存记录、检查证据。
 16. [CUDA 窗口代表构造](docs/implementation/GPU_REPRESENTATIVES.md)：后续窗口评分、环形状态、块内代表、CPU 状态接管及图核查。
 17. [有界 CUDA 分块 prefill](docs/implementation/GPU_PREFILL.md)：因果 attention、在线 softmax、分块读取、源生命周期、池释放和数值核查。
+
+18. [独立 I/O 与协调线程](docs/implementation/IO_WORKERS.md)：有界提交、完成通知、取消排空、物理核预留和实际线程记录。
 
 ## 系统机制
 

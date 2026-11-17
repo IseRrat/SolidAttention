@@ -14,7 +14,8 @@ int main() {
         std::array<unsigned char, 64> expected{};
         for (std::size_t i = 0; i < expected.size(); ++i) expected[i] = static_cast<unsigned char>(i);
         if (file->write_at(expected.data(), expected.size(), 0) != expected.size()) throw std::runtime_error("test setup write");
-        auto reader = solid::make_uring_reader(2);
+        for (bool threaded:{false,true}) {
+        auto reader = threaded ? solid::make_threaded_uring_reader(2) : solid::make_uring_reader(2);
         std::array<unsigned char, 32> a{}, b{};
         if (!reader->submit(1, file->native_handle(), a.data(), a.size(), 0) ||
             !reader->submit(2, file->native_handle(), b.data(), b.size(), 32) ||
@@ -31,8 +32,13 @@ int main() {
         reader->flush(); reader->cancel(5); reader->flush();
         if (!reader->poll(c, true) || c.id != 5) throw std::runtime_error("cancel lost original completion");
         reader->drain();
-        if (reader->stats().cancel_requests != reader->stats().cancel_completions || reader->stats().completed_reads != 4) {
+        if (reader->stats().cancel_requests != reader->stats().cancel_completions ||
+            reader->stats().completed_reads+reader->stats().queued_cancellations != 4) {
             throw std::runtime_error("uring cancellation drain accounting");
+        }
+        if (reader->stats().dedicated_worker!=threaded) throw std::runtime_error("uring owner thread identity");
+        std::cout<<"threaded="<<threaded<<" READ completions="<<reader->stats().completed_reads
+                 <<" queued cancellations="<<reader->stats().queued_cancellations<<'\n';
         }
         std::cout << "liburing temporary-file reads, short reads, EOF, cancellation and drain passed\n";
         return 0;

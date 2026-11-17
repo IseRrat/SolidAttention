@@ -400,6 +400,10 @@ int main(int argc, char ** argv) {
             if (config.attention.prefetch) {
                 result["prefetch"] = {
                     {"io_engine", "liburing"}, {"queue_depth", config.attention.prefetch_queue_depth},
+                    {"io_execution",stats.prefetch.io.dedicated_worker?"dedicated_thread":"caller_thread"},
+                    {"io_cpu",stats.prefetch.io.worker_cpu},{"inference_cpus",adapter->inference_cpus()},
+                    {"io_admission_capacity",stats.prefetch.io.worker_capacity},
+                    {"worker_submissions",stats.prefetch.io.worker_submissions},{"queued_cancellations",stats.prefetch.io.queued_cancellations},
                     {"slots_per_head", stats.prefetch.slots_per_head},
                     {"trace_enabled", config.attention.prefetch_trace},
                     {"history_resolutions", stats.prefetch.history_resolutions}, {"formal_resolutions", stats.prefetch.formal_resolutions},
@@ -427,6 +431,7 @@ int main(int argc, char ** argv) {
                 result["schedule"] = {
                     {"mode", config.attention.schedule}, {"trace_enabled", config.attention.schedule_trace},
                     {"frames", schedule.frames}, {"tasks", schedule.tasks}, {"worker_jobs", schedule.worker_jobs},
+                    {"coordinator_cpu",schedule.coordinator_cpu},
                     {"observed_critical_path_sum_ms", schedule.critical_path_ns / 1e6},
                     {"miss_projection_overlap_sum_ms", schedule.miss_projection_overlap_ns / 1e6},
                     {"query_reused_fences", schedule.query_reused_fences}, {"process_reused_fences", schedule.process_reused_fences},

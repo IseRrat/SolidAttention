@@ -84,6 +84,12 @@ int main() {
         const auto async_mode = ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"interleaved\",\"prefetch\":true";
         write(prefix + async_mode + ",\"prefetch_queue_depth\":2,\"prefetch_slots_per_head\":4}}");
         if (!solid::RunConfig::load(config).attention.prefetch) throw std::runtime_error("prefetch config parsing");
+        write(prefix+async_mode+",\"io_cpu\":0,\"coordinator_cpu\":1}}");
+        const auto placement=solid::RunConfig::load(config).attention;
+        if (placement.io_cpu!=0 || placement.coordinator_cpu!=1) throw std::runtime_error("worker CPU parsing");
+        reject(prefix+async_mode+",\"io_cpu\":1,\"coordinator_cpu\":1}}");
+        for (const auto value:{"-2","true","1.5","2147483648","18446744073709551615"}) reject(prefix+async_mode+",\"io_cpu\":"+value+"}}");
+        reject(prefix+",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"io_cpu\":0}}");
         reject(prefix + async_mode + ",\"prefetch_queue_depth\":1}}");
         reject(prefix + async_mode + ",\"prefetch_slots_per_head\":1000}}");
         reject(prefix + async_mode + ",\"gpu_decode\":false}}");

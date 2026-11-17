@@ -60,7 +60,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         const auto path = std::filesystem::temp_directory_path() / ("solid-prefetch-graph-" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
         store = std::make_unique<solid::FileKvStore>(geometry, solid::create_session_file(path, true), 2048);
-        reader = solid::make_uring_reader(2);
+        reader = solid::make_threaded_uring_reader(2);
     } else {
         auto file = std::make_unique<File>();
         auto fake = std::make_unique<Reader>(file.get());

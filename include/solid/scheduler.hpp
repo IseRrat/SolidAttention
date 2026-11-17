@@ -69,7 +69,7 @@ private:
 // One persistent worker, one bounded job. Exceptions are delivered by join().
 class TaskWorker {
 public:
-    TaskWorker();
+    explicit TaskWorker(int cpu=-1);
     ~TaskWorker();
     void submit(std::function<void()> work);
     void join();
@@ -80,9 +80,12 @@ private:
     std::exception_ptr error_;
     bool stopping_ = false, busy_ = false, done_ = false;
     std::thread thread_;
+    bool initialized_=false;
+    std::exception_ptr initialization_error_;
     void run();
 };
 struct ScheduleStats {
+    int coordinator_cpu=-1;
     std::uint64_t frames = 0, tasks = 0, worker_jobs = 0;
     std::uint64_t critical_path_ns = 0, miss_projection_overlap_ns = 0;
     std::uint64_t query_reused_fences = 0, process_reused_fences = 0, attention_fences = 0;

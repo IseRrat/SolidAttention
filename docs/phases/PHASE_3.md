@@ -168,3 +168,5 @@ python3 scripts/compare_prefetch.py results/sync/result.json results/prefetch-ch
 | 配置与工具 | 组合和范围拒绝、构建特性、实际输入继承、选择差异、覆盖时序、epoch 和来源检查 |
 
 本机检查使用合成张量与临时文件。模型输出、CUDA 实际执行、任务准确率与设备性能按本节实验入口核查。全部阶段入口见 [阶段索引](README.md)，检查摘要见 [CHECKS](../CHECKS.md)，后续任务见 [阶段 4](../ROADMAP.md#阶段-4微任务调度)。
+
+2026-11-18 补齐了独立 I/O 所有者、有界请求/完成队列、物理核预留和取消排空，详见 [I/O 线程完成记录](../implementation/IO_WORKERS.md)。

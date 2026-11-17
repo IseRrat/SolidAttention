@@ -9,7 +9,7 @@ namespace solid {
 class GgmlPrefetch {
 public:
     GgmlPrefetch(AttentionSession & session, ggml_backend * backend, const std::filesystem::path & trace = {},
-                 ScheduleMode mode = ScheduleMode::naive, const std::filesystem::path & schedule_trace = {});
+                 ScheduleMode mode = ScheduleMode::naive, const std::filesystem::path & schedule_trace = {},int coordinator_cpu=-1);
     ~GgmlPrefetch();
     ggml_tensor * tensor() const;
     std::uint32_t tokens_per_head() const;

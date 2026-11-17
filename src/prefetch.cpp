@@ -328,6 +328,7 @@ void Prefetcher::finish() {
     }
     while (!requests_.empty()) poll(true);
     reader_->drain();
+    reader_->rethrow_failure();
     if (trace_.is_open()) { trace_.flush(); if (!trace_) throw std::runtime_error("prefetch trace flush failed"); }
 }
 PrefetchStats Prefetcher::stats() const { auto result = stats_; result.io = reader_->stats(); return result; }

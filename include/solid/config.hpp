@@ -29,6 +29,7 @@ struct AttentionConfig {
     std::string prefill_backend = "auto";
     std::uint32_t prefill_tile_tokens = 512;
     std::uint32_t prefetch_queue_depth = 64;
+    int io_cpu=-1,coordinator_cpu=-1;
     std::uint32_t prefetch_slots_per_head = 0;
     std::uint32_t block_tokens = 32;
     std::uint32_t context_budget_tokens = 0;

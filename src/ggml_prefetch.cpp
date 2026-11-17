@@ -175,9 +175,9 @@ struct GgmlPrefetch::Impl {
     std::uint64_t sequence = 0;
     bool quiesced = true;
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
-          const std::filesystem::path & schedule) :
-        session(s), mode(mode), trace(schedule), transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode),
-        device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) { estimates.fill(1); }
+          const std::filesystem::path & schedule,int cpu) :
+        session(s), mode(mode), worker(cpu), trace(schedule), transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode),
+        device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) { estimates.fill(1); totals.coordinator_cpu=cpu; }
     std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position) {
         if (work && !work->dag.finished()) throw std::logic_error("new layer started before previous completion proof");
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
@@ -214,8 +214,8 @@ struct GgmlPrefetch::Impl {
     }
 };
 GgmlPrefetch::GgmlPrefetch(AttentionSession & session, ggml_backend_t backend, const std::filesystem::path & trace,
-                          ScheduleMode mode, const std::filesystem::path & schedule_trace) :
-    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace)) {}
+                          ScheduleMode mode, const std::filesystem::path & schedule_trace,int cpu) :
+    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace,cpu)) {}
 GgmlPrefetch::~GgmlPrefetch() { if (!impl_->quiesced) { try { quiesce(); } catch (...) {} } }
 ggml_tensor * GgmlPrefetch::tensor() const { return impl_->transport.tensor(); }
 std::uint32_t GgmlPrefetch::tokens_per_head() const { return impl_->device.tokens_per_head(); }

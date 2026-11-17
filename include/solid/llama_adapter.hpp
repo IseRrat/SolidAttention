@@ -79,6 +79,7 @@ public:
     void quiesce();
     DeviceCacheStats device_stats() const;
     ScheduleStats schedule_stats() const;
+    std::vector<int> inference_cpus() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
