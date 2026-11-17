@@ -3,6 +3,7 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
+#include <chrono>
 #include <climits>
 #include <cstring>
 #include <fcntl.h>
@@ -187,10 +188,30 @@ std::unique_ptr<RandomAccessFile> create_session_file(const std::filesystem::pat
     return std::make_unique<NativeFile>(path, remove_on_close);
 }
 KvStore::KvStore(KvGeometry geometry) : geometry_(geometry) { geometry_.validate(); }
+Half * KvBlock::key(std::size_t row) {
+    return data.data() + row * dimension * (layout == KvLayout::interleaved ? 2 : 1);
+}
+Half * KvBlock::value(std::size_t row) {
+    return key(row) + (layout == KvLayout::interleaved ? dimension : static_cast<std::size_t>(capacity) * dimension);
+}
+const Half * KvBlock::key(std::size_t row) const { return const_cast<KvBlock *>(this)->key(row); }
+const Half * KvBlock::value(std::size_t row) const { return const_cast<KvBlock *>(this)->value(row); }
+void KvStore::append(std::uint32_t layer, std::uint64_t position,
+                     const std::vector<Half> & keys, const std::vector<Half> & values) {
+    if (keys.size() != static_cast<std::size_t>(geometry_.heads) * geometry_.dimension || values.size() != keys.size()) {
+        throw std::invalid_argument("KV append requires complete heads");
+    }
+    std::vector<Half> kv(keys.size() * 2);
+    for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
+        std::copy_n(keys.data() + head * geometry_.dimension, geometry_.dimension, kv.data() + head * 2 * geometry_.dimension);
+        std::copy_n(values.data() + head * geometry_.dimension, geometry_.dimension, kv.data() + (head * 2 + 1) * geometry_.dimension);
+    }
+    append_interleaved(layer, position, kv);
+}
 void KvStore::validate_append(std::uint32_t layer, std::uint64_t position, std::uint64_t current,
-                             const std::vector<Half> & keys, const std::vector<Half> & values) const {
+                             const std::vector<Half> & kv) const {
     if (layer >= geometry_.layers || position != current || position >= geometry_.capacity_tokens ||
-        keys.size() != static_cast<std::uint64_t>(geometry_.heads) * geometry_.dimension || keys.size() != values.size()) {
+        kv.size() != static_cast<std::uint64_t>(geometry_.heads) * 2 * geometry_.dimension) {
         throw std::invalid_argument("KV append requires consecutive positions and complete heads");
     }
 }
@@ -202,32 +223,28 @@ void KvStore::prepare_block(std::uint32_t layer, std::uint32_t head, std::uint64
     result.first_position = first;
     result.valid_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(geometry_.block_tokens, current - first));
     result.version = result.valid_tokens;
-    result.keys.assign(static_cast<std::size_t>(geometry_.block_tokens) * geometry_.dimension, 0);
-    result.values.assign(result.keys.size(), 0);
+    result.layout = geometry_.layout;
+    result.dimension = geometry_.dimension;
+    result.capacity = geometry_.block_tokens;
+    result.data.assign(static_cast<std::size_t>(geometry_.block_tokens) * 2 * geometry_.dimension, 0);
 }
 MemoryKvStore::MemoryKvStore(KvGeometry geometry) : KvStore(geometry), data_(geometry.layers), lengths_(geometry.layers, 0) {
     const auto elements = static_cast<std::size_t>(geometry.capacity_tokens) * geometry.heads * 2 * geometry.dimension;
     for (auto & data : data_) data.reserve(elements);
 }
-void MemoryKvStore::append(std::uint32_t layer, std::uint64_t position,
-                           const std::vector<Half> & keys, const std::vector<Half> & values) {
+void MemoryKvStore::append_interleaved(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv) {
     const auto current = length(layer);
-    validate_append(layer, position, current, keys, values);
+    validate_append(layer, position, current, kv);
     auto & data = data_[layer];
-    const auto previous = data.size();
-    data.resize(previous + keys.size() * 2);
-    for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
-        std::copy_n(keys.data() + head * geometry_.dimension, geometry_.dimension, data.data() + previous + head * 2 * geometry_.dimension);
-        std::copy_n(values.data() + head * geometry_.dimension, geometry_.dimension, data.data() + previous + (head * 2 + 1) * geometry_.dimension);
-    }
+    data.insert(data.end(), kv.begin(), kv.end());
     ++lengths_[layer];
 }
 void MemoryKvStore::read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & result) {
     prepare_block(layer, head, block, length(layer), result);
     for (std::uint32_t i = 0; i < result.valid_tokens; ++i) {
         const auto source = ((result.first_position + i) * geometry_.heads + head) * 2 * geometry_.dimension;
-        std::copy_n(data_[layer].data() + source, geometry_.dimension, result.keys.data() + i * geometry_.dimension);
-        std::copy_n(data_[layer].data() + source + geometry_.dimension, geometry_.dimension, result.values.data() + i * geometry_.dimension);
+        std::copy_n(data_[layer].data() + source, geometry_.dimension, result.key(i));
+        std::copy_n(data_[layer].data() + source + geometry_.dimension, geometry_.dimension, result.value(i));
     }
 }
 std::uint64_t MemoryKvStore::length(std::uint32_t layer) const { return lengths_.at(layer); }
@@ -260,7 +277,9 @@ void FileKvStore::read_exact(void * destination, std::size_t bytes, std::uint64_
     std::size_t done = 0;
     try {
         while (done < bytes) {
+            const auto start = std::chrono::steady_clock::now();
             const auto n = file_->read_at(data + done, bytes - done, offset + done);
+            stats_.read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
             ++stats_.read_requests;
             if (n == 0 || n > bytes - done) throw std::runtime_error("incomplete KV read at " + std::to_string(offset + done));
             stats_.read_bytes += n;
@@ -273,7 +292,9 @@ void FileKvStore::write_exact(const void * source, std::size_t bytes, std::uint6
     std::size_t done = 0;
     try {
         while (done < bytes) {
+            const auto start = std::chrono::steady_clock::now();
             const auto n = file_->write_at(data + done, bytes - done, offset + done);
+            stats_.write_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
             ++stats_.write_requests;
             if (n == 0 || n > bytes - done) throw std::runtime_error("incomplete KV write at " + std::to_string(offset + done));
             stats_.write_bytes += n;
@@ -281,21 +302,13 @@ void FileKvStore::write_exact(const void * source, std::size_t bytes, std::uint6
         }
     } catch (...) { failed_ = true; throw; }
 }
-void FileKvStore::append(std::uint32_t layer, std::uint64_t position,
-                         const std::vector<Half> & keys, const std::vector<Half> & values) {
+void FileKvStore::append_interleaved(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv) {
     check_ready();
-    validate_append(layer, position, length(layer), keys, values);
+    validate_append(layer, position, length(layer), kv);
     auto & pending = pending_.at(layer);
     if (pending.values.size() / token_elements_ == pending_tokens_) flush_layer(layer);
     if (pending.values.empty()) pending.first = position;
-    const auto previous = pending.values.size();
-    pending.values.resize(previous + token_elements_);
-    for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
-        std::copy_n(keys.data() + head * geometry_.dimension, geometry_.dimension,
-                    pending.values.data() + previous + head * 2 * geometry_.dimension);
-        std::copy_n(values.data() + head * geometry_.dimension, geometry_.dimension,
-                    pending.values.data() + previous + (head * 2 + 1) * geometry_.dimension);
-    }
+    pending.values.insert(pending.values.end(), kv.begin(), kv.end());
     ++lengths_[layer];
 }
 void FileKvStore::flush_layer(std::uint32_t layer) {
@@ -341,22 +354,18 @@ void FileKvStore::read(std::uint32_t layer, std::uint32_t head, std::uint64_t bl
         std::min<std::uint64_t>(result.valid_tokens, committed_[layer] - result.first_position);
     if (committed > 0) {
         if (geometry_.layout == KvLayout::separate) {
-            read_exact(result.keys.data(), committed * dimension * sizeof(Half), offset);
-            read_exact(result.values.data(), committed * dimension * sizeof(Half), offset + align_up(geometry_.plane_bytes(), geometry_.alignment));
+            read_exact(result.key(0), committed * dimension * sizeof(Half), offset);
+            read_exact(result.value(0), committed * dimension * sizeof(Half), offset + align_up(geometry_.plane_bytes(), geometry_.alignment));
         } else {
-            read_exact(scratch_.data(), committed * 2 * dimension * sizeof(Half), offset);
-            for (std::size_t i = 0; i < committed; ++i) {
-                std::copy_n(scratch_.data() + i * 2 * dimension, dimension, result.keys.data() + i * dimension);
-                std::copy_n(scratch_.data() + (i * 2 + 1) * dimension, dimension, result.values.data() + i * dimension);
-            }
+            read_exact(result.data.data(), committed * 2 * dimension * sizeof(Half), offset);
         }
     }
     const auto & pending = pending_[layer];
     for (std::uint32_t i = static_cast<std::uint32_t>(committed); i < result.valid_tokens; ++i) {
         const auto source = (result.first_position + i - pending.first) * token_elements_ + head * 2 * dimension;
         if (source + 2 * dimension > pending.values.size()) throw std::logic_error("KV dirty range mismatch");
-        std::copy_n(pending.values.data() + source, dimension, result.keys.data() + i * dimension);
-        std::copy_n(pending.values.data() + source + dimension, dimension, result.values.data() + i * dimension);
+        std::copy_n(pending.values.data() + source, dimension, result.key(i));
+        std::copy_n(pending.values.data() + source + dimension, dimension, result.value(i));
     }
 }
 void FileKvStore::flush() { for (std::uint32_t layer = 0; layer < geometry_.layers; ++layer) flush_layer(layer); }

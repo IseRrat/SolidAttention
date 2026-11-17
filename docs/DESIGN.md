@@ -75,9 +75,9 @@ decode 当前 token 的 KV 先进入 attention 工作集，再进入每层写缓
 
 ## 6. KV consolidator
 
-首先实现 CPU encode/decode，验证交错布局与独立 K/V 布局的字节和 attention 输出。随后在模型加载阶段合并 K/V 投影权重，用一次投影生成交错输出，K 经过相应 RoPE 处理。
+`KvBlock` 保持独立或交错排列，CPU attention 通过行指针读取，decode 工作集通过 stride/view 提供 K/V。模型加载后按 `[head,K/V,D]` 行顺序合并投影权重，用一次矩阵乘法生成交错输出；K 沿用原生 RoPE 并写回对应行。
 
-attention 通过 stride/view 访问 K/V。适配时检查量化行边界、GQA head 映射和后端连续性要求；转换开销单独计时。布局消融固定 token 块大小、选择集合和 KV 精度，比较读请求数、传输字节、H2D 延迟及 attention 延迟。
+同类型权重逐行保留量化编码，混合类型逐行转换成 FP32 融合权重。融合 buffer 容量、初始化时间及实际权重类型写入结果。布局和投影独立开关；消融固定 token 块大小、输入、选择集合及 KV 精度。文件调用、工作集构造、后端复制和 attention 分项记录，完成说明见 [阶段 2](phases/PHASE_2.md)。
 
 ## 7. 历史预取与槽位管理
 

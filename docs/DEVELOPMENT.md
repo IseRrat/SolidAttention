@@ -57,5 +57,9 @@ python3 scripts/run_baseline.py configs/baseline.local.json
 | `result.json` | 模型元数据、输入/输出 token、逐 token 计时、停止原因 |
 | `memory.jsonl` | 进程 RSS/HWM、锁页和 swap 采样 |
 | `stdout.txt`、`stderr.txt` | 完整标准输出和后端日志 |
+| `selection.jsonl` | attention 路径每层、每轮、每 KV head 的实际选择范围 |
+| `selection.replay.jsonl` | 固定选择回放时的输入轨迹副本 |
 
 启动脚本要求主仓库和上游源码已提交；本地配置与结果目录由 `.gitignore` 排除。内存采样间隔为 100 ms，manifest 标注采样峰值及 cgroup 范围；VRAM 和 KV 分配信息保留在后端日志中。
+
+交错布局、融合投影、固定集合消融与分项观测入口见 [阶段 2](phases/PHASE_2.md)。各阶段完成后整理的实现与检查证据见 [阶段记录](phases/README.md)。

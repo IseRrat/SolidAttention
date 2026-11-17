@@ -48,6 +48,11 @@ int main() {
         reject(prefix + ",\"replay_token_ids\":[0]}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"context_budget_tokens\":4,\"init_tokens\":4,\"local_tokens\":1}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"unexpected\":1}}");
+        write(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"interleaved\",\"fuse_kv_projection\":true,\"profile\":true}}");
+        const auto interleaved = solid::RunConfig::load(config).attention;
+        if (!interleaved.interleaved || !interleaved.fuse_kv_projection || !interleaved.profile) throw std::runtime_error("layout configuration parsing");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"unknown\"}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"fuse_kv_projection\":1}}");
         auto change = [&](const std::string & from, const std::string & to) {
             auto content = prefix + "}";
             content.replace(content.find(from), from.size(), to);

@@ -8,6 +8,7 @@ import os
 from pathlib import Path
 import platform
 import re
+import shutil
 import subprocess
 import sys
 import time
@@ -129,6 +130,11 @@ def main():
         config[key] = str((config_path.parent / config[key]).resolve())
     if "session_file" in config.get("attention", {}):
         config["attention"]["session_file"] = str((config_path.parent / config["attention"]["session_file"]).resolve())
+    replay_path = config.get("attention", {}).get("selection_replay")
+    replay_hash = None
+    if replay_path:
+        replay_path = (config_path.parent / replay_path).resolve(strict=True)
+        replay_hash = digest(replay_path)
     model, prompt, output = (Path(config[key]) for key in ("model", "prompt", "output"))
     model_files = validate_model_files(config, config_path.parent)
     for part in config.get("additional_model_files", []):
@@ -145,6 +151,12 @@ def main():
     prompt_copy = run_dir / "prompt.txt"
     prompt_copy.write_bytes(prompt.read_bytes())
     config["prompt"] = str(prompt_copy)
+    if replay_path:
+        replay_copy = run_dir / "selection.replay.jsonl"
+        shutil.copyfile(replay_path, replay_copy)
+        if digest(replay_copy) != replay_hash:
+            raise ValueError("selection replay changed while preparing the run")
+        config["attention"]["selection_replay"] = str(replay_copy)
     effective_config = run_dir / "config.json"
     atomic_json(effective_config, config)
     manifest = {
@@ -159,6 +171,7 @@ def main():
         "prompt_sha256": digest(prompt_copy),
         "source_config_sha256": digest(config_path),
         "effective_config_sha256": digest(effective_config),
+        "selection_replay_sha256": replay_hash,
         "command": [str(runner), "--config", str(effective_config)],
         "system": {"uname": list(platform.uname()), "python": sys.version,
                    "os_release": Path("/etc/os-release").read_text()},
@@ -204,6 +217,8 @@ def main():
         manifest["elapsed_seconds"] = time.monotonic() - start
         manifest["sampled_peak_rss_bytes"] = peak_rss
         manifest["status"] = "complete" if process.returncode == 0 and output.is_file() else "failed"
+        if manifest["status"] == "complete":
+            manifest["result_sha256"] = digest(output)
         atomic_json(run_dir / "manifest.json", manifest)
     print(run_dir)
     return 0 if manifest["status"] == "complete" else 1

@@ -1,6 +1,7 @@
 #include "solid/config.hpp"
 #include "solid/filehash.hpp"
 #include "solid/llama_adapter.hpp"
+#include "solid/profile.hpp"
 #include "solid_build_info.hpp"
 #include "llama.h"
 #include "ggml-backend.h"
@@ -121,6 +122,7 @@ int main(int argc, char ** argv) {
         }
         const auto request_start = Clock::now();
         BackendLifetime backend;
+        solid::ExecutionProfile profile(config.attention.profile);
         if (config.gpu_layers > 0 && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
             throw std::runtime_error("GPU layers requested but no GPU backend is available");
         }
@@ -159,12 +161,18 @@ int main(int argc, char ** argv) {
         cp.flash_attn_type = config.flash_attention ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cp.offload_kqv = config.kv_on_gpu;
         cp.no_perf = false;
+        if (config.attention.profile) {
+            cp.cb_eval = solid::ExecutionProfile::evaluate;
+            cp.cb_eval_user_data = &profile;
+        }
         std::unique_ptr<solid::AttentionAdapter> adapter;
+        const auto adapter_start = Clock::now();
         if (config.attention.enabled) {
             std::filesystem::create_directories(config.output.parent_path());
             adapter = std::make_unique<solid::AttentionAdapter>(model.get(), config.attention, config.context_tokens,
                        tokens.size(), config.output.parent_path() / "selection.jsonl");
         }
+        const double adapter_ms = milliseconds(adapter_start);
         const auto context_start = Clock::now();
         std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), cp), llama_free);
         if (!ctx) throw std::runtime_error("context initialization failed");
@@ -175,10 +183,12 @@ int main(int argc, char ** argv) {
         for (std::size_t first = 0; first < tokens.size();) {
             const auto count = std::min<std::size_t>(config.batch_tokens, tokens.size() - first);
             submit(ctx.get(), batch.get(), tokens.data() + first, count, static_cast<llama_pos>(first), first + count == tokens.size(), adapter.get());
+            profile.check();
             first += count;
         }
         if (adapter) adapter->flush();
         const double prefill_ms = milliseconds(prefill_start);
+        profile.set_decode();
         std::ofstream logits_file;
         const auto logits_path = config.output.parent_path() / "logits.f32";
         if (config.dump_logits) {
@@ -202,6 +212,7 @@ int main(int argc, char ** argv) {
                 decode_inputs.push_back(input);
                 submit(ctx.get(), batch.get(), &input, 1,
                        static_cast<llama_pos>(tokens.size() + i - 1), true, adapter.get());
+                profile.check();
                 process_ms = milliseconds(processing);
             }
             const auto sample_start = Clock::now();
@@ -225,7 +236,7 @@ int main(int argc, char ** argv) {
         if (config.replay) stop = "replay_length";
         if (config.dump_logits) { logits_file.close(); if (!logits_file) throw std::runtime_error("logits close failed"); }
         const auto final_flush_start = Clock::now();
-        if (adapter) adapter->flush();
+        if (adapter) adapter->finish();
         const double final_flush_ms = milliseconds(final_flush_start);
         const auto perf = llama_perf_context(ctx.get());
         Json result = {
@@ -239,6 +250,7 @@ int main(int argc, char ** argv) {
                              {"kv_heads", llama_model_n_head_kv(model.get())}, {"embedding", llama_model_n_embd(model.get())}}},
             {"effective_context_tokens", llama_n_ctx(ctx.get())},
             {"timing", {{"model_load_ms", load_ms}, {"context_init_ms", context_ms}, {"prefill_ms", prefill_ms},
+                        {"adapter_init_ms", adapter_ms},
                         {"decode_loop_ms", decode_ms}, {"decode_steps", generated.size() - 1},
                         {"final_flush_ms", final_flush_ms},
                         {"first_token_ms", prefill_ms + trace.front().at("total_ms").get<double>()},
@@ -257,6 +269,12 @@ int main(int argc, char ** argv) {
             const auto budget = adapter->budget();
             result["attention"] = {
                 {"storage", config.attention.in_memory ? "memory" : "ssd"}, {"sparse", config.attention.sparse},
+                {"layout", config.attention.interleaved ? "interleaved" : "separate"},
+                {"fuse_kv_projection", config.attention.fuse_kv_projection},
+                {"projection_extra_weight_bytes", adapter->projection_buffer_bytes()},
+                {"projection_initialization_ms", adapter->projection_initialization_ns() / 1e6},
+                {"projection_weight_types", adapter->projection_weight_types()},
+                {"selection_source", config.attention.selection_replay.empty() ? "dynamic" : "replay"},
                 {"block_tokens", config.attention.block_tokens}, {"context_budget_tokens", budget.total},
                 {"init_tokens", budget.initial}, {"local_tokens", budget.local}, {"representative_count", budget.representatives},
                 {"head_aggregation", "mean"}, {"position_policy", "absolute_native_rope"},
@@ -266,8 +284,23 @@ int main(int argc, char ** argv) {
                 {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"kv_buffer_bytes", stats.kv_resident_bytes},
                 {"representative_buffer_bytes", stats.representative_bytes},
                 {"read_requests", stats.io.read_requests}, {"read_bytes", stats.io.read_bytes},
-                {"write_requests", stats.io.write_requests}, {"write_bytes", stats.io.write_bytes}
+                {"write_requests", stats.io.write_requests}, {"write_bytes", stats.io.write_bytes},
+                {"io_read_ms", stats.io.read_ns / 1e6}, {"io_write_ms", stats.io.write_ns / 1e6},
+                {"append_ms", stats.append_ns / 1e6}, {"selection_ms", stats.selection_ns / 1e6},
+                {"gather_inclusive_ms", stats.gather_ns / 1e6}, {"gather_copy_bytes", stats.gather_copy_bytes},
+                {"streaming_attention_inclusive_ms", stats.streaming_attention_ns / 1e6}
             };
+            result["selection_trace_sha256"] = solid::sha256_file(config.output.parent_path() / "selection.jsonl");
+            if (!config.attention.selection_replay.empty()) result["selection_replay_sha256"] = solid::sha256_file(config.attention.selection_replay);
+        }
+        if (config.attention.profile) {
+            const auto serialize = [](const std::map<std::string, solid::ProfileTotal> & totals) {
+                Json entries = Json::object();
+                for (const auto & pair : totals) entries[pair.first] = {{"calls", pair.second.calls}, {"bytes", pair.second.bytes}, {"ms", pair.second.ns / 1e6}};
+                return entries;
+            };
+            result["profile"] = {{"mode", "serialized_nodes_and_transfers"}, {"nodes", serialize(profile.nodes())},
+                                 {"transfers", serialize(profile.transfers())}};
         }
         std::filesystem::create_directories(config.output.parent_path());
         const auto temporary = config.output.string() + ".tmp";

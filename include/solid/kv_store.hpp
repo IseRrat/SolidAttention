@@ -34,8 +34,14 @@ struct KvBlock {
     std::uint64_t first_position = 0;
     std::uint32_t valid_tokens = 0;
     std::uint64_t version = 0;
-    std::vector<Half> keys;
-    std::vector<Half> values;
+    KvLayout layout = KvLayout::separate;
+    std::uint32_t dimension = 0;
+    std::uint32_t capacity = 0;
+    std::vector<Half> data;
+    Half * key(std::size_t row);
+    Half * value(std::size_t row);
+    const Half * key(std::size_t row) const;
+    const Half * value(std::size_t row) const;
 };
 
 struct IoStats {
@@ -43,6 +49,8 @@ struct IoStats {
     std::uint64_t write_requests = 0;
     std::uint64_t read_bytes = 0;
     std::uint64_t write_bytes = 0;
+    std::uint64_t read_ns = 0;
+    std::uint64_t write_ns = 0;
 };
 
 class RandomAccessFile {
@@ -61,7 +69,9 @@ public:
     virtual ~KvStore() = default;
     const KvGeometry & geometry() const { return geometry_; }
     virtual void append(std::uint32_t layer, std::uint64_t position,
-                        const std::vector<Half> & keys, const std::vector<Half> & values) = 0;
+                        const std::vector<Half> & keys, const std::vector<Half> & values);
+    virtual void append_interleaved(std::uint32_t layer, std::uint64_t position,
+                                    const std::vector<Half> & kv) = 0;
     virtual void read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & destination) = 0;
     virtual void flush() = 0;
     virtual std::uint64_t length(std::uint32_t layer) const = 0;
@@ -70,7 +80,7 @@ public:
 protected:
     KvGeometry geometry_;
     void validate_append(std::uint32_t layer, std::uint64_t position, std::uint64_t length,
-                         const std::vector<Half> & keys, const std::vector<Half> & values) const;
+                         const std::vector<Half> & kv) const;
     void prepare_block(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
                        std::uint64_t length, KvBlock & destination) const;
 };
@@ -78,8 +88,7 @@ protected:
 class MemoryKvStore final : public KvStore {
 public:
     explicit MemoryKvStore(KvGeometry geometry);
-    void append(std::uint32_t layer, std::uint64_t position,
-                const std::vector<Half> & keys, const std::vector<Half> & values) override;
+    void append_interleaved(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv) override;
     void read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & destination) override;
     void flush() override {}
     std::uint64_t length(std::uint32_t layer) const override;
@@ -93,8 +102,7 @@ class FileKvStore final : public KvStore {
 public:
     FileKvStore(KvGeometry geometry, std::unique_ptr<RandomAccessFile> file,
                 std::size_t write_buffer_bytes_per_layer = 32768);
-    void append(std::uint32_t layer, std::uint64_t position,
-                const std::vector<Half> & keys, const std::vector<Half> & values) override;
+    void append_interleaved(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv) override;
     void read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & destination) override;
     void flush() override;
     std::uint64_t length(std::uint32_t layer) const override;

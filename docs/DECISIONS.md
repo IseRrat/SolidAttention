@@ -16,6 +16,9 @@
 | D10 | 上游适配生成到构建目录，主仓库保存生成器和接入代码 | cmake/Adapter.cmake，UPSTREAM_MAP |
 | D11 | 阶段 1 使用流式 prefill 与 FP16 收集后的 GGML Flash Attention decode | SSD_PATH，strided-attention-graph、gathered-flash-attention |
 | D12 | 默认 1 个代表，GQA 组内平均 Q，使用原生 RoPE；并列按逻辑位置排序 | SSD_PATH，kv-and-attention |
+| D13 | 文件块和 attention 工作集共用布局开关；交错读取保留 `[B,2,D]`，attention 使用 stride 视图 | 阶段 2，interleaved-layout、gathered-flash-attention |
+| D14 | 同类型融合权重保留完整量化行；混合类型逐行转为 FP32；额外 buffer 单独记录 | 阶段 2，fused-kv-projection |
+| D15 | 消融独立控制布局和投影，回放相同输入与选择集合；分项观测采用统一同步模式 | 阶段 2，layout_ablation.py、execution-profile |
 
 ## 参数锁定任务
 

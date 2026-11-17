@@ -69,7 +69,7 @@ void store_layout(solid::KvLayout layout) {
                 solid::KvBlock actual, expected;
                 disk.read(layer, head, block, actual);
                 memory.read(layer, head, block, expected);
-                require(actual.keys == expected.keys && actual.values == expected.values &&
+                require(actual.data == expected.data &&
                         actual.valid_tokens == expected.valid_tokens && actual.version == expected.version,
                         "dirty or committed block differs from memory oracle");
             }
@@ -79,7 +79,7 @@ void store_layout(solid::KvLayout layout) {
     disk.flush();
     solid::KvBlock tail;
     disk.read(1, 1, 3, tail);
-    require(tail.valid_tokens == 1 && tail.keys[3] == 0, "invalid tail padding");
+    require(tail.valid_tokens == 1 && tail.key(1)[0] == 0, "invalid tail padding");
     require(disk.io_stats().read_requests > 0 && disk.io_stats().write_requests > 0, "missing I/O counters");
     require(std::memcmp(inspect->bytes.data(), "SOLIDKV1", 8) == 0, "file format header");
     rejects([&] { disk.append(0, 13, std::vector<solid::Half>(6), std::vector<solid::Half>(6)); });
@@ -107,7 +107,7 @@ void native_file() {
         disk.flush();
         solid::KvBlock block;
         disk.read(0, 0, 0, block);
-        require(solid::from_half(block.values[1]) == 8, "native file round trip");
+        require(solid::from_half(block.value(1)[0]) == 8, "native file round trip");
         rejects([&] { (void) solid::create_session_file(path, true); });
         require(std::filesystem::exists(path), "existing session file was removed");
     }
@@ -173,6 +173,51 @@ void session_batching() {
     require(actual == expected, "microbatch partition changes attention or selection");
     require(split.stats().attention_queries == 8 && split.stats().io.write_bytes > 0, "session counters");
 }
+void selection_replay() {
+    const auto root = std::filesystem::temp_directory_path() / ("solid-replay-" +
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    std::filesystem::create_directory(root);
+    const auto trace = root / "selection.jsonl";
+    const auto output = root / "copy.jsonl";
+    solid::KvGeometry separate{1, 1, 2, 2, 16, 64}, interleaved = separate;
+    interleaved.layout = solid::KvLayout::interleaved;
+    solid::SparseBudget budget{4, 1, 1, 1};
+    std::vector<float> q, k, v, kv;
+    for (int p = 0; p < 8; ++p) {
+        q.insert(q.end(), {1, 0.5f, -0.5f, 1});
+        k.insert(k.end(), {p * 0.25f, 1});
+        v.insert(v.end(), {static_cast<float>(p), -static_cast<float>(p)});
+        kv.insert(kv.end(), {p * 0.25f, 1, static_cast<float>(p), -static_cast<float>(p)});
+    }
+    {
+        solid::AttentionSession source(std::make_unique<solid::MemoryKvStore>(separate), 2, budget, true, 3, trace);
+        const auto expected = source.process(0, 0, 8, q, k, v, 0.5f);
+        source.finish();
+        solid::AttentionSession replay(std::make_unique<solid::FileKvStore>(interleaved, std::make_unique<TestFile>(), 16), 2, budget, true, 3, output, trace);
+        const auto actual = replay.process(0, 0, 8, q, kv, {}, 0.5f, true);
+        replay.finish();
+        require(expected == actual, "fixed-selection interleaved replay changed attention");
+        std::ifstream a(trace), b(output);
+        require(std::string(std::istreambuf_iterator<char>(a), {}) == std::string(std::istreambuf_iterator<char>(b), {}), "selection replay changed trace");
+    }
+    const auto invalid = root / "invalid.jsonl";
+    for (const std::string line : {
+            "{\"layer\":0,\"position\":3,\"kv_head\":1,\"ranges\":[[0,4]]}",
+            "{\"layer\":0,\"position\":3,\"kv_head\":0,\"ranges\":[[0,1],[4,1]]}",
+            "{\"layer\":0,\"position\":3,\"kv_head\":0,\"ranges\":[[0,3],[2,2]]}",
+            "{\"layer\":0,\"position\":3,\"kv_head\":0,\"ranges\":[[0,2]]}",
+            ""}) {
+        std::ofstream(invalid) << line << '\n';
+        solid::AttentionSession replay(std::make_unique<solid::MemoryKvStore>(interleaved), 2, budget, true, 3, {}, invalid);
+        rejects([&] { (void) replay.process(0, 0, 8, q, k, v, 0.5f); });
+    }
+    {
+        solid::AttentionSession replay(std::make_unique<solid::MemoryKvStore>(interleaved), 2, budget, true, 3, {}, trace);
+        (void) replay.process(0, 0, 3, {q.begin(), q.begin() + 12}, {k.begin(), k.begin() + 6}, {v.begin(), v.begin() + 6}, 0.5f);
+        rejects([&] { replay.finish(); });
+    }
+    std::filesystem::remove_all(root);
+}
 }
 int main() {
     try {
@@ -183,6 +228,7 @@ int main() {
         native_file();
         attention_and_selection();
         session_batching();
+        selection_replay();
         auto overflow = solid::KvGeometry{0xffffffff, 0xffffffff, 0xffffffff, 32, 0xffffffff, 4096};
         rejects([&] { overflow.validate(); });
         std::cout << "KV, I/O, representative and attention checks passed\n";

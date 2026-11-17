@@ -39,3 +39,19 @@ bash scripts/check.sh --cuda
 | 上游适配 | 构建目录生成文件，原始源文件字节保持一致，固定提交检查通过 |
 
 完整检查入口为 `bash scripts/check.sh --cuda`，包含 CUDA 编译、11 项 CTest、10 项 Python 单元检查和源码指纹核对。计算使用合成张量与临时文件。实验环境的原版/内存/SSD 数值对照命令见 [SSD_PATH](SSD_PATH.md)。
+
+## 2026-11-17：交错布局与融合投影
+
+| 检查范围 | 证据 |
+| --- | --- |
+| 交错文件 | 两层两头、对齐、尾块与原排列；完整块读取请求 32 对 16，字节数相同 |
+| 连续 KV 输入 | 内存与 SSD 接受 `[Hkv,2,D]`；固定选择回放的输出与原路径一致 |
+| 融合投影 | F32/F16/Q4_K、混合 Q4_K/Q6_K、bias、量化行逐字节保留、多头多 token |
+| 位置与 attention | Normal/NeoX RoPE、K 回写和 V 保留；两种布局的 CPU Flash Attention、GQA mask 与 padding |
+| 观测 | CPU 计算图输出与分阶段统计、次数、输出字节；CUDA 接入编译与链接 |
+| 固定集合消融 | 四组配置、实际输入 token、预算、选择轨迹、logits 与来源检查；缺失组与文件变更拒绝 |
+| 回归与来源 | 原有配置、哈希、I/O 失败和数值检查通过；三份生成文件保持上游源码一致 |
+
+最终入口 `bash scripts/check.sh --cuda` 通过 CUDA 编译、17 项 CTest、14 项 Python 检查及源码指纹核对。数学检查使用 CPU 后端与合成张量，文件检查使用临时文件。模型数值、CUDA 运行与设备性能的实验环境入口见 [阶段 2 完成记录](phases/PHASE_2.md)。
+
+`bash scripts/check.sh --unit-only` 的 Debug 核心构建、3 项 CTest 和 14 项 Python 检查通过。15 篇 Markdown 的本地链接、标题锚点、代码块与文风检查通过，配置 JSON 解析通过。

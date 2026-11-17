@@ -192,7 +192,7 @@ std::vector<float> streamed_attention(KvStore & store, std::uint32_t layer, std:
                 double score = 0;
                 for (std::uint32_t d = 0; d < geometry.dimension; ++d) {
                     score += static_cast<double>(query[(head * group + q) * geometry.dimension + d]) *
-                             from_half(block.keys[in_block * geometry.dimension + d]);
+                             from_half(block.key(in_block)[d]);
                 }
                 score *= scale;
                 if (!std::isfinite(score)) throw std::runtime_error("non-finite attention score");
@@ -200,7 +200,7 @@ std::vector<float> streamed_attention(KvStore & store, std::uint32_t layer, std:
                 const double old_scale = std::exp(maxima[q] - maximum);
                 const double weight = std::exp(score - maximum);
                 for (std::uint32_t d = 0; d < geometry.dimension; ++d) {
-                    const auto value = from_half(block.values[in_block * geometry.dimension + d]);
+                    const auto value = from_half(block.value(in_block)[d]);
                     if (!std::isfinite(value)) throw std::runtime_error("non-finite attention value");
                     weighted[q * geometry.dimension + d] = weighted[q * geometry.dimension + d] * old_scale + weight * value;
                 }

@@ -131,8 +131,8 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     }
     if (j.contains("attention")) {
         const auto & a = j.at("attention");
-        const std::set<std::string> allowed = {"storage", "sparse", "gpu_decode", "block_tokens", "context_budget_tokens",
-            "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file"};
+        const std::set<std::string> allowed = {"storage", "sparse", "gpu_decode", "layout", "fuse_kv_projection", "profile", "block_tokens", "context_budget_tokens",
+            "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "selection_replay"};
         if (!a.is_object()) throw std::invalid_argument("attention must be an object");
         for (const auto & item : a.items()) if (allowed.count(item.key()) == 0) throw std::invalid_argument("unknown attention key: " + item.key());
         auto & target = result.attention;
@@ -141,6 +141,17 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         if (storage != "memory" && storage != "ssd") throw std::invalid_argument("attention storage must be memory or ssd");
         target.in_memory = storage == "memory";
         target.sparse = a.at("sparse").get<bool>();
+        if (a.contains("layout")) {
+            const auto layout = a.at("layout").get<std::string>();
+            if (layout != "separate" && layout != "interleaved") throw std::invalid_argument("layout must be separate or interleaved");
+            target.interleaved = layout == "interleaved";
+        }
+        if (a.contains("fuse_kv_projection")) target.fuse_kv_projection = a.at("fuse_kv_projection").get<bool>();
+        if (a.contains("profile")) target.profile = a.at("profile").get<bool>();
+        if (a.contains("selection_replay")) {
+            if (!target.sparse) throw std::invalid_argument("selection replay requires sparse attention");
+            target.selection_replay = resolve(base, a.at("selection_replay").get<std::string>());
+        }
         if (a.contains("gpu_decode")) target.gpu_decode = a.at("gpu_decode").get<bool>();
         if (a.contains("block_tokens")) target.block_tokens = positive(a, "block_tokens");
         if (a.contains("representative_count")) target.representative_count = positive(a, "representative_count");

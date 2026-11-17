@@ -23,6 +23,8 @@ def prepare(reference, template, output):
         config["attention"] = mode["attention"]
         if "session_file" in config["attention"]:
             config["attention"]["session_file"] = str((template_path.parent / config["attention"]["session_file"]).resolve())
+        if "selection_replay" in config["attention"]:
+            config["attention"]["selection_replay"] = str((template_path.parent / config["attention"]["selection_replay"]).resolve())
     config["output"] = str(Path(output).resolve())
     config["max_new_tokens"] = len(ids)
     config["replay_token_ids"] = inputs

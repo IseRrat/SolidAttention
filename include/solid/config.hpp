@@ -17,6 +17,9 @@ struct AttentionConfig {
     bool in_memory = false;
     bool sparse = false;
     bool gpu_decode = true;
+    bool interleaved = false;
+    bool fuse_kv_projection = false;
+    bool profile = false;
     std::uint32_t block_tokens = 32;
     std::uint32_t context_budget_tokens = 0;
     std::uint32_t init_tokens = 0;
@@ -24,6 +27,7 @@ struct AttentionConfig {
     std::uint32_t representative_count = 1;
     std::uint32_t write_buffer_bytes_per_layer = 32768;
     std::filesystem::path session_file;
+    std::filesystem::path selection_replay;
     bool keep_session_file = false;
 };
 

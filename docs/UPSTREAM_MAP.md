@@ -46,13 +46,14 @@ solid-baseline
 
 ## SSD 路径的改动范围
 
-接入由 `cmake/Adapter.cmake` 与 `scripts/generate_adapter.py` 生成两个构建目录编译单元，调用主仓库的 `src/llama_adapter.cpp`。具体数据流与模式见 [SSD_PATH](SSD_PATH.md)。
+接入由 `cmake/Adapter.cmake` 与 `scripts/generate_adapter.py` 生成三个构建目录编译单元：`llama-context.cpp`、`llama-graph.cpp`、`ggml-backend.cpp`。主仓库的 `src/llama_adapter.cpp` 和 `src/projection.cpp` 提供 attention 与融合投影，`src/profile.cpp` 记录可选观测。具体数据流与模式见 [SSD_PATH](SSD_PATH.md) 和 [阶段 2](phases/PHASE_2.md)。
 
 1. 由独立存储层管理完整历史 KV，向计算图提供预算内的每层工作集。
 2. 在 Q 就绪后评分，按 KV head 收集逻辑块，生成对应位置与 mask。
 3. 将 K/V 写入、SSD 读入、H2D、attention 和释放槽位表达为明确依赖。
 4. prefill 的 microbatch 继续复用原版投影；历史 attention 改为有界 KV tile 累加。
 5. 用全内存/同步 SSD 对照检查 logits、KV、位置及最终选择集合，再接预取和异步调度。
+6. `build_qkv` 在融合模式进入 `adapter_qkv`，K RoPE 结果写回融合张量；`ggml-backend.cpp` 的同步复制与预取复制位置提供观测钩子。
 
 ## 计时边界
 
