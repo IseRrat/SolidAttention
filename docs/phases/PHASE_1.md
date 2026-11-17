@@ -24,6 +24,8 @@ decode 先追加当前 KV，再按当前 Q 选块；从 SSD 已提交数据和�
 
 配置入口为 `indram-reference.json`、`offload.json`、`indram-sparse.json` 和 `offload-sparse.json`。稀疏配置默认块大小 32；预算和 GQA/位置规则记录在结果文件中。
 
+后续补齐的 CUDA 块评分、预算 top-k、代表增量上传和后端选择见 [GPU 选择完成记录](../implementation/GPU_SELECTION.md)。CPU 代表构造与参考选择保留，`selection_backend` 控制评分后端。
+
 ## 检查
 
 阶段完成时通过 CUDA 编译、11 项 CTest、10 项 Python 检查及源码指纹核对。证据覆盖 FP16 舍入、布局与尾块、写缓冲转发、I/O 错误、独立 softmax 公式、GQA、microbatch 一致性和 CPU Flash Attention。详细记录见 [CHECKS](../CHECKS.md)。

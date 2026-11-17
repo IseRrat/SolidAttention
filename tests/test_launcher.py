@@ -115,9 +115,28 @@ class LauncherTests(unittest.TestCase):
             info = {"upstream_commit": launcher.UPSTREAM, "source_files": {
                 "CMakeLists.txt": launcher.digest(source), "scripts/generate_adapter.py": launcher.digest(generator)}}
             launcher.verify_build_info(info, root)
+            (root / "src/cuda").mkdir(parents=True)
+            kernel = root / "src/cuda/block_ranker.cu"
+            kernel.write_text("kernel")
+            with self.assertRaisesRegex(ValueError, "build inputs differ"):
+                launcher.verify_build_info(info, root)
+            info["source_files"]["src/cuda/block_ranker.cu"] = launcher.digest(kernel)
+            launcher.verify_build_info(info, root)
+            kernel.write_text("changed kernel")
+            with self.assertRaisesRegex(ValueError, "different source"):
+                launcher.verify_build_info(info, root)
+            kernel.write_text("kernel")
             source.write_text("changed")
             with self.assertRaisesRegex(ValueError, "different source"):
                 launcher.verify_build_info(info, root)
+
+    def test_cuda_selection_requires_cuda_build(self):
+        config = {"attention": {"selection_backend": "cuda"}}
+        with self.assertRaisesRegex(ValueError, "SOLID_CUDA"):
+            launcher.verify_features(config, {"features": {"cuda": False}})
+        launcher.verify_features(config, {"features": {"cuda": True}})
+        launcher.verify_features({"attention": {"selection_backend": "cpu"}}, {"features": {}})
+        launcher.verify_features({"attention": {"selection_backend": "auto"}}, {"features": {}})
 
 
 if __name__ == "__main__":

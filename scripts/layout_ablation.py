@@ -40,6 +40,7 @@ def create(reference, destination, results, profile=False):
     base["prefetch"] = False
     base["keep_session_file"] = False
     base["selection_replay"] = str(selection)
+    base["selection_backend"] = "cpu"
     base["selection_trace"] = True
     base["profile"] = profile
     for key in ("block_tokens", "context_budget_tokens", "init_tokens", "local_tokens", "representative_count"):

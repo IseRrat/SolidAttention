@@ -2,7 +2,7 @@
 
 复现 FAST 2026 论文 **SolidAttention: Low-Latency SSD-based Serving on Memory-Constrained PCs**，在 llama.cpp 上实现 SSD KV cache、动态稀疏注意力、历史预取和计算/I/O 重叠。
 
-首条路线采用 Linux + CUDA，单请求 decode，INT4 模型权重和 FP16 KV cache。当前交付包括参考执行路径、交错布局、历史预取、固定图重叠和实验工具。后续核心代码按 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md) 补齐 GPU 执行、块级调度与线程分工，再开展模型与设备评测。
+首条路线采用 Linux + CUDA，单请求 decode，INT4 模型权重和 FP16 KV cache。当前交付包括参考执行路径、交错布局、CUDA 块评分与 top-k、历史预取、固定图重叠和实验工具。后续核心代码按 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md) 补齐 GPU 代表构造、分块 prefill、块级调度与线程分工，再开展模型与设备评测。
 
 ## 开发入口
 
@@ -20,6 +20,7 @@
 12. [论文实验代码](docs/phases/PHASE_5.md)：精确输入、实验矩阵、续跑与汇总、准确率接口、官方评分和可追溯绘图。
 13. [工程审查记录](docs/ENGINEERING_REVIEW.md)：异步错误清理、子进程管理、实验完成核查和 scorer 来源修复。
 14. [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md)：论文代码规模、当前执行路径、核心实现差距与补齐顺序。
+15. [CUDA 块评分与动态选块](docs/implementation/GPU_SELECTION.md)：新增 GPU 内核、代表发布、预算 top-k、实际后端与内存记录、检查证据。
 
 ## 系统机制
 

@@ -148,7 +148,7 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         const auto & a = j.at("attention");
         const std::set<std::string> allowed = {"storage", "sparse", "gpu_decode", "layout", "fuse_kv_projection", "profile", "block_tokens", "context_budget_tokens",
             "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "selection_replay",
-            "prefetch", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head", "schedule", "schedule_trace", "selection_trace"};
+            "prefetch", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head", "schedule", "schedule_trace", "selection_trace", "selection_backend"};
         if (!a.is_object()) throw std::invalid_argument("attention must be an object");
         for (const auto & item : a.items()) if (allowed.count(item.key()) == 0) throw std::invalid_argument("unknown attention key: " + item.key());
         auto & target = result.attention;
@@ -171,6 +171,13 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
             target.selection_replay = resolve(base, a.at("selection_replay").get<std::string>());
         }
         if (a.contains("gpu_decode")) target.gpu_decode = a.at("gpu_decode").get<bool>();
+        if (a.contains("selection_backend")) target.selection_backend = a.at("selection_backend").get<std::string>();
+        if (target.selection_backend != "auto" && target.selection_backend != "cpu" && target.selection_backend != "cuda") {
+            throw std::invalid_argument("selection_backend must be auto, cpu or cuda");
+        }
+        if (target.selection_backend == "cuda" && (!target.sparse || !target.gpu_decode || !target.selection_replay.empty())) {
+            throw std::invalid_argument("CUDA selection requires dynamic sparse GGML decode");
+        }
         if (a.contains("prefetch")) target.prefetch = a.at("prefetch").get<bool>();
         if (a.contains("prefetch_trace")) target.prefetch_trace = a.at("prefetch_trace").get<bool>();
         if (a.contains("schedule")) target.schedule = a.at("schedule").get<std::string>();

@@ -12,6 +12,8 @@ struct SessionStats {
     std::uint64_t workspace_peak_bytes = 0;
     std::uint64_t kv_resident_bytes = 0;
     std::uint64_t representative_bytes = 0;
+    RankerStats ranking;
+    std::string selection_backend = "cpu";
     IoStats io;
     std::uint64_t append_ns = 0;
     std::uint64_t selection_ns = 0;
@@ -40,6 +42,7 @@ public:
     const KvGeometry & geometry() const { return store_->geometry(); }
     std::uint32_t query_heads() const { return query_heads_; }
     SparseBudget budget() const { return budget_; }
+    void set_ranker(std::unique_ptr<BlockRanker> ranker);
     bool prefetch_enabled() const { return prefetch_ != nullptr; }
     Prefetcher & prefetcher();
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);

@@ -63,6 +63,14 @@ int main() {
         if (!interleaved.interleaved || !interleaved.fuse_kv_projection || !interleaved.profile) throw std::runtime_error("layout configuration parsing");
         write(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"selection_trace\":false}}");
         if (solid::RunConfig::load(config).attention.selection_trace) throw std::runtime_error("selection trace switch parsing");
+        for (const auto mode : {"cpu", "cuda", "auto"}) {
+            write(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"selection_backend\":\"" + mode + "\"}}");
+            if (solid::RunConfig::load(config).attention.selection_backend != mode) throw std::runtime_error("selection backend parsing");
+        }
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"selection_backend\":\"unknown\"}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":false,\"selection_backend\":\"cuda\"}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"gpu_decode\":false,\"selection_backend\":\"cuda\"}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"selection_replay\":\"r.jsonl\",\"selection_backend\":\"cuda\"}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"unknown\"}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"fuse_kv_projection\":1}}");
         const auto async_mode = ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"interleaved\",\"prefetch\":true";

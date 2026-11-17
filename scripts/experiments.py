@@ -43,6 +43,10 @@ def variant_config(template, variant, block, budget):
                  "layout": "interleaved" if interleaved else "separate", "fuse_kv_projection": interleaved,
                  "block_tokens": block, "representative_count": 1, "write_buffer_bytes_per_layer": 32768,
                  "selection_trace": False, "profile": False, "keep_session_file": False, "prefetch": prefetch}
+    if sparse:
+        selector = template.get("attention", {}).get("selection_backend", "auto")
+        if selector not in ("auto", "cpu", "cuda"): raise ValueError("unknown selection backend")
+        attention["selection_backend"] = selector
     if prefetch:
         attention.update(prefetch_trace=False, prefetch_queue_depth=64, schedule_trace=False,
                          schedule={"prefetch":"naive","overlap":"overlap","solid":"overlap+sync_reuse"}[variant])

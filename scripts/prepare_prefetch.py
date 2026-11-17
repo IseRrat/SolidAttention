@@ -33,7 +33,9 @@ def prepare_prefetch(reference, output, fixed_selection=False, queue_depth=64, s
     mode.update({"prefetch": True, "prefetch_trace": True, "selection_trace": True, "prefetch_queue_depth": queue_depth, "keep_session_file": False})
     for key in ("block_tokens", "context_budget_tokens", "init_tokens", "local_tokens", "representative_count"):
         mode[key] = attention[key]
-    if fixed_selection: mode["selection_replay"] = str(selection)
+    if fixed_selection:
+        mode["selection_replay"] = str(selection)
+        mode["selection_backend"] = "cpu"
     if slots_per_head is not None: mode["prefetch_slots_per_head"] = slots_per_head
     return config
 

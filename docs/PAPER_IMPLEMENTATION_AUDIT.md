@@ -6,9 +6,9 @@
 
 论文 §7 报告约 25k 行代码，其中 GPU kernels 约 12k、llama.cpp adapters 约 1k。§1 说明实现覆盖 CUDA 与 SYCL。论文按模块给出的规模可作为实现范围的核查线索。
 
-当前仓库统计使用已跟踪文件的物理行数，包含注释与空行，排除上游 submodule、生成文件和构建产物。
+基点 `afe4773` 的统计使用已跟踪文件的物理行数，包含注释与空行，排除上游 submodule、生成文件和构建产物。后续新增代码见各项补齐记录。
 
-| 当前代码类别 | 行数 |
+| 基点代码类别 | 行数 |
 | --- | ---: |
 | 运行时 C++ 源码与头文件 | 4,423 |
 | Python/shell 工具与评测入口 | 2,361 |
@@ -17,7 +17,7 @@
 | 合计 | 9,753 |
 | 新增 CUDA/SYCL GPU kernel 源码 | 0 |
 
-GPU 运算通过上游 GGML 投影、RoPE 和 Flash Attention 接口执行。§4 明确允许通过 stride 访问复用 attention kernel。论文给出 GPU kernel 总量，具体算子和双后端的代码分配需要逐项查证。后续逐算子登记复用、适配和新增代码，以执行路径和数据流作为交付依据。
+基点的 GPU 运算通过上游 GGML 投影、RoPE 和 Flash Attention 接口执行。§4 明确允许通过 stride 访问复用 attention kernel。论文给出 GPU kernel 总量，具体算子和双后端的代码分配需要逐项查证。后续逐算子登记复用、适配和新增代码，以执行路径和数据流作为交付依据。
 
 ## 2. 已接入的执行路径
 
@@ -26,12 +26,13 @@ GPU 运算通过上游 GGML 投影、RoPE 和 Flash Attention 接口执行。§4
 - liburing 异步读、历史预测与纠错、独立 DRAM/VRAM 租约和 generation 校验。
 - Q-only CPU 选择前沿、历史补读与 KV 投影重叠、独立 H2D 后端、跨层完成证明复用。
 - 实验矩阵、固定 token/选择回放、准确率接口、来源核查与绘图工具。
+- CUDA 块相关度评分与预算 top-k、定稿代表增量上传、后端身份与设备内存记录，完成记录见 [GPU 选择](implementation/GPU_SELECTION.md)。
 
 ## 3. 论文路径与后续核心代码
 
 | 核查项 | 当前执行路径 | 后续代码与核查要求 |
 | --- | --- | --- |
-| GPU 算子覆盖，§3.1、§4、§7 | [llama_adapter.cpp](../src/llama_adapter.cpp) 把 Q/KV 下载到 CPU；[attention.cpp](../src/attention.cpp) 在 CPU 上维护代表、评分和选块；decode attention 复用 GGML GPU 算子 | 逐算子列出论文依据、输入输出、dtype、stride、设备和依赖；为 GPU 主路径补齐必要算子及图接入，保留合成参考对照 |
+| GPU 算子覆盖，§3.1、§4、§7 | [llama_adapter.cpp](../src/llama_adapter.cpp) 把 Q/KV 下载到 CPU；CPU 维护代表和候选；[CUDA 评分/top-k](implementation/GPU_SELECTION.md) 接入动态选择；decode attention 复用 GGML GPU 算子 | 补齐 GPU 代表构造、直接消费设备 Q 与交错 KV 更新；逐算子记录输入输出、dtype、stride、设备和依赖 |
 | 长输入 prefill | [session.cpp](../src/session.cpp) 对每个 token 调用 CPU `streamed_attention`，逐块读取历史；图投影使用上游后端 | 建立有界 GPU 分块 prefill 与增量 KV/代表构造；检查 causal mask、RoPE、GQA、尾块与内存上限。CPU 路径继续承担数值参考 |
 | 算法 1 的调度范围，§6.1 | [scheduler.cpp](../src/scheduler.cpp) 提供关键路径/LST；[ggml_prefetch.cpp](../src/ggml_prefetch.cpp) 沿固定图与回调推进，每层聚合为 12 项任务；`ready()` 在回写/下一层预取之间选择 | 建立块级预测读、纠错读、H2D、D2H、回写的资源就绪队列，以真实完成事件解锁后继，按关键路径/LST 分派；合成执行轨迹证明优先级影响提交次序 |
 | selected 优先，§6.1 | [prefetch.cpp](../src/prefetch.cpp) 的 `begin()` 按 head 加入 init、local、历史 selected，再按插入次序启动读取 | 给块请求保留类别、依赖和估算成本，让关键纠错依赖的 selected 请求获得优先级；用受限队列检查实际发出顺序和饥饿边界 |
@@ -43,7 +44,7 @@ prefill 的 GPU 分块方案属于长上下文工程补齐；论文 §7 对实�
 
 ## 4. 后续开发顺序与交付
 
-1. 建立逐算子映射，落实 GPU prefill、代表构造、选择和交错 KV 更新的数据流与设备边界，补充对应代码。
+1. 在 CUDA 评分/top-k 基础上补齐 GPU 代表构造、直接消费设备 Q、分块 prefill 和交错 KV 更新的数据流。
 2. 把聚合任务扩展为块级事件任务，连接资源就绪队列与关键路径/LST 分派，落实 selected 优先。
 3. 拆分 I/O 与协调线程、配置 CPU 绑定，完善异步传输与设备完成观测。
 4. 复核 CUDA 全路径，补齐 SYCL 与统一内存接入。

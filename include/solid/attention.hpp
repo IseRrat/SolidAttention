@@ -1,6 +1,7 @@
 #pragma once
 
 #include "solid/kv_store.hpp"
+#include "solid/block_ranker.hpp"
 #include <deque>
 #include <vector>
 
@@ -26,6 +27,11 @@ public:
     std::vector<std::uint64_t> representative_positions(std::uint32_t layer, std::uint32_t head, std::uint64_t block) const;
     std::uint64_t resident_bytes() const;
     std::uint32_t query_heads() const { return query_heads_; }
+    void set_ranker(std::unique_ptr<BlockRanker> ranker);
+    RankerStats ranker_stats() const { return ranker_ ? ranker_->stats() : RankerStats{}; }
+    const char * ranker_name() const { return ranker_ ? ranker_->name() : "cpu"; }
+    std::vector<std::vector<std::uint64_t>> rank_blocks(std::uint32_t layer, const std::vector<float> & query,
+                                                       const BlockCandidates & candidates) const;
 private:
     struct Representative { std::uint64_t position; double score; std::vector<Half> key; };
     struct Block { std::uint32_t finalized = 0; std::vector<Representative> tokens; };
@@ -37,6 +43,8 @@ private:
     std::vector<std::vector<Block>> blocks_;
     std::vector<std::uint64_t> lengths_;
     std::vector<bool> query_pending_;
+    std::unique_ptr<BlockRanker> ranker_;
+    void publish(BlockRanker & ranker, std::uint32_t layer, std::uint64_t first, std::uint64_t count) const;
     std::size_t index(std::uint32_t layer, std::uint32_t head) const;
 };
 

@@ -6,6 +6,8 @@
 
 当前阶段记录描述首版代码及其检查结果。论文核心路径的后续开发见 [论文实现核查](PAPER_IMPLEMENTATION_AUDIT.md)：GPU 执行、块级事件调度、selected 优先及 I/O/协调线程分工。先完成这些代码，再推进正式评测与阶段 6。
 
+已完成的核心补齐：[CUDA 块评分与动态选块](implementation/GPU_SELECTION.md)。后续依次推进 GPU 代表构造与分块 prefill、块级调度及线程分工。
+
 ## 阶段 0：上游与原版基线
 
 获取 llama.cpp，固定提交和模型，完成 Linux/CUDA 构建与短输入推理。记录环境、GGUF 哈希、生成配置、耗时及内存。沿 KV 生成、位置处理、attention 和后端执行路径填写接口表，确定长输入 prefill 的分块接入点。

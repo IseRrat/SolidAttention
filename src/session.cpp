@@ -320,8 +320,17 @@ SessionStats AttentionSession::stats() const {
     auto result = stats_;
     result.kv_resident_bytes = store_->resident_bytes();
     result.representative_bytes = representatives_ ? representatives_->resident_bytes() : 0;
+    if (representatives_) {
+        result.ranking = representatives_->ranker_stats();
+        result.selection_backend = replay_.is_open() ? "replay" : representatives_->ranker_name();
+    }
     result.io = store_->io_stats();
     if (prefetch_) result.prefetch = prefetch_->stats();
     return result;
+}
+void AttentionSession::set_ranker(std::unique_ptr<BlockRanker> ranker) {
+    if (failed_ || !representatives_ || replay_.is_open() || early_) throw std::logic_error("ranker requires a dynamic sparse session at a query boundary");
+    try { representatives_->set_ranker(std::move(ranker)); }
+    catch (...) { failed_ = true; throw; }
 }
 } // namespace solid

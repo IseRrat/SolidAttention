@@ -118,3 +118,9 @@ bash scripts/check.sh --cuda
 | scorer 来源 | 绕过同名模块缓存、源字节哈希与评分后校验、导入状态恢复 |
 
 CUDA 编译与链接、30 项 CTest、Linux 54 项 Python 检查及源码指纹通过。核心库 6 项 CTest 的地址、泄漏和未定义行为检查通过。详细触发、修复与入口见 [工程审查记录](ENGINEERING_REVIEW.md)。输入为 CPU 合成张量、临时文件及合成子进程。
+
+## 2026-11-17：CUDA 块评分与动态选块
+
+新增相关度与预算 top-k 两个 CUDA 内核，接入动态稀疏选择、增量代表发布和运行器。CUDA 12.6、sm_89 编译与链接通过；最终 31 项 CTest、56 项 Linux Python 检查、`.cu` 文件在内的源码指纹通过。核心库 7 项 CTest 的地址、泄漏和未定义行为检查通过。
+
+合成检查覆盖多层/GQA、多代表、并列规则、增量与延迟发布、局部预算、尾块、后端错误结果和会话失败传播；共享归约规则用 CPU tournament 对照完整排序。CUDA 设备检查程序完成编译与链接，执行入口保留在实验环境。代码入口、数据流和检查范围见 [GPU 选择完成记录](implementation/GPU_SELECTION.md)。

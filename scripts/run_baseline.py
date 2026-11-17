@@ -63,7 +63,7 @@ def command_output(args, cwd=ROOT):
 
 def verify_build_info(info, root=ROOT):
     source_files = {"CMakeLists.txt", "scripts/generate_adapter.py"}
-    for folder, pattern in (("src", "*.cpp"), ("include", "*.hpp"), ("cmake", "*")):
+    for folder, pattern in (("src", "*.cpp"), ("src", "*.cu"), ("include", "*.hpp"), ("cmake", "*")):
         source_files.update(path.relative_to(root).as_posix() for path in (root / folder).rglob(pattern) if path.is_file())
     if info["upstream_commit"] != UPSTREAM or set(info["source_files"]) != source_files:
         raise ValueError("runner build inputs differ from the current project; rebuild it")
@@ -75,6 +75,8 @@ def verify_build_info(info, root=ROOT):
 def verify_features(config, info):
     if config.get("attention", {}).get("prefetch") and not info.get("features", {}).get("uring"):
         raise ValueError("prefetch requires a runner built with SOLID_URING=ON")
+    if config.get("attention", {}).get("selection_backend") == "cuda" and not info.get("features", {}).get("cuda"):
+        raise ValueError("CUDA selection requires a runner built with SOLID_CUDA=ON")
 
 
 def atomic_json(path, data):

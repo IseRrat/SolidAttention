@@ -57,6 +57,18 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_selection_backend_survives_sparse_variant_preparation(self):
+        for selector in ("auto", "cpu", "cuda"):
+            template = {"attention": {"selection_backend": selector}}
+            for variant in experiments.VARIANTS:
+                config = experiments.variant_config(template,variant,32,1024)
+                if config.get("attention",{}).get("sparse"):
+                    self.assertEqual(config["attention"]["selection_backend"],selector)
+                else:
+                    self.assertNotIn("selection_backend",config.get("attention",{}))
+        with self.assertRaisesRegex(ValueError,"selection backend"):
+            experiments.variant_config({"attention":{"selection_backend":"unknown"}},"solid",32,1024)
+
     def test_exact_prefix_matrix_repeats_and_disabled_traces(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary); spec,_=fixture(root)

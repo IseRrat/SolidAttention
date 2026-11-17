@@ -74,6 +74,8 @@ void RepresentativeIndex::observe_query(std::uint32_t layer, std::uint64_t posit
             if (block.tokens.size() > budget_.representatives) block.tokens.resize(budget_.representatives);
             ++block.finalized;
         }
+        const auto block = token.position / geometry_.block_tokens;
+        if (ranker_ && ready(layer, block)) publish(*ranker_, layer, block, 1);
         pending.pop_front();
     }
     query_pending_[layer] = true;
@@ -108,6 +110,81 @@ double RepresentativeIndex::score(std::uint32_t layer, std::uint32_t head, std::
     if (!std::isfinite(value)) throw std::runtime_error("non-finite block relevance");
     return value;
 }
+void RepresentativeIndex::publish(BlockRanker & ranker, std::uint32_t layer, std::uint64_t first, std::uint64_t count) const {
+    std::vector<Half> keys;
+    const auto stride = static_cast<std::uint64_t>(geometry_.heads) * budget_.representatives * geometry_.dimension;
+    if (count && stride > SIZE_MAX / count) throw std::overflow_error("representative publication size");
+    keys.reserve(static_cast<std::size_t>(count * stride));
+    for (auto block = first; block < first + count; ++block) {
+        if (!ready(layer, block)) throw std::logic_error("publishing an unfinished representative block");
+        for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
+            const auto & tokens = blocks_[index(layer, head)].at(block).tokens;
+            if (tokens.size() != budget_.representatives) throw std::logic_error("finalized representative count");
+            for (const auto & token : tokens) keys.insert(keys.end(), token.key.begin(), token.key.end());
+        }
+    }
+    if (count) ranker.publish(layer, first, count, keys);
+}
+void RepresentativeIndex::set_ranker(std::unique_ptr<BlockRanker> ranker) {
+    if (!ranker || ranker_) throw std::logic_error("representative ranker already configured or empty");
+    for (std::uint32_t layer = 0; layer < geometry_.layers; ++layer) {
+        std::uint64_t count = 0;
+        while (count < geometry_.blocks_per_head() && ready(layer, count)) ++count;
+        publish(*ranker, layer, 0, count);
+    }
+    ranker_ = std::move(ranker);
+}
+std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
+    std::uint32_t layer, const std::vector<float> & query, const BlockCandidates & candidates) const {
+    if (layer >= geometry_.layers || query.size() != static_cast<std::size_t>(query_heads_) * geometry_.dimension ||
+        candidates.blocks.size() != candidates.tokens.size() || candidates.remaining > budget_.total) {
+        throw std::invalid_argument("block ranking shape or budget");
+    }
+    finite_query(query);
+    std::uint64_t available = 0;
+    for (std::size_t i = 0; i < candidates.blocks.size(); ++i) {
+        if ((i && candidates.blocks[i] <= candidates.blocks[i-1]) || candidates.blocks[i] >= geometry_.blocks_per_head() ||
+            !ready(layer, candidates.blocks[i]) || candidates.tokens[i] == 0 || candidates.tokens[i] > geometry_.block_tokens) {
+            throw std::invalid_argument("invalid block candidate");
+        }
+        available += candidates.tokens[i];
+    }
+    const auto needed = std::min<std::uint64_t>(available, candidates.remaining);
+    std::vector<std::vector<std::uint64_t>> result(geometry_.heads);
+    if (!needed) return result;
+    if (ranker_) result = ranker_->rank(layer, query, candidates);
+    else for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
+        std::vector<std::pair<double, std::uint64_t>> best;
+        const auto better = [](const auto & a, const auto & b) { return a.first == b.first ? a.second < b.second : a.first > b.first; };
+        for (const auto block : candidates.blocks) {
+            best.emplace_back(score(layer, head, block, query), block);
+            std::push_heap(best.begin(), best.end(), better);
+            if (best.size() > candidates.remaining) { std::pop_heap(best.begin(), best.end(), better); best.pop_back(); }
+        }
+        std::sort(best.begin(), best.end(), better);
+        std::uint64_t covered = 0;
+        for (const auto & item : best) {
+            result[head].push_back(item.second);
+            const auto offset = std::lower_bound(candidates.blocks.begin(), candidates.blocks.end(), item.second) - candidates.blocks.begin();
+            covered += candidates.tokens[offset];
+            if (covered >= needed) break;
+        }
+    }
+    if (result.size() != geometry_.heads) throw std::runtime_error("ranker returned wrong head count");
+    for (const auto & head : result) {
+        std::set<std::uint64_t> unique;
+        std::uint64_t covered = 0;
+        for (const auto block : head) {
+            const auto found = std::lower_bound(candidates.blocks.begin(), candidates.blocks.end(), block);
+            if (found == candidates.blocks.end() || *found != block || !unique.insert(block).second || covered >= needed) {
+                throw std::runtime_error("ranker returned invalid, duplicate or excess block");
+            }
+            covered += candidates.tokens[found - candidates.blocks.begin()];
+        }
+        if (covered < needed) throw std::runtime_error("ranker returned insufficient token coverage");
+    }
+    return result;
+}
 std::vector<std::uint64_t> RepresentativeIndex::representative_positions(std::uint32_t layer, std::uint32_t head, std::uint64_t block) const {
     std::vector<std::uint64_t> result;
     for (const auto & token : blocks_.at(index(layer, head)).at(block).tokens) result.push_back(token.position);
@@ -138,42 +215,34 @@ std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const Spar
     finite_query(query);
     const auto count = position + 1;
     std::vector<HeadSelection> result(geometry.heads);
+    std::set<std::uint64_t> deterministic;
+    if (count <= budget.total) {
+        for (std::uint64_t i = 0; i < count; ++i) deterministic.insert(i);
+    } else {
+        for (std::uint64_t i = 0; i < std::min<std::uint64_t>(budget.initial, count); ++i) deterministic.insert(i);
+        for (auto i = count - std::min<std::uint64_t>(budget.local, count); i < count; ++i) deterministic.insert(i);
+    }
+    BlockCandidates candidates;
+    candidates.remaining = budget.total - static_cast<std::uint32_t>(deterministic.size());
+    if (count > budget.total && candidates.remaining) {
+        for (std::uint64_t block = 0; block <= position / geometry.block_tokens; ++block) {
+            if (!representatives.ready(layer, block)) continue;
+            const auto first = block * geometry.block_tokens;
+            const auto last = std::min<std::uint64_t>(count, first + geometry.block_tokens);
+            std::uint32_t cost = 0;
+            for (auto p = first; p < last; ++p) if (deterministic.count(p) == 0) ++cost;
+            if (cost) { candidates.blocks.push_back(block); candidates.tokens.push_back(cost); }
+        }
+    }
+    const auto ranked = representatives.rank_blocks(layer, query, candidates);
     for (std::uint32_t head = 0; head < geometry.heads; ++head) {
-        std::set<std::uint64_t> chosen;
-        if (count <= budget.total) {
-            for (std::uint64_t i = 0; i < count; ++i) chosen.insert(i);
-        } else {
-            for (std::uint64_t i = 0; i < std::min<std::uint64_t>(budget.initial, count); ++i) chosen.insert(i);
-            for (auto i = count - std::min<std::uint64_t>(budget.local, count); i < count; ++i) chosen.insert(i);
-            std::vector<std::pair<double, std::uint64_t>> candidates;
-            const auto limit = budget.total - chosen.size();
-            const auto better = [](const auto & a, const auto & b) {
-                return a.first == b.first ? a.second < b.second : a.first > b.first;
-            };
-            candidates.reserve(limit + 1);
-            for (std::uint64_t block = 0; block <= position / geometry.block_tokens; ++block) {
-                if (!representatives.ready(layer, block)) continue;
-                const auto first = block * geometry.block_tokens;
-                const auto last = std::min<std::uint64_t>(count, first + geometry.block_tokens);
-                bool needed = false;
-                for (auto p = first; p < last; ++p) if (chosen.count(p) == 0) { needed = true; break; }
-                if (needed && limit > 0) {
-                    candidates.emplace_back(representatives.score(layer, head, block, query), block);
-                    std::push_heap(candidates.begin(), candidates.end(), better);
-                    if (candidates.size() > limit) {
-                        std::pop_heap(candidates.begin(), candidates.end(), better);
-                        candidates.pop_back();
-                    }
-                }
+        auto chosen = deterministic;
+        for (const auto block : ranked[head]) {
+            const auto first = block * geometry.block_tokens;
+            for (auto p = first; p < std::min<std::uint64_t>(count, first + geometry.block_tokens) && chosen.size() < budget.total; ++p) {
+                chosen.insert(p);
             }
-            std::sort(candidates.begin(), candidates.end(), better);
-            for (const auto & candidate : candidates) {
-                const auto first = candidate.second * geometry.block_tokens;
-                for (auto p = first; p < std::min<std::uint64_t>(count, first + geometry.block_tokens) && chosen.size() < budget.total; ++p) {
-                    chosen.insert(p);
-                }
-                if (chosen.size() >= budget.total) break;
-            }
+            if (chosen.size() >= budget.total) break;
         }
         result[head].positions.assign(chosen.begin(), chosen.end());
         for (const auto p : chosen) {

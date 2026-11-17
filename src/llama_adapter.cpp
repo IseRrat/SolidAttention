@@ -5,6 +5,9 @@
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "ggml-backend.h"
+#ifdef SOLID_HAVE_CUDA_SELECTION
+#include "ggml-cuda.h"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -229,6 +232,8 @@ struct AttentionAdapter::Impl {
     ScheduleMode schedule = ScheduleMode::naive;
     ggml_backend_t prefetch_backend = nullptr;
     std::unique_ptr<GgmlPrefetch> device;
+    std::string selection_backend;
+    bool configure_ranker = false;
 };
 AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionConfig & options,
                                   std::uint32_t capacity, std::uint64_t prefill_tokens, const std::filesystem::path & trace) :
@@ -282,6 +287,8 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     impl_->model = model;
     impl_->gpu_decode = options.gpu_decode;
     impl_->prefill_tokens = prefill_tokens;
+    impl_->selection_backend = options.selection_backend;
+    impl_->configure_ranker = options.sparse && options.gpu_decode && options.selection_replay.empty() && options.selection_backend != "cpu";
     impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens,
         options.selection_trace ? trace : std::filesystem::path{},
         options.selection_replay, options.prefetch ? make_uring_reader(options.prefetch_queue_depth) : nullptr,
@@ -307,6 +314,23 @@ SessionStats AttentionAdapter::stats() const { check(); return impl_->session->s
 SparseBudget AttentionAdapter::budget() const { return impl_->session->budget(); }
 std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionFrame> frame, std::uint32_t layer, float scale,
                                                     bool gathered, ggml_backend_t backend) {
+    if (gathered && impl_->configure_ranker) {
+        bool configured = false;
+#ifdef SOLID_HAVE_CUDA_SELECTION
+        if (backend && ggml_backend_is_cuda(backend)) {
+            auto * registry = ggml_backend_cuda_reg();
+            for (std::size_t ordinal = 0; ordinal < ggml_backend_reg_dev_count(registry); ++ordinal) {
+                if (ggml_backend_reg_dev_get(registry, ordinal) != ggml_backend_get_device(backend)) continue;
+                impl_->session->set_ranker(make_cuda_block_ranker(impl_->session->geometry(), impl_->session->query_heads(),
+                    impl_->session->budget().representatives, impl_->session->budget().total, static_cast<int>(ordinal)));
+                configured = true;
+                break;
+            }
+        }
+#endif
+        if (!configured && impl_->selection_backend == "cuda") throw std::runtime_error("CUDA selection requires a CUDA build and CUDA attention backend");
+        impl_->configure_ranker = false;
+    }
     if (gathered && prefetch_enabled()) {
         if (!backend) throw std::logic_error("prefetch decode backend is required");
         if (!impl_->device) {

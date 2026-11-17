@@ -1,5 +1,5 @@
 file(GLOB_RECURSE SOLID_BUILD_INPUTS CONFIGURE_DEPENDS RELATIVE "${PROJECT_SOURCE_DIR}"
-    "${PROJECT_SOURCE_DIR}/src/*.cpp" "${PROJECT_SOURCE_DIR}/include/*.hpp" "${PROJECT_SOURCE_DIR}/cmake/*")
+    "${PROJECT_SOURCE_DIR}/src/*.cpp" "${PROJECT_SOURCE_DIR}/src/*.cu" "${PROJECT_SOURCE_DIR}/include/*.hpp" "${PROJECT_SOURCE_DIR}/cmake/*")
 list(APPEND SOLID_BUILD_INPUTS "CMakeLists.txt")
 list(APPEND SOLID_BUILD_INPUTS "scripts/generate_adapter.py")
 list(SORT SOLID_BUILD_INPUTS)

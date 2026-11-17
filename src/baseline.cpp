@@ -96,6 +96,8 @@ Json counters(const solid::SessionStats & s, const solid::DeviceCacheStats & d) 
         {"write_bytes", s.io.write_bytes}, {"io_read_ms", s.io.read_ns / 1e6}, {"io_write_ms", s.io.write_ns / 1e6},
         {"attention_queries", s.attention_queries}, {"selected_tokens", s.selected_tokens},
         {"append_ms", s.append_ns / 1e6}, {"selection_ms", s.selection_ns / 1e6},
+        {"selection_rank_calls", s.ranking.calls}, {"selection_scored_blocks", s.ranking.scored_blocks},
+        {"selection_published_blocks", s.ranking.published_blocks},
         {"gather_inclusive_ms", s.gather_ns / 1e6}, {"gather_copy_bytes", s.gather_copy_bytes},
         {"streaming_attention_inclusive_ms", s.streaming_attention_ns / 1e6},
         {"prefetch_wait_ms", s.prefetch.wait_ns / 1e6}, {"prefetch_resolve_ms", s.prefetch.resolve_ns / 1e6},
@@ -342,9 +344,10 @@ int main(int argc, char ** argv) {
             const auto device = adapter->device_stats();
             const auto staging = adapter->schedule_stats().staging_bytes;
             result["memory"]["kv_system_tracked_bytes"] = stats.kv_resident_bytes + stats.representative_bytes +
-                stats.prefetch.host_bytes + device.resident_bytes + staging;
+                stats.prefetch.host_bytes + device.resident_bytes + staging + stats.ranking.device_bytes + stats.ranking.host_bytes;
             result["memory"]["custom_buffers"] = {{"store_bytes", stats.kv_resident_bytes}, {"representatives_bytes", stats.representative_bytes},
                 {"prefetch_host_bytes", stats.prefetch.host_bytes}, {"device_kv_bytes", device.resident_bytes}, {"copy_staging_bytes", staging},
+                {"selection_device_bytes", stats.ranking.device_bytes}, {"selection_host_bytes", stats.ranking.host_bytes},
                 {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"extra_projection_weight_bytes", adapter->projection_buffer_bytes()}};
             result["attention_phases"] = {{"prefill", prefill_counters}, {"decode", difference(decode_counters, prefill_counters)},
                 {"final_flush", difference(counters(stats, device), decode_counters)}};
@@ -359,6 +362,9 @@ int main(int argc, char ** argv) {
                 {"projection_initialization_ms", adapter->projection_initialization_ns() / 1e6},
                 {"projection_weight_types", adapter->projection_weight_types()},
                 {"selection_source", config.attention.selection_replay.empty() ? "dynamic" : "replay"},
+                {"selection_backend", stats.selection_backend}, {"selection_backend_requested", config.attention.selection_backend},
+                {"selection_rank_calls", stats.ranking.calls}, {"selection_scored_blocks", stats.ranking.scored_blocks},
+                {"selection_published_blocks", stats.ranking.published_blocks},
                 {"block_tokens", config.attention.block_tokens}, {"context_budget_tokens", budget.total},
                 {"init_tokens", budget.initial}, {"local_tokens", budget.local}, {"representative_count", budget.representatives},
                 {"head_aggregation", "mean"}, {"position_policy", "absolute_native_rope"},
