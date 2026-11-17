@@ -397,6 +397,10 @@ std::vector<KvReadSegment> FileKvStore::plan_read(std::uint32_t layer, std::uint
     return segments;
 }
 void FileKvStore::flush() { for (std::uint32_t layer = 0; layer < geometry_.layers; ++layer) flush_layer(layer); }
+void FileKvStore::flush_full_layer(std::uint32_t layer) {
+    check_ready();
+    if (pending_.at(layer).values.size() / token_elements_ == pending_tokens_) flush_layer(layer);
+}
 std::uint64_t FileKvStore::length(std::uint32_t layer) const { check_ready(); return lengths_.at(layer); }
 std::uint64_t FileKvStore::resident_bytes() const {
     std::uint64_t total = (lengths_.capacity() + committed_.capacity()) * sizeof(std::uint64_t) + scratch_.capacity() * sizeof(Half);

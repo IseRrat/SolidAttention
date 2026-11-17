@@ -133,7 +133,7 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         const auto & a = j.at("attention");
         const std::set<std::string> allowed = {"storage", "sparse", "gpu_decode", "layout", "fuse_kv_projection", "profile", "block_tokens", "context_budget_tokens",
             "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "selection_replay",
-            "prefetch", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head"};
+            "prefetch", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head", "schedule", "schedule_trace"};
         if (!a.is_object()) throw std::invalid_argument("attention must be an object");
         for (const auto & item : a.items()) if (allowed.count(item.key()) == 0) throw std::invalid_argument("unknown attention key: " + item.key());
         auto & target = result.attention;
@@ -156,6 +156,9 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         if (a.contains("gpu_decode")) target.gpu_decode = a.at("gpu_decode").get<bool>();
         if (a.contains("prefetch")) target.prefetch = a.at("prefetch").get<bool>();
         if (a.contains("prefetch_trace")) target.prefetch_trace = a.at("prefetch_trace").get<bool>();
+        if (a.contains("schedule")) target.schedule = a.at("schedule").get<std::string>();
+        if (target.schedule != "naive" && target.schedule != "overlap" && target.schedule != "overlap+sync_reuse") throw std::invalid_argument("unknown schedule");
+        if (a.contains("schedule_trace")) target.schedule_trace = a.at("schedule_trace").get<bool>();
         if (a.contains("prefetch_queue_depth")) {
             target.prefetch_queue_depth = positive(a, "prefetch_queue_depth");
             if (target.prefetch_queue_depth < 2 || target.prefetch_queue_depth > 16384) throw std::invalid_argument("prefetch_queue_depth must be in [2,16384]");
@@ -165,6 +168,7 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
             throw std::invalid_argument("prefetch requires SSD sparse interleaved storage and GGML decode");
         }
         if (!target.prefetch && (a.contains("prefetch_queue_depth") || a.contains("prefetch_slots_per_head") || a.contains("prefetch_trace"))) throw std::invalid_argument("prefetch options require prefetch=true");
+        if (!target.prefetch && (a.contains("schedule") || a.contains("schedule_trace"))) throw std::invalid_argument("schedule requires prefetch=true");
         if (a.contains("block_tokens")) target.block_tokens = positive(a, "block_tokens");
         if (a.contains("representative_count")) target.representative_count = positive(a, "representative_count");
         if (target.representative_count > target.block_tokens) throw std::invalid_argument("representative_count exceeds block_tokens");

@@ -46,6 +46,10 @@ public:
     std::vector<HeadSelection> select_decode(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                             const std::vector<float> & keys, const std::vector<float> & values,
                                             bool interleaved_inputs = false);
+    std::vector<HeadSelection> select_before_kv(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query);
+    void append_after_selection(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
+                                const std::vector<float> & keys, const std::vector<float> & values, bool interleaved_inputs);
+    void flush_full_layer(std::uint32_t layer) { store_->flush_full_layer(layer); }
 private:
     std::unique_ptr<KvStore> store_;
     std::unique_ptr<RepresentativeIndex> representatives_;
@@ -58,8 +62,9 @@ private:
     std::ofstream trace_;
     std::ifstream replay_;
     bool failed_ = false;
+    std::optional<std::pair<std::uint32_t, std::uint64_t>> early_;
     void append_token(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
-                      const float * keys, const float * values);
+                      const float * keys, const float * values, bool query_observed = false);
     void record(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & selection);
     std::vector<HeadSelection> select(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query);
 };

@@ -14,7 +14,7 @@ git submodule update --init --recursive
 
 ## 检查代码
 
-仅构建配置库并运行单元检查：
+构建配置与核心库并运行单元检查：
 
 ```bash
 bash scripts/check.sh --unit-only
@@ -62,9 +62,10 @@ python3 scripts/run_baseline.py configs/baseline.local.json
 | `selection.jsonl` | attention 路径每层、每轮、每 KV head 的实际选择范围 |
 | `selection.replay.jsonl` | 固定选择回放时的输入轨迹副本 |
 | `prefetch.jsonl`、`residency.jsonl` | `prefetch_trace=true` 时的主机预取与设备槽位生命周期 |
+| `schedule.jsonl` | `schedule_trace=true` 时的逐层 DAG、任务依赖、主机观测区间及完成依据 |
 
 启动脚本要求主仓库和上游源码已提交；本地配置与结果目录由 `.gitignore` 排除。内存采样间隔为 100 ms，manifest 标注采样峰值及 cgroup 范围；VRAM 和 KV 分配信息保留在后端日志中。
 
 交错布局、融合投影、固定集合消融与分项观测入口见 [阶段 2](phases/PHASE_2.md)。各阶段完成后整理的实现与检查证据见 [阶段记录](phases/README.md)。
 
-liburing 历史预取、同步参考对照与轨迹核查见 [阶段 3](phases/PHASE_3.md)。性能配置关闭 `prefetch_trace`、`profile` 和 `dump_logits`，保持同一输入与正式选择规则。
+liburing 历史预取、同步参考对照与轨迹核查见 [阶段 3](phases/PHASE_3.md)。微任务 DAG、独立复制后端、同步复用和三组固定集合对照见 [阶段 4](phases/PHASE_4.md)。性能配置关闭 `schedule_trace`、`prefetch_trace`、`profile` 和 `dump_logits`，保持同一输入与正式选择规则。

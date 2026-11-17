@@ -3,6 +3,7 @@
 #include "solid/config.hpp"
 #include "solid/session.hpp"
 #include "solid/device_cache.hpp"
+#include "solid/scheduler.hpp"
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -41,6 +42,10 @@ public:
                        ggml_backend * decode_backend = nullptr);
     void check() const;
     ggml_tensor * host_node() const;
+    ggml_tensor * selection_node() const;
+    ggml_tensor * attention_node() const;
+    void set_query_proof(bool covers_previous_attention);
+    void defer_completion();
     void complete_attention();
 private:
     struct Impl;
@@ -55,6 +60,7 @@ public:
     AttentionAdapter(const AttentionAdapter &) = delete;
     AttentionAdapter & operator=(const AttentionAdapter &) = delete;
     void check() const;
+    void after_process();
     void flush();
     void finish();
     SessionStats stats() const;
@@ -72,12 +78,14 @@ public:
     bool observe(ggml_tensor * tensor, bool ask) noexcept;
     void quiesce();
     DeviceCacheStats device_stats() const;
+    ScheduleStats schedule_stats() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
 };
 
 bool adapter_active(const llama_model * model);
+bool graph_depends_on(const ggml_tensor * tensor, const ggml_tensor * ancestor);
 bool adapter_fused_projection(const llama_model * model);
 llm_graph_qkv adapter_qkv(const llm_graph_context & graph, const llama_layer & layer, ggml_tensor * input,
                          std::int64_t dimension_q, std::int64_t heads_q, std::int64_t dimension_k,

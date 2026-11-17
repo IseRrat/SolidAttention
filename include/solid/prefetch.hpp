@@ -38,7 +38,7 @@ public:
     SlotLease refresh(const SlotLease & previous, const BlockIdentity & identity);
     bool complete(const SlotLease & lease);
     bool retire(const SlotLease & lease);
-    void pin(const SlotLease & lease);
+    void pin(const SlotLease & lease, bool allow_pending = false);
     void unpin(const SlotLease & lease);
     bool matches(const SlotLease & lease) const;
     SlotLease lease(std::uint32_t slot) const;
@@ -50,6 +50,8 @@ private:
     std::uint32_t slots_per_head_;
 };
 struct PrefetchStats {
+    std::uint64_t history_resolutions = 0;
+    std::uint64_t formal_resolutions = 0;
     std::uint64_t predicted_blocks = 0;
     std::uint64_t ready_hits = 0;
     std::uint64_t inflight_hits = 0;
@@ -70,6 +72,7 @@ public:
     ~Prefetcher();
     void begin(std::uint32_t layer, std::uint64_t position);
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
+    std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     void poll(bool wait = false);
     const KvBlock & block(const SlotLease & lease) const;
     void pin(const SlotLease & lease) { slots_.pin(lease); }
@@ -102,5 +105,7 @@ private:
     void retire(const SlotLease & lease);
     void pump();
     void event(const char * name, const SlotLease & lease);
+    std::vector<SlotLease> resolve_impl(std::uint32_t layer, std::uint64_t position,
+                                       const std::vector<HeadSelection> & actual, bool historical);
 };
 } // namespace solid

@@ -19,6 +19,8 @@ public:
     RepresentativeIndex(KvGeometry geometry, std::uint32_t query_heads, SparseBudget budget);
     void observe(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                  const std::vector<Half> & keys);
+    void observe_query(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query);
+    void append_keys(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & keys);
     bool ready(std::uint32_t layer, std::uint64_t block) const;
     double score(std::uint32_t layer, std::uint32_t head, std::uint64_t block, const std::vector<float> & query) const;
     std::vector<std::uint64_t> representative_positions(std::uint32_t layer, std::uint32_t head, std::uint64_t block) const;
@@ -34,6 +36,7 @@ private:
     std::vector<std::deque<Pending>> pending_;
     std::vector<std::vector<Block>> blocks_;
     std::vector<std::uint64_t> lengths_;
+    std::vector<bool> query_pending_;
     std::size_t index(std::uint32_t layer, std::uint32_t head) const;
 };
 

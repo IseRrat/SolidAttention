@@ -22,6 +22,8 @@ struct AttentionConfig {
     bool profile = false;
     bool prefetch = false;
     bool prefetch_trace = false;
+    std::string schedule = "naive";
+    bool schedule_trace = false;
     std::uint32_t prefetch_queue_depth = 64;
     std::uint32_t prefetch_slots_per_head = 0;
     std::uint32_t block_tokens = 32;

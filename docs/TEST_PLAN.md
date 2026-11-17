@@ -4,6 +4,8 @@
 
 历史预取使用 [阶段 3](phases/PHASE_3.md) 的动态/固定集合对照和设备轨迹核查。核心单元覆盖真实 liburing 临时文件、取消顺序、乱序完成、版本刷新、DRAM/VRAM 租约及容量边界；`--sanitize` 追加内存检查。
 
+微任务调度使用 [阶段 4](phases/PHASE_4.md) 的三组固定集合对照。检查覆盖 DAG/LST、Q 提前选择、worker 并发、延迟 pin、后继 Q 完成证明，以及真实合成图轨迹与统计的跨语言核对。
+
 ## 1. 参考路径与数值对照
 
 | 路径 | KV 位置与选择 | 用途 |
@@ -40,6 +42,9 @@ dense 内存与 SSD 路径比较 K/V、attention 输出和 logits。稀疏内存
 | 尾块读写 | 写缓冲未满、SSD 版本较旧、立即读取新增 token | 从最新待提交版本转发，flush 后读回一致 |
 | 容量压力 | 预测集合超过容量、实际集合超过容量 | 预测按容量裁剪；实际超额返回配置错误 |
 | I/O 故障 | 短读、短写、失败、会话中断 | 短传输按剩余区间处理；失败传播到会话，块版本保持可查 |
+| 调度并发 | 让缺块读取等待 K 投影节点的条件变量通知 | worker 与计算图均可推进，历史补读与 KV 区间存在交集 |
+| 同步复用 | 两层图中后继 Q 依赖前层 attention，末层到达请求同步 | 设备租约按证明释放，Q/请求/显式边界分别计数 |
+| 任务轨迹 | 实际 C++ 图导出三种模式的任务和驻留事件 | Python 重算依赖、最长路径、重叠、同步次数和租约平衡 |
 
 每条测试保存输入、预期块集合、事件轨迹和输出摘要。
 
@@ -78,6 +83,8 @@ LongBench 八任务使用 2WikiMQA、TriviaQA、HotpotQA、MultiFieldQA、MuSiQu
 分别记录模型加载、prefill、首 token、decode 和整请求耗时。decode token/s 为实际生成 token 数除以对应 decode 时间；同时保存计数与起止事件。遇到 prefill 直接产生首 token 的接口，单独记录该 token 的归属。
 
 逐 token 延迟给出平均、P50、P90、P99；重复运行报告中位数和范围。初始使用 5 次独立测量，预热次数和样本量写入配置。I/O 阻塞取 attention 等待 KV 就绪的临界路径区间，使用事件时间轴计算重叠区间。
+
+调度轨迹使用主机 `steady_clock_ns`，其任务区间包含到相应完成边界为止的执行与等待。`observed_critical_path_sum_ms` 按各帧任务时长计算最长依赖链，区间间的调度空隙保留在时间轴；`miss_projection_overlap_sum_ms` 计算历史纠错与 KV 到主机区间的交集。逐 kernel 成本使用 `profile.nodes` 的串行观测配置，端到端性能配置关闭全部详细轨迹与 profile。
 
 使用 cgroup v2 设置 DRAM 限额并记录 `memory.max`、`memory.peak`、`memory.stat` 和 swap 设置；CUDA 显存单独统计。页缓存、pinned memory、代表向量、读写缓冲区、模型与工作区分别计量。
 

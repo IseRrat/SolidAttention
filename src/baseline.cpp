@@ -67,7 +67,7 @@ void submit(llama_context * ctx, llama_batch_ext * batch, const llama_token * to
     const int status = llama_process(ctx, LLAMA_PROCESS_TYPE_DECODE, batch);
     if (status != 0) throw std::runtime_error("llama_process failed: " + std::to_string(status));
     llama_synchronize(ctx);
-    if (adapter) adapter->check();
+    if (adapter) adapter->after_process();
 }
 Json metadata(const llama_model * model) {
     Json result = Json::object();
@@ -297,6 +297,7 @@ int main(int argc, char ** argv) {
                 {"layout", config.attention.interleaved ? "interleaved" : "separate"},
                 {"fuse_kv_projection", config.attention.fuse_kv_projection},
                 {"prefetch", config.attention.prefetch},
+                {"schedule", config.attention.schedule},
                 {"projection_extra_weight_bytes", adapter->projection_buffer_bytes()},
                 {"projection_initialization_ms", adapter->projection_initialization_ns() / 1e6},
                 {"projection_weight_types", adapter->projection_weight_types()},
@@ -322,6 +323,7 @@ int main(int argc, char ** argv) {
                     {"io_engine", "liburing"}, {"queue_depth", config.attention.prefetch_queue_depth},
                     {"slots_per_head", stats.prefetch.slots_per_head},
                     {"trace_enabled", config.attention.prefetch_trace},
+                    {"history_resolutions", stats.prefetch.history_resolutions}, {"formal_resolutions", stats.prefetch.formal_resolutions},
                     {"predicted_blocks", stats.prefetch.predicted_blocks}, {"ready_hits", stats.prefetch.ready_hits},
                     {"inflight_hits", stats.prefetch.inflight_hits}, {"missing_blocks", stats.prefetch.missing_blocks},
                     {"unused_blocks", stats.prefetch.unused_blocks}, {"refreshed_blocks", stats.prefetch.refreshed_blocks},
@@ -342,6 +344,21 @@ int main(int argc, char ** argv) {
                 // cache only when a decode graph is built.
                 const auto residency = config.output.parent_path() / "residency.jsonl";
                 if (std::filesystem::exists(residency)) result["residency_trace_sha256"] = solid::sha256_file(residency);
+                const auto schedule = adapter->schedule_stats();
+                result["schedule"] = {
+                    {"mode", config.attention.schedule}, {"trace_enabled", config.attention.schedule_trace},
+                    {"frames", schedule.frames}, {"tasks", schedule.tasks}, {"worker_jobs", schedule.worker_jobs},
+                    {"observed_critical_path_sum_ms", schedule.critical_path_ns / 1e6},
+                    {"miss_projection_overlap_sum_ms", schedule.miss_projection_overlap_ns / 1e6},
+                    {"query_reused_fences", schedule.query_reused_fences}, {"process_reused_fences", schedule.process_reused_fences},
+                    {"attention_fences", schedule.attention_fences}, {"fallback_fences", schedule.fallback_fences},
+                    {"copy_event_waits", schedule.event_waits}, {"copy_batch_waits", schedule.batch_waits},
+                    {"copy_stream_waits", schedule.stream_waits}, {"copy_batch_groups", schedule.batch_groups},
+                    {"copy_events_coalesced", schedule.events_coalesced}, {"backend_drains", schedule.backend_drains},
+                    {"backend_compute_waits", schedule.backend_compute_waits}, {"staging_buffer_bytes", schedule.staging_bytes}
+                };
+                const auto schedule_trace = config.output.parent_path() / "schedule.jsonl";
+                if (std::filesystem::exists(schedule_trace)) result["schedule_trace_sha256"] = solid::sha256_file(schedule_trace);
             }
             result["selection_trace_sha256"] = solid::sha256_file(config.output.parent_path() / "selection.jsonl");
             if (!config.attention.selection_replay.empty()) result["selection_replay_sha256"] = solid::sha256_file(config.attention.selection_replay);

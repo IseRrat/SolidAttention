@@ -35,20 +35,21 @@ def audit_residency(path, block_tokens, slots_per_head):
             if not previous or previous["generation"] != generation or previous["identity"] != identity:
                 raise ValueError(f"stale residency event at line {line_number}")
             expected, target = {
-                "upload_complete": ("loading", "ready"),
+                "upload_complete": (("loading_pinned", "pinned") if previous["state"] == "loading_pinned" else ("loading", "ready")),
                 "attention_pin": ("ready", "pinned"),
+                "attention_pin_waiting": ("loading", "loading_pinned"),
                 "attention_complete": ("pinned", "ready"),
                 "overwrite_available": ("ready", "free"),
             }.get(event, (None, None))
             if previous["state"] != expected:
                 raise ValueError(f"invalid device transition at line {line_number}: {event}")
-            if event == "attention_pin":
+            if event in ("attention_pin", "attention_pin_waiting"):
                 if not item["epoch"]: raise ValueError("attention epoch must be positive")
                 previous["epoch"] = item["epoch"]; pins += 1
             if event == "attention_complete" and previous["epoch"] != item["epoch"]:
                 raise ValueError(f"attention completion epoch differs at line {line_number}")
             previous["state"] = target
-    if any(item["state"] in ("pinned", "loading") for item in states.values()):
+    if any(item["state"] in ("pinned", "loading", "loading_pinned") for item in states.values()):
         raise ValueError("device trace ends with active transfers or attention readers")
     return {"uploads": uploads, "attention_pins": pins, "slots_used": len(states), "balanced": True}
 

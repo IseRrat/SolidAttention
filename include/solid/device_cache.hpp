@@ -11,6 +11,7 @@ public:
     virtual bool complete(std::uint64_t ticket, bool wait) = 0;
     // Wait for issued copies; ticket receipts remain valid for complete().
     virtual void drain() = 0;
+    virtual void wait_batch() { drain(); }
     virtual std::uint64_t resident_bytes() const = 0;
 };
 struct DeviceCacheStats {
@@ -28,7 +29,10 @@ public:
     ~DeviceCache();
     void prefetch_ready();
     void wait_transfers();
-    std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection);
+    void wait_transfers_coalesced();
+    void stage(const std::vector<SlotLease> & host_leases);
+    std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
+                              bool deferred_upload = false);
     // Called only after the backend confirms attention completion.
     bool attention_complete(std::uint64_t epoch);
     std::uint64_t attention_epoch() const { return epoch_; }

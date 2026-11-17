@@ -1,5 +1,6 @@
 #include "solid/device_cache.hpp"
 #include <algorithm>
+#include <chrono>
 #include <limits>
 #include <stdexcept>
 
@@ -27,7 +28,9 @@ std::uint32_t DeviceCache::tokens_per_head() const {
 }
 void DeviceCache::event(const char * name, const SlotLease & lease) {
     if (!trace_.is_open()) return;
-    trace_ << "{\"event\":\"" << name << "\",\"epoch\":" << epoch_ << ",\"layer\":" << lease.identity.layer
+    trace_ << "{\"event\":\"" << name << "\",\"timestamp_ns\":"
+           << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()
+           << ",\"epoch\":" << epoch_ << ",\"layer\":" << lease.identity.layer
            << ",\"kv_head\":" << lease.identity.head << ",\"block\":" << lease.identity.block << ",\"version\":" << lease.identity.version
            << ",\"slot\":" << lease.slot << ",\"generation\":" << lease.generation << "}\n";
     if (!trace_) throw std::runtime_error("device residency trace write failed");
@@ -46,6 +49,7 @@ void DeviceCache::poll_transfers(bool wait) {
     if (error) std::rethrow_exception(error);
 }
 void DeviceCache::wait_transfers() { poll_transfers(true); }
+void DeviceCache::wait_transfers_coalesced() { if (!transfers_.empty()) transport_.wait_batch(); poll_transfers(true); }
 void DeviceCache::retain(const std::vector<BlockIdentity> & identities) {
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
         const auto & entry = slots_.entry(i);
@@ -94,7 +98,15 @@ void DeviceCache::prefetch_ready() {
     retain(identities);
     for (const auto & lease : ready) (void) upload(lease);
 }
-std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection) {
+void DeviceCache::stage(const std::vector<SlotLease> & host_leases) {
+    if (!attention_.empty()) throw std::logic_error("stage before previous attention completed");
+    wait_transfers();
+    std::vector<BlockIdentity> actual;
+    for (const auto & lease : host_leases) actual.push_back(lease.identity);
+    retain(actual);
+    for (const auto & lease : host_leases) (void) upload(lease);
+}
+std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection, bool deferred_upload) {
     if (!attention_.empty()) throw std::logic_error("previous device attention has not completed");
     if (selection.size() != geometry_.heads) throw std::invalid_argument("device selection head count");
     wait_transfers();
@@ -108,7 +120,7 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
         else device = upload(host);
         used.push_back(*device);
     }
-    wait_transfers();
+    if (!deferred_upload) wait_transfers();
     const auto tokens = tokens_per_head();
     std::vector<Half> mask(static_cast<std::size_t>(tokens) * query_heads_, Half{0xfc00});
     const auto group = query_heads_ / geometry_.heads;
@@ -127,13 +139,18 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
     ++epoch_;
     std::size_t pinned = 0;
     try {
-        for (const auto & lease : used) { slots_.pin(lease); ++pinned; event("attention_pin", lease); }
+        for (const auto & lease : used) {
+            const bool pending = slots_.entry(lease.slot).producer;
+            slots_.pin(lease, deferred_upload); ++pinned;
+            event(pending ? "attention_pin_waiting" : "attention_pin", lease);
+        }
         attention_ = std::move(used);
     } catch (...) { for (std::size_t i = 0; i < pinned; ++i) slots_.unpin(used[i]); throw; }
     return mask;
 }
 bool DeviceCache::attention_complete(std::uint64_t epoch) {
     if (epoch != epoch_ || attention_.empty()) { ++stats_.stale_events; return false; }
+    for (const auto & lease : attention_) if (slots_.entry(lease.slot).producer) throw std::logic_error("attention completion precedes upload acknowledgment");
     auto completed = std::move(attention_);
     attention_.clear();
     std::exception_ptr error;

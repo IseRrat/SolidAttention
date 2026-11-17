@@ -28,7 +28,7 @@ def prepare_prefetch(reference, output, fixed_selection=False, queue_depth=64, s
         raise ValueError("prefetch verification requires a GGML decode reference")
     if slots_per_head is not None and slots_per_head > (config["context_tokens"] + attention["block_tokens"] - 1) // attention["block_tokens"]:
         raise ValueError("slots per head exceed context block count")
-    for key in ("session_file", "selection_replay", "prefetch_slots_per_head"):
+    for key in ("session_file", "selection_replay", "prefetch_slots_per_head", "schedule", "schedule_trace"):
         mode.pop(key, None)
     mode.update({"prefetch": True, "prefetch_trace": True, "prefetch_queue_depth": queue_depth, "keep_session_file": False})
     for key in ("block_tokens", "context_budget_tokens", "init_tokens", "local_tokens", "representative_count"):

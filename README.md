@@ -2,7 +2,7 @@
 
 复现 FAST 2026 论文 **SolidAttention: Low-Latency SSD-based Serving on Memory-Constrained PCs**，在 llama.cpp 上实现 SSD KV cache、动态稀疏注意力、历史预取和计算/I/O 重叠。
 
-首条路线采用 Linux + CUDA，单请求 decode，INT4 模型权重和 FP16 KV cache。开发从获取并固定 llama.cpp 版本、运行原版基线开始。
+首条路线采用 Linux + CUDA，单请求 decode，INT4 模型权重和 FP16 KV cache。阶段 0 至 4 的代码与合成数据检查已完成，模型与设备评测按实验环境入口执行。
 
 ## 开发入口
 
@@ -16,7 +16,7 @@
 8. [同步 SSD 路径](docs/SSD_PATH.md)：内存/SSD 模式、选块规则、文件格式和固定 token 对照。
 9. [阶段完成记录](docs/phases/README.md)：各阶段完成后的代码入口、检查证据与核查步骤。
 10. [历史预取与纠错](docs/phases/PHASE_3.md)：liburing、DRAM/VRAM 租约、纠错轨迹和同步参考核查。
-9. [阶段完成记录](docs/phases/README.md)：各阶段完成后的代码入口、检查证据与核查步骤。
+11. [微任务调度](docs/phases/PHASE_4.md)：计算/I/O 重叠、同步复用、三组固定集合对照与任务轨迹核查。
 
 ## 系统机制
 

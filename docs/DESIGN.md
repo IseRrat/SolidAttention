@@ -48,6 +48,7 @@ representative_bytes = layers * Hkv * blocks_per_head * representative_count * D
 | VRAM attention 缓冲区 | 一层选中 KV 和当前 token KV | 当前 attention 完成 |
 | DRAM 写缓冲区 | 每层 32 KiB，聚合新增 KV | SSD 写入完成 |
 | 传输暂存区 | 固定容量，容纳 D2H 及尾块更新 | 消费该数据的写入完成 |
+| overlap H2D 暂存 | 一层设备槽位对应的 pinned host buffer，实际容量写入结果 | 对应复制事件完成，设备槽位可复用 |
 | 元数据和代表向量 | 按层、head、块常驻 | 会话结束 |
 | 模型与计算工作区 | 由后端分配 | 按后端生命周期管理 |
 
@@ -94,7 +95,7 @@ unused = predicted - actual
 
 取消请求提交后，槽位保持占用直至原操作完成或确认取消。generation 用于通知归属校验；物理写入完成状态控制缓冲区释放。预测数量按剩余容量裁剪，实际集合容量在提交前检查。
 
-阶段 3 的 liburing 路径以原 READ CQE 结束内核写入期。主机槽位和设备槽位分别管理 producer/readers；H2D 完成事件释放主机源租约，Flash Attention 后端同步后释放设备读者。尾块等待旧读取完成后保留不可变前缀并补齐新行，设备 mask 按实际物理槽位构建。代码、容量公式和完成记录见 [阶段 3](phases/PHASE_3.md)。
+liburing 路径以原 READ CQE 结束内核写入期。主机槽位和设备槽位分别管理 producer/readers；H2D 完成事件释放主机源租约，attention 完成证明释放设备读者。尾块等待旧读取完成后保留不可变前缀并补齐新行，设备 mask 按实际物理槽位构建。代码与容量公式见 [阶段 3](phases/PHASE_3.md)，同步复用见 [阶段 4](phases/PHASE_4.md)。
 
 ## 8. SSD-aware 调度
 
@@ -111,6 +112,10 @@ attention → ffn → next_layer_q_proj
 H2D 还依赖目标 VRAM 槽释放；SSD 读取依赖目标 DRAM 槽释放；回写与后续读取通过块版本连接。就绪任务按关键路径优先，再按最晚开始时间排序；非关键 I/O 尽早提交。重点实现 missing load 与 KV projection 重叠、下一层读取与当前层 attention 重叠。
 
 同步复用分别比较 `naive`、`overlap`、`overlap+sync_reuse`。共享同步点覆盖所合并任务的全部前置事件。轨迹分别记录 SSD 完成、主机复制完成、GPU 事件完成及槽位释放。
+
+阶段 4 通过 Q-only CPU 节点建立选择前沿，先更新过去 token 的代表评分并选择历史块，worker 纠错读盘时 GGML 继续 KV 投影。late CPU 节点接收当前 KV 后追加并刷新尾块。独立复制后端与固定 pinned 暂存承载 H2D，worker 在共同就绪前沿按 DAG 的关键路径/LST 安排满缓冲回写和后继预取。
+
+sync_reuse 通过实际图祖先核查，以后继 Q 下载完成证明释放前层 attention 读者；末层使用请求已有同步。上传中的设备槽位允许登记未来读者，producer 和 reader 均完成后复用。详细轨迹采用主机观测区间，逐 kernel 观测使用单独的串行 profile 配置。实现、指标和三组固定集合核查见 [阶段 4 完成记录](phases/PHASE_4.md)。
 
 ## 9. 模块接口
 

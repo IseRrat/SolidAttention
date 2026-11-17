@@ -30,3 +30,4 @@ CUDA 参照环境：Ultra 9 185H、RTX 4070 Laptop 8 GB、Linux 6.8、CUDA 12.8�
 - [llama.cpp](https://github.com/ggml-org/llama.cpp)：模型执行、KV 管理、计算图及 CUDA/SYCL 后端；[构建文档](https://github.com/ggml-org/llama.cpp/blob/master/docs/build.md)。
 - [liburing](https://github.com/axboe/liburing)：异步 SSD I/O。
 - [fio](https://github.com/axboe/fio)：SSD 微基准和干扰负载。
+- [NVIDIA CUDA 事件接口](https://docs.nvidia.com/cuda/cuda-runtime-api/cuda_runtime_api/group__CUDART__EVENT.html)、[异步执行](https://docs.nvidia.com/cuda/cuda-programming-guide/02-basics/asynchronous-execution.html)：事件记录、流等待及跨流完成边界，阶段 4 通过锁定版本的 GGML 后端接口接入。

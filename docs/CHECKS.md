@@ -69,3 +69,21 @@ bash scripts/check.sh --cuda
 | 配置与工具 | 预取选项与构建特性、固定输入、选择差异、覆盖/epoch 审计及运行来源 |
 
 `bash scripts/check.sh --cuda` 通过 CUDA 编译与链接、21 项 CTest、19 项 Python 检查和源码指纹核对。`bash scripts/check.sh --sanitize` 的 5 项核心 CTest 与地址、泄漏、未定义行为检查通过。输入为合成张量与临时文件，数学计算使用 CPU 后端。模型与设备实验入口见 [阶段 3 完成记录](phases/PHASE_3.md)。
+
+## 2026-11-17：微任务调度
+
+| 检查范围 | 证据 |
+| --- | --- |
+| DAG/LST | 环、重复边、前驱状态、关键路径优先、最晚开始时间、共享 fence 覆盖与单调性 |
+| 有界 worker | 条件变量控制的并发进展、容量拒绝、异常传递及后续复用 |
+| 提前选择 | 多轮变化 Q、GQA、代表定稿；Q-only 选择与原串行选择一致 |
+| 调度计算图 | naive/overlap/sync_reuse，两层、任意物理槽位 mask，CPU Flash Attention 对同步稀疏参考 |
+| 缺块/投影重叠 | 缺块读取屏障由合成 K 投影解除，两路任务均推进且观测区间相交 |
+| 同步与租约 | 每例 12 帧/144 任务；reuse 为 6 次 Q 边界与 6 次请求边界；延迟 pin 保留上传 producer |
+| 真实文件 | 三种模式均在临时文件和真实 liburing 上通过多层计算图检查 |
+| 跨语言核查 | C++ 实际图导出调度/驻留轨迹，Python 独立核对任务依赖、最长路径、重叠和同步计数 |
+| 工具与配置 | 三组固定输入及选择、来源与副本校验、模式约束、指标变更、失败/未闭合和提前释放拒绝 |
+
+`bash scripts/check.sh --cuda` 通过 CUDA 编译与链接、27 项 CTest、23 项 Python 检查和源码指纹核对。`bash scripts/check.sh --sanitize` 通过 6 项核心 CTest 与地址、泄漏和未定义行为检查。输入为合成张量与临时文件，数学计算使用 CPU 后端。任务指标采用主机观测完成区间；模型、CUDA 实际并发和设备性能的实验环境入口见 [阶段 4 完成记录](phases/PHASE_4.md)。
+
+17 篇 Markdown 的本地链接、标题锚点、代码块与文风检查通过，配置 JSON 解析及差异格式检查通过。

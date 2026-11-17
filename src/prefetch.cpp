@@ -73,21 +73,22 @@ bool SlotTable::retire(const SlotLease & lease) {
     slot.state = (!slot.producer && slot.readers == 0) ? SlotState::free : SlotState::retiring;
     return slot.state == SlotState::free;
 }
-void SlotTable::pin(const SlotLease & lease) {
+void SlotTable::pin(const SlotLease & lease, bool allow_pending) {
     if (!matches(lease)) throw std::logic_error("pin of stale slot lease");
     auto & slot = slots_[lease.slot];
-    if ((slot.state != SlotState::ready && slot.state != SlotState::pinned) || slot.readers == std::numeric_limits<std::uint32_t>::max()) {
+    if ((slot.state != SlotState::ready && slot.state != SlotState::pinned && !(allow_pending && slot.state == SlotState::loading)) ||
+        slot.readers == std::numeric_limits<std::uint32_t>::max()) {
         throw std::logic_error("slot is not ready for a reader");
     }
     ++slot.readers;
-    slot.state = SlotState::pinned;
+    slot.state = slot.producer ? SlotState::loading : SlotState::pinned;
 }
 void SlotTable::unpin(const SlotLease & lease) {
     if (!matches(lease) || slots_[lease.slot].readers == 0) throw std::logic_error("unpin of stale or unowned slot");
     auto & slot = slots_[lease.slot];
     if (--slot.readers == 0) {
         if (slot.state == SlotState::retiring) { if (!slot.producer) slot.state = SlotState::free; }
-        else slot.state = SlotState::ready;
+        else slot.state = slot.producer ? SlotState::loading : SlotState::ready;
     }
 }
 Prefetcher::Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t per_head,
@@ -113,7 +114,9 @@ Prefetcher::~Prefetcher() {
 void Prefetcher::check() const { if (failed_) throw std::runtime_error("prefetch session failed"); }
 void Prefetcher::event(const char * name, const SlotLease & lease) {
     if (!trace_.is_open()) return;
-    trace_ << "{\"event\":\"" << name << "\",\"position\":" << position_ << ",\"layer\":" << lease.identity.layer
+    trace_ << "{\"event\":\"" << name << "\",\"timestamp_ns\":"
+           << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()
+           << ",\"position\":" << position_ << ",\"layer\":" << lease.identity.layer
            << ",\"kv_head\":" << lease.identity.head << ",\"block\":" << lease.identity.block
            << ",\"version\":" << lease.identity.version << ",\"slot\":" << lease.slot << ",\"generation\":" << lease.generation << "}\n";
     if (!trace_) { failed_ = true; throw std::runtime_error("prefetch trace write failed"); }
@@ -227,23 +230,35 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position) {
     pump();
 }
 std::vector<SlotLease> Prefetcher::resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual) {
+    return resolve_impl(layer, position, actual, false);
+}
+std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual) {
+    auto past = actual;
+    for (auto & head : past) {
+        if (!head.positions.empty() && head.positions.back() == position) head.positions.pop_back();
+    }
+    return resolve_impl(layer, position, past, true);
+}
+std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64_t position,
+                                            const std::vector<HeadSelection> & actual, bool historical) {
     const auto start = std::chrono::steady_clock::now();
     check();
     const auto & g = store_.geometry();
-    if (layer_ != layer || position_ != position || actual.size() != g.heads || store_.length(layer) != position + 1) {
+    const auto available = position + (historical ? 0 : 1);
+    if (layer_ != layer || position_ != position || actual.size() != g.heads || store_.length(layer) != available) {
         throw std::invalid_argument("prefetch resolve identity mismatch");
     }
     std::vector<BlockIdentity> needed;
     for (std::uint32_t head = 0; head < g.heads; ++head) {
         const auto & positions = actual[head].positions;
-        if (positions.empty() || positions.size() > budget_.total || positions.back() > position ||
+        if ((!historical && positions.empty()) || positions.size() > budget_.total || (!positions.empty() && positions.back() >= available) ||
             !std::is_sorted(positions.begin(), positions.end()) || std::adjacent_find(positions.begin(), positions.end()) != positions.end()) {
             throw std::invalid_argument("invalid actual prefetch selection");
         }
         std::set<std::uint64_t> ids;
         for (const auto p : positions) ids.insert(p / g.block_tokens);
         if (ids.size() > slots_.slots_per_head()) throw std::invalid_argument("actual selection exceeds slots_per_head");
-        for (const auto id : ids) needed.push_back({layer, head, id, std::min<std::uint64_t>(g.block_tokens, position + 1 - id * g.block_tokens)});
+        for (const auto id : ids) needed.push_back({layer, head, id, std::min<std::uint64_t>(g.block_tokens, available - id * g.block_tokens)});
     }
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
         const auto lease = slots_.lease(i);
@@ -281,7 +296,7 @@ std::vector<SlotLease> Prefetcher::resolve(std::uint32_t layer, std::uint64_t po
         result.push_back(*lease);
     }
     for (const auto & lease : result) while (slots_.entry(lease.slot).state == SlotState::loading) poll(true);
-    for (std::uint32_t head = 0; head < g.heads; ++head) {
+    if (!historical) for (std::uint32_t head = 0; head < g.heads; ++head) {
         auto & history = history_[layer][head];
         history.clear();
         const auto local_first = position + 1 - std::min<std::uint64_t>(budget_.local, position + 1);
@@ -291,6 +306,7 @@ std::vector<SlotLease> Prefetcher::resolve(std::uint32_t layer, std::uint64_t po
         }
     }
     for (const auto & lease : result) slots_.pin(lease);
+    if (historical) ++stats_.history_resolutions; else ++stats_.formal_resolutions;
     stats_.resolve_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
     return result;
 }

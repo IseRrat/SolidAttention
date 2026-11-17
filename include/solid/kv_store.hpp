@@ -81,6 +81,7 @@ public:
                                     const std::vector<Half> & kv) = 0;
     virtual void read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & destination) = 0;
     virtual void flush() = 0;
+    virtual void flush_full_layer(std::uint32_t) {}
     virtual std::uint64_t length(std::uint32_t layer) const = 0;
     virtual std::uint64_t resident_bytes() const = 0;
     virtual IoStats io_stats() const { return {}; }
@@ -117,6 +118,7 @@ public:
     void append_interleaved(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv) override;
     void read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & destination) override;
     void flush() override;
+    void flush_full_layer(std::uint32_t layer) override;
     std::uint64_t length(std::uint32_t layer) const override;
     std::uint64_t resident_bytes() const override;
     IoStats io_stats() const override { return stats_; }

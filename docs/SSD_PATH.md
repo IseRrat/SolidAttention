@@ -32,6 +32,8 @@
 
 阶段 3 的 `prefetch` 接入 liburing 与固定设备块槽位，正式选择通过物理槽位 mask 进入 attention。配置、完成事件、取消协议与对照步骤见 [阶段 3 完成记录](phases/PHASE_3.md)。
 
+阶段 4 的 `schedule` 控制 `naive`、`overlap`、`overlap+sync_reuse`。Q 选择前沿提前触发历史补读，独立复制后端上传单层工作集，worker 继续满缓冲回写和下一层读取。`schedule_trace` 输出任务依赖与完成区间；配置、同步证明及三组核查见 [阶段 4 完成记录](phases/PHASE_4.md)。
+
 入口支持 Llama、Qwen2 的单序列文本 decode、统一层形状和 FP16 KV。模型形状在 adapter 构造时检查。每个模型绑定一个会话，位置从 0 连续追加。
 
 ## KV 文件格式

@@ -63,6 +63,10 @@ int main() {
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":false,\"layout\":\"interleaved\",\"prefetch\":true}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"prefetch\":true}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"prefetch_queue_depth\":4}}");
+        write(prefix + async_mode + ",\"schedule\":\"overlap+sync_reuse\",\"schedule_trace\":true}}");
+        if (solid::RunConfig::load(config).attention.schedule != "overlap+sync_reuse") throw std::runtime_error("schedule configuration parsing");
+        reject(prefix + async_mode + ",\"schedule\":\"unknown\"}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"schedule\":\"overlap\"}}");
         auto change = [&](const std::string & from, const std::string & to) {
             auto content = prefix + "}";
             content.replace(content.find(from), from.size(), to);

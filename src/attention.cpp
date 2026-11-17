@@ -21,7 +21,7 @@ void SparseBudget::validate(const KvGeometry & geometry) const {
 }
 RepresentativeIndex::RepresentativeIndex(KvGeometry geometry, std::uint32_t query_heads, SparseBudget budget) :
     geometry_(geometry), query_heads_(query_heads), budget_(budget), pending_(geometry.layers),
-    blocks_(static_cast<std::size_t>(geometry.layers) * geometry.heads), lengths_(geometry.layers, 0) {
+    blocks_(static_cast<std::size_t>(geometry.layers) * geometry.heads), lengths_(geometry.layers, 0), query_pending_(geometry.layers, false) {
     geometry_.validate();
     budget_.validate(geometry_);
     if (query_heads == 0 || query_heads % geometry.heads != 0) throw std::invalid_argument("invalid GQA head mapping");
@@ -33,13 +33,17 @@ std::size_t RepresentativeIndex::index(std::uint32_t layer, std::uint32_t head) 
 }
 void RepresentativeIndex::observe(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                   const std::vector<Half> & keys) {
+    if (keys.size() != static_cast<std::size_t>(geometry_.heads) * geometry_.dimension) throw std::invalid_argument("representative key shape");
+    for (const auto key : keys) if (!std::isfinite(from_half(key))) throw std::invalid_argument("non-finite key");
+    observe_query(layer, position, query);
+    append_keys(layer, position, keys);
+}
+void RepresentativeIndex::observe_query(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query) {
     if (position != lengths_.at(layer) || position >= geometry_.capacity_tokens ||
-        query.size() != static_cast<std::size_t>(query_heads_) * geometry_.dimension ||
-        keys.size() != static_cast<std::size_t>(geometry_.heads) * geometry_.dimension) {
+        query_pending_.at(layer) || query.size() != static_cast<std::size_t>(query_heads_) * geometry_.dimension) {
         throw std::invalid_argument("representative observation shape or position mismatch");
     }
     finite_query(query);
-    for (const auto key : keys) if (!std::isfinite(from_half(key))) throw std::invalid_argument("non-finite key");
     const auto group = query_heads_ / geometry_.heads;
     std::vector<double> mean_query(static_cast<std::size_t>(geometry_.heads) * geometry_.dimension, 0);
     for (std::uint32_t head = 0; head < query_heads_; ++head) {
@@ -72,7 +76,15 @@ void RepresentativeIndex::observe(std::uint32_t layer, std::uint64_t position, c
         }
         pending.pop_front();
     }
-    pending.push_back({position, keys, std::vector<double>(geometry_.heads, 0)});
+    query_pending_[layer] = true;
+}
+void RepresentativeIndex::append_keys(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & keys) {
+    if (position != lengths_.at(layer) || !query_pending_.at(layer) || keys.size() != static_cast<std::size_t>(geometry_.heads) * geometry_.dimension) {
+        throw std::invalid_argument("representative append requires its query first");
+    }
+    for (const auto key : keys) if (!std::isfinite(from_half(key))) throw std::invalid_argument("non-finite key");
+    pending_[layer].push_back({position, keys, std::vector<double>(geometry_.heads, 0)});
+    query_pending_[layer] = false;
     ++lengths_[layer];
 }
 bool RepresentativeIndex::ready(std::uint32_t layer, std::uint64_t block) const {
@@ -102,7 +114,7 @@ std::vector<std::uint64_t> RepresentativeIndex::representative_positions(std::ui
     return result;
 }
 std::uint64_t RepresentativeIndex::resident_bytes() const {
-    std::uint64_t total = lengths_.capacity() * sizeof(std::uint64_t);
+    std::uint64_t total = lengths_.capacity() * sizeof(std::uint64_t) + (query_pending_.capacity() + 7) / 8;
     for (const auto & blocks : blocks_) {
         total += blocks.capacity() * sizeof(Block);
         for (const auto & block : blocks) {

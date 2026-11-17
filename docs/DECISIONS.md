@@ -22,6 +22,10 @@
 | D16 | liburing 原 READ CQE 结束主机槽位写入期；取消 CQE 单独统计，短读按剩余部分继续 | 阶段 3，uring-io、prefetch-and-residency |
 | D17 | DRAM 与设备各用固定槽位表；复制完成释放主机 pin，attention 完成释放设备 pin，纠错保持有效块原位 | 阶段 3，DeviceCache、prefetched-flash-attention |
 | D18 | 预取尾块先完成原读取，再以新 generation 保留不可变前缀、补齐最新行；详细轨迹由独立开关控制 | 阶段 3，plan_read、prefetch_trace |
+| D19 | Q 单独到达时完成代表评分与选择，历史补读在有界 worker 执行，GGML 继续当前 KV 投影 | 阶段 4，select_early、scheduled-flash-overlap |
+| D20 | 独立 GGML 复制后端与单层 pinned 暂存；同流最新已记录事件覆盖批量复制 | 阶段 4，GgmlTransport、DeviceCache |
+| D21 | 检查后继 Q 的实际图祖先后复用完成证明；末层复用已有请求同步，显式 fallback 单独计数 | 阶段 4，graph_depends_on、after_process |
+| D22 | DAG 按关键路径/LST 安排就绪 I/O；主机完成区间、逐 kernel 观测和端到端计时分别记录 | 阶段 4，TaskDag、schedule_ablation.py |
 
 ## 参数锁定任务
 

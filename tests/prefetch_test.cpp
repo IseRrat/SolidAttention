@@ -131,11 +131,33 @@ void device() {
     cache.finish(); host.finish();
     require(cache.stats().uploads == 6 && cache.stats().reused_blocks >= 3, "device upload/hit accounting");
 }
+void deferred_device() {
+    const solid::KvGeometry g{1, 1, 2, 1, 16, 64, solid::KvLayout::interleaved};
+    solid::MemoryKvStore store(g);
+    fill(store, 6);
+    solid::Prefetcher host(store, {4, 1, 1, 1}, 4, std::make_unique<Reader>());
+    Transport transport;
+    solid::DeviceCache cache(host, g, 2, transport);
+    host.begin(0, 6);
+    store.append_interleaved(0, 6, token(g, 0, 6));
+    const std::vector<solid::HeadSelection> selection{{{0, 1, 2, 6}, {}}};
+    auto leases = host.resolve(0, 6, selection);
+    (void) cache.prepare(leases, selection, true);
+    for (const auto & lease : leases) host.unpin(lease);
+    require(transport.memory.empty() && !transport.copies.empty(), "deferred prepare waited for the copies");
+    rejects([&] { (void) cache.attention_complete(cache.attention_epoch()); });
+    rejects([&] { host.begin(0, 7); });
+    cache.wait_transfers_coalesced();
+    require(transport.copies.empty() && transport.memory.size() == leases.size(), "batch acknowledgment lost copy receipts");
+    rejects([&] { cache.prefetch_ready(); });
+    require(cache.attention_complete(cache.attention_epoch()), "completed batch left the future attention reader unavailable");
+    cache.finish(); host.finish();
+}
 }
 int main() {
     try {
         slots(); prefix(); wrong_predictions(); read_error(solid::KvLayout::interleaved);
-        read_error(solid::KvLayout::separate); capacity(); device();
+        read_error(solid::KvLayout::separate); capacity(); device(); deferred_device();
         std::cout << "prefetch, correction, cancellation races, versions, host/device leases and stable slots passed\n";
         return 0;
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }

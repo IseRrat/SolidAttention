@@ -2,6 +2,7 @@
 #include "solid/device_cache.hpp"
 #include <algorithm>
 #include <cstring>
+#include <functional>
 #include <map>
 #include <memory>
 #include <stdexcept>
@@ -36,6 +37,7 @@ public:
     bool reverse = true;
     bool fail_next = false;
     std::optional<solid::ReadCompletion> duplicate;
+    std::function<void()> before_wait;
     solid::AsyncIoStats counters;
     std::vector<Pending> pending;
     bool submit(std::uint64_t id, int, void * dst, std::size_t bytes, std::uint64_t offset) override {
@@ -62,6 +64,7 @@ public:
     bool poll(solid::ReadCompletion & result, bool wait) override {
         if (duplicate) { result = *duplicate; duplicate.reset(); return true; }
         if (pending.empty() || (!wait && !auto_complete)) return false;
+        if (wait && before_wait) before_wait();
         const auto index = reverse ? pending.size() - 1 : 0;
         const auto op = pending[index];
         pending.erase(pending.begin() + index);
