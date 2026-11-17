@@ -41,6 +41,7 @@ void put_u64(unsigned char * p, std::uint64_t value) {
 }
 class NativeFile final : public RandomAccessFile {
 public:
+    int native_handle() const override { return fd_; }
     NativeFile(std::filesystem::path path, bool remove_on_close) : path_(std::move(path)), remove_(remove_on_close) {
 #ifdef _WIN32
         const auto status = _wsopen_s(&fd_, path_.c_str(), _O_CREAT | _O_EXCL | _O_RDWR | _O_BINARY,
@@ -188,6 +189,11 @@ std::unique_ptr<RandomAccessFile> create_session_file(const std::filesystem::pat
     return std::make_unique<NativeFile>(path, remove_on_close);
 }
 KvStore::KvStore(KvGeometry geometry) : geometry_(geometry) { geometry_.validate(); }
+std::vector<KvReadSegment> KvStore::plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
+                                            KvBlock & destination, std::uint32_t) {
+    read(layer, head, block, destination);
+    return {};
+}
 Half * KvBlock::key(std::size_t row) {
     return data.data() + row * dimension * (layout == KvLayout::interleaved ? 2 : 1);
 }
@@ -346,27 +352,49 @@ void FileKvStore::flush_layer(std::uint32_t layer) {
     pending.first = committed_[layer];
 }
 void FileKvStore::read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & result) {
+    const auto segments = plan_read(layer, head, block, result);
+    for (const auto & segment : segments) {
+        read_exact(reinterpret_cast<unsigned char *>(result.data.data()) + segment.buffer_offset, segment.bytes, segment.file_offset);
+    }
+}
+std::vector<KvReadSegment> FileKvStore::plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
+                                                KvBlock & result, std::uint32_t prefix) {
     check_ready();
-    prepare_block(layer, head, block, length(layer), result);
+    if (prefix == 0) prepare_block(layer, head, block, length(layer), result);
+    else {
+        const auto first = block * geometry_.block_tokens;
+        (void) geometry_.block_offset(layer, head, block);
+        if (result.first_position != first || result.dimension != geometry_.dimension || result.layout != geometry_.layout ||
+            result.capacity != geometry_.block_tokens || result.data.size() != static_cast<std::size_t>(geometry_.block_tokens) * 2 * geometry_.dimension ||
+            prefix > result.valid_tokens || first >= length(layer)) {
+            throw std::invalid_argument("invalid KV read prefix");
+        }
+        result.valid_tokens = static_cast<std::uint32_t>(std::min<std::uint64_t>(geometry_.block_tokens, length(layer) - first));
+        result.version = result.valid_tokens;
+    }
+    std::vector<KvReadSegment> segments;
     const auto dimension = geometry_.dimension;
     const auto offset = geometry_.block_offset(layer, head, block);
     const auto committed = committed_[layer] <= result.first_position ? 0 :
         std::min<std::uint64_t>(result.valid_tokens, committed_[layer] - result.first_position);
-    if (committed > 0) {
+    if (committed > prefix) {
+        const auto bytes = (committed - prefix) * dimension * sizeof(Half);
         if (geometry_.layout == KvLayout::separate) {
-            read_exact(result.key(0), committed * dimension * sizeof(Half), offset);
-            read_exact(result.value(0), committed * dimension * sizeof(Half), offset + align_up(geometry_.plane_bytes(), geometry_.alignment));
+            segments.push_back({offset + prefix * dimension * sizeof(Half), prefix * dimension * sizeof(Half), static_cast<std::size_t>(bytes)});
+            segments.push_back({offset + align_up(geometry_.plane_bytes(), geometry_.alignment) + prefix * dimension * sizeof(Half),
+                                (static_cast<std::size_t>(geometry_.block_tokens) + prefix) * dimension * sizeof(Half), static_cast<std::size_t>(bytes)});
         } else {
-            read_exact(result.data.data(), committed * 2 * dimension * sizeof(Half), offset);
+            segments.push_back({offset + prefix * 2 * dimension * sizeof(Half), prefix * 2 * dimension * sizeof(Half), static_cast<std::size_t>(bytes * 2)});
         }
     }
     const auto & pending = pending_[layer];
-    for (std::uint32_t i = static_cast<std::uint32_t>(committed); i < result.valid_tokens; ++i) {
+    for (auto i = static_cast<std::uint32_t>(std::max<std::uint64_t>(committed, prefix)); i < result.valid_tokens; ++i) {
         const auto source = (result.first_position + i - pending.first) * token_elements_ + head * 2 * dimension;
         if (source + 2 * dimension > pending.values.size()) throw std::logic_error("KV dirty range mismatch");
         std::copy_n(pending.values.data() + source, dimension, result.key(i));
         std::copy_n(pending.values.data() + source + dimension, dimension, result.value(i));
     }
+    return segments;
 }
 void FileKvStore::flush() { for (std::uint32_t layer = 0; layer < geometry_.layers; ++layer) flush_layer(layer); }
 std::uint64_t FileKvStore::length(std::uint32_t layer) const { check_ready(); return lengths_.at(layer); }

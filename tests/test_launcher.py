@@ -9,6 +9,11 @@ spec.loader.exec_module(launcher)
 
 
 class LauncherTests(unittest.TestCase):
+    def test_prefetch_requires_uring_build_feature(self):
+        launcher.verify_features({}, {})
+        launcher.verify_features({"attention": {"prefetch": True}}, {"features": {"uring": True}})
+        with self.assertRaises(ValueError):
+            launcher.verify_features({"attention": {"prefetch": True}}, {"features": {"uring": False}})
     def test_sha256_matches_known_binary(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "input"

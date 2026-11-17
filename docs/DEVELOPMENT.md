@@ -28,6 +28,8 @@ bash scripts/check.sh --cuda
 
 构建依赖 Linux、CMake 3.22+、Ninja、C++17、Git 和 Python 3。CUDA 构建使用目标环境的 Toolkit，可通过 `CUDACXX` 指定编译器。
 
+Linux 默认启用 `SOLID_URING`，准备 `liburing-dev` 开发包。纯可移植核心构建可设置 `-DSOLID_URING=OFF`；预取入口检查对应构建特性。`bash scripts/check.sh --sanitize` 对核心库与配置运行地址、泄漏和未定义行为检查。
+
 `solid-baseline --build-info` 输出编译时的源码哈希。`scripts/run_baseline.py --check-build` 校验二进制与当前源码是否一致；启动实验前自动执行同一检查。
 
 ## 在实验环境运行原版基线
@@ -59,7 +61,10 @@ python3 scripts/run_baseline.py configs/baseline.local.json
 | `stdout.txt`、`stderr.txt` | 完整标准输出和后端日志 |
 | `selection.jsonl` | attention 路径每层、每轮、每 KV head 的实际选择范围 |
 | `selection.replay.jsonl` | 固定选择回放时的输入轨迹副本 |
+| `prefetch.jsonl`、`residency.jsonl` | `prefetch_trace=true` 时的主机预取与设备槽位生命周期 |
 
 启动脚本要求主仓库和上游源码已提交；本地配置与结果目录由 `.gitignore` 排除。内存采样间隔为 100 ms，manifest 标注采样峰值及 cgroup 范围；VRAM 和 KV 分配信息保留在后端日志中。
 
 交错布局、融合投影、固定集合消融与分项观测入口见 [阶段 2](phases/PHASE_2.md)。各阶段完成后整理的实现与检查证据见 [阶段记录](phases/README.md)。
+
+liburing 历史预取、同步参考对照与轨迹核查见 [阶段 3](phases/PHASE_3.md)。性能配置关闭 `prefetch_trace`、`profile` 和 `dump_logits`，保持同一输入与正式选择规则。

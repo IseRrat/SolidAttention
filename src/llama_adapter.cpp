@@ -1,5 +1,6 @@
 #include "solid/llama_adapter.hpp"
 #include "solid/projection.hpp"
+#include "solid/ggml_prefetch.hpp"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-graph.h"
@@ -42,8 +43,10 @@ struct AttentionNode::Impl {
     float scale;
     std::shared_ptr<AttentionFailure> failure;
     bool gathered;
+    GgmlPrefetch * prefetch;
     bool packed_inputs = false;
     ggml_tensor * host = nullptr;
+    std::uint64_t epoch = 0;
 
     static void compute(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith != 0) return;
@@ -62,7 +65,12 @@ struct AttentionNode::Impl {
                 inputs[source].resize(static_cast<std::size_t>(ggml_nelements(tensor)));
                 std::memcpy(inputs[source].data(), tensor->data, inputs[source].size() * sizeof(float));
             }
-            if (self.gathered) {
+            if (self.prefetch) {
+                const auto result = self.prefetch->decode(self.layer, self.frame->positions.front(), inputs[0], inputs[1], inputs[2], self.packed_inputs);
+                self.epoch = self.prefetch->attention_epoch();
+                if (result.size() != static_cast<std::size_t>(ggml_nelements(destination))) throw std::logic_error("prefetch mask shape");
+                std::memcpy(destination->data, result.data(), result.size() * sizeof(Half));
+            } else if (self.gathered) {
                 const auto result = self.session.gather(self.layer, self.frame->positions.front(), inputs[0], inputs[1], inputs[2], self.packed_inputs);
                 if (result.size() != static_cast<std::size_t>(ggml_nelements(destination))) throw std::logic_error("gather output shape");
                 std::memcpy(destination->data, result.data(), result.size() * sizeof(Half));
@@ -73,7 +81,12 @@ struct AttentionNode::Impl {
             }
         } catch (...) {
             self.failure->capture(std::current_exception(), self.layer, self.frame->positions.empty() ? 0 : self.frame->positions.front());
-            if (self.gathered) {
+            if (self.prefetch) {
+                self.epoch = self.prefetch->attention_epoch();
+                auto * data = static_cast<Half *>(destination->data);
+                std::fill_n(data, ggml_nelements(destination), Half{0xfc00});
+                for (std::uint32_t h = 0; h < self.session.query_heads(); ++h) data[h * self.prefetch->tokens_per_head()] = 0;
+            } else if (self.gathered) {
                 auto * data = static_cast<Half *>(destination->data);
                 std::fill_n(data, ggml_nelements(destination), Half{0});
                 const auto slots = self.session.gather_slots();
@@ -85,9 +98,11 @@ struct AttentionNode::Impl {
     }
 };
 AttentionNode::AttentionNode(AttentionSession & session, std::shared_ptr<AttentionFrame> frame,
-                            std::uint32_t layer, float scale, std::shared_ptr<AttentionFailure> failure, bool gathered) :
+                            std::uint32_t layer, float scale, std::shared_ptr<AttentionFailure> failure, bool gathered, GgmlPrefetch * prefetch) :
     impl_(std::make_unique<Impl>(Impl{session, std::move(frame), layer, scale,
-                                    failure ? std::move(failure) : std::make_shared<AttentionFailure>(), gathered})) {}
+                                    failure ? std::move(failure) : std::make_shared<AttentionFailure>(), gathered, prefetch})) {
+    if (prefetch && !gathered) throw std::invalid_argument("prefetch node requires decode attention");
+}
 AttentionNode::~AttentionNode() = default;
 ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, ggml_tensor * key, ggml_tensor * value,
                                   ggml_tensor * packed_kv, ggml_backend_sched * scheduler, ggml_backend * decode_backend) {
@@ -113,13 +128,29 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         input = ggml_cont(context, input);
     }
     if (impl_->gathered && query->ne[2] != 1) throw std::invalid_argument("gathered attention requires one decode token");
+    const auto elements = impl_->prefetch ? static_cast<std::uint64_t>(impl_->prefetch->tokens_per_head()) * impl_->session.query_heads() :
+                                          impl_->session.gather_elements();
     auto * result = ggml_custom_4d(context, impl_->gathered ? GGML_TYPE_F16 : GGML_TYPE_F32,
-                                   impl_->gathered ? static_cast<int64_t>(impl_->session.gather_elements()) : query->ne[0] * query->ne[1],
+                                   impl_->gathered ? static_cast<int64_t>(elements) : query->ne[0] * query->ne[1],
                                    impl_->gathered ? 1 : query->ne[2], 1, 1,
                                    inputs, packed_kv ? 2 : 3, Impl::compute, 1, impl_.get());
     ggml_set_name(result, "solid_sync_attention");
     impl_->host = result;
-    if (impl_->gathered) {
+    if (impl_->prefetch) {
+        const auto slots = impl_->prefetch->tokens_per_head();
+        auto * bank = impl_->prefetch->tensor();
+        const auto stride = static_cast<std::size_t>(g.dimension) * 2 * sizeof(Half);
+        auto * keys = ggml_view_3d(context, bank, g.dimension, slots, g.heads, stride, bank->nb[2], 0);
+        auto * values = ggml_view_3d(context, bank, g.dimension, slots, g.heads, stride, bank->nb[2], g.dimension * sizeof(Half));
+        auto * mask = ggml_view_3d(context, result, slots, 1, impl_->session.query_heads(), slots * sizeof(Half), slots * sizeof(Half), 0);
+        auto * q = query->type == GGML_TYPE_F32 ? query : ggml_cast(context, query, GGML_TYPE_F32);
+        q = ggml_permute(context, q, 0, 2, 1, 3);
+        result = ggml_flash_attn_ext(context, q, keys, values, mask, impl_->scale, 0, 0);
+        ggml_prec_set_acc(result, GGML_PREC_F32);
+        ggml_set_name(result, "solid_prefetched_flash_attention");
+        if (scheduler && decode_backend) ggml_backend_sched_set_tensor_backend(scheduler, result, decode_backend);
+        result = ggml_reshape_2d(context, result, g.dimension * impl_->session.query_heads(), 1);
+    } else if (impl_->gathered) {
         if (g.layout == KvLayout::interleaved && scheduler && decode_backend) {
             result = ggml_dup(context, result);
             ggml_set_name(result, "solid_kv_upload");
@@ -145,6 +176,7 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
 }
 void AttentionNode::check() const { impl_->failure->check(); }
 ggml_tensor * AttentionNode::host_node() const { return impl_->host; }
+void AttentionNode::complete_attention() { if (impl_->prefetch) impl_->prefetch->completed(impl_->epoch); }
 
 struct AttentionAdapter::Impl {
     const llama_model * model;
@@ -153,6 +185,9 @@ struct AttentionAdapter::Impl {
     bool gpu_decode;
     std::uint64_t prefill_tokens;
     std::vector<std::unique_ptr<KvProjection>> projections;
+    std::filesystem::path residency_trace;
+    ggml_backend_t prefetch_backend = nullptr;
+    std::unique_ptr<GgmlPrefetch> device;
 };
 AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionConfig & options,
                                   std::uint32_t capacity, std::uint64_t prefill_tokens, const std::filesystem::path & trace) :
@@ -172,6 +207,7 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
             hp.n_embd_head_k(layer) != geometry.dimension || hp.n_embd_head_v(layer) != geometry.dimension) {
             throw std::invalid_argument("adapter requires uniform layer geometry");
         }
+        if (options.prefetch && model->dev_layer(layer) != model->dev_layer(0)) throw std::invalid_argument("prefetch requires all attention layers on one backend");
     }
     if (options.fuse_kv_projection) {
         for (std::uint32_t id = 0; id < hp.n_layer(); ++id) {
@@ -205,7 +241,10 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     impl_->model = model;
     impl_->gpu_decode = options.gpu_decode;
     impl_->prefill_tokens = prefill_tokens;
-    impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens, trace, options.selection_replay);
+    impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens, trace,
+        options.selection_replay, options.prefetch ? make_uring_reader(options.prefetch_queue_depth) : nullptr,
+        options.prefetch_slots_per_head, options.prefetch_trace ? trace.parent_path() / "prefetch.jsonl" : std::filesystem::path{});
+    if (options.prefetch_trace) impl_->residency_trace = trace.parent_path() / "residency.jsonl";
     std::lock_guard<std::mutex> lock(registry_mutex);
     if (!registry.emplace(model, this).second) throw std::invalid_argument("one attention session per model is supported");
 }
@@ -215,12 +254,33 @@ AttentionAdapter::~AttentionAdapter() {
 }
 void AttentionAdapter::check() const { impl_->failure->check(); }
 void AttentionAdapter::flush() { check(); impl_->session->flush(); }
-void AttentionAdapter::finish() { check(); impl_->session->finish(); }
+void AttentionAdapter::finish() { check(); quiesce(); impl_->session->finish(); }
 SessionStats AttentionAdapter::stats() const { check(); return impl_->session->stats(); }
 SparseBudget AttentionAdapter::budget() const { return impl_->session->budget(); }
-std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionFrame> frame, std::uint32_t layer, float scale, bool gathered) {
-    return std::make_unique<AttentionNode>(*impl_->session, std::move(frame), layer, scale, impl_->failure, gathered);
+std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionFrame> frame, std::uint32_t layer, float scale,
+                                                    bool gathered, ggml_backend_t backend) {
+    if (gathered && prefetch_enabled()) {
+        if (!backend) throw std::logic_error("prefetch decode backend is required");
+        if (!impl_->device) {
+            impl_->device = std::make_unique<GgmlPrefetch>(*impl_->session, backend, impl_->residency_trace);
+            impl_->prefetch_backend = backend;
+        } else if (impl_->prefetch_backend != backend) throw std::logic_error("prefetch decode backend changed");
+    }
+    return std::make_unique<AttentionNode>(*impl_->session, std::move(frame), layer, scale, impl_->failure, gathered,
+                                          gathered ? impl_->device.get() : nullptr);
 }
+bool AttentionAdapter::prefetch_enabled() const { return impl_->session->prefetch_enabled(); }
+void AttentionAdapter::begin_prefetch(std::uint32_t layer, std::uint64_t position) { check(); impl_->session->begin_prefetch(layer, position); }
+bool AttentionAdapter::observe(ggml_tensor * tensor, bool ask) noexcept {
+    const bool ours = tensor->op == GGML_OP_FLASH_ATTN_EXT && std::strcmp(ggml_get_name(tensor), "solid_prefetched_flash_attention") == 0;
+    if (ask) return ours;
+    if (!ours) return true;
+    try { if (impl_->device) impl_->device->completed(impl_->device->attention_epoch()); }
+    catch (...) { impl_->failure->capture(std::current_exception()); return false; }
+    return true;
+}
+void AttentionAdapter::quiesce() { if (impl_->device) impl_->device->quiesce(); }
+DeviceCacheStats AttentionAdapter::device_stats() const { return impl_->device ? impl_->device->stats() : DeviceCacheStats{}; }
 bool AttentionAdapter::gathered_decode(std::uint64_t position) const { return impl_->gpu_decode && position >= impl_->prefill_tokens; }
 bool AttentionAdapter::fused_projection() const { return !impl_->projections.empty(); }
 const KvProjection & AttentionAdapter::projection(std::uint32_t layer) const { return *impl_->projections.at(layer); }
@@ -255,6 +315,7 @@ public:
             }
             frame->positions[i] = static_cast<std::uint64_t>(batch->pos[i]);
         }
+        if (batch->n_tokens == 1) adapter.begin_prefetch(0, frame->positions.front());
     }
     bool can_reuse(const llm_graph_params &) override { return false; }
     AttentionAdapter & adapter;
@@ -301,7 +362,6 @@ ggml_tensor * adapter_attention(const llm_graph_context & graph, llm_graph_input
     if (!custom || layer < 0) throw std::logic_error("invalid attention graph input");
     const bool gathered = query->ne[2] == 1 && graph.ubatch.pos && graph.ubatch.pos[0] >= 0 &&
         custom->adapter.gathered_decode(static_cast<std::uint64_t>(graph.ubatch.pos[0]));
-    auto node = custom->adapter.node(custom->frame, static_cast<std::uint32_t>(layer), scale, gathered);
     ggml_tensor * packed = nullptr;
     if (custom->adapter.fused_projection()) {
         packed = KvProjection::update_key(graph.ctx0, custom->projected_kv.at(layer), key);
@@ -311,6 +371,7 @@ ggml_tensor * adapter_attention(const llm_graph_context & graph, llm_graph_input
         auto * candidate = ggml_backend_sched_get_backend(graph.sched, i);
         if (ggml_backend_get_device(candidate) == graph.model.dev_layer(layer)) { device = candidate; break; }
     }
+    auto node = custom->adapter.node(custom->frame, static_cast<std::uint32_t>(layer), scale, gathered, device);
     auto * result = node->build(graph.ctx0, query, key, value, packed, graph.sched, device);
     ggml_backend_sched_set_tensor_backend(graph.sched, node->host_node(), graph.backend_cpu);
     custom->nodes.push_back(std::move(node));

@@ -15,6 +15,7 @@
 7. [构建与检查](docs/DEVELOPMENT.md)：代码构建、单元检查和实验环境运行入口。
 8. [同步 SSD 路径](docs/SSD_PATH.md)：内存/SSD 模式、选块规则、文件格式和固定 token 对照。
 9. [阶段完成记录](docs/phases/README.md)：各阶段完成后的代码入口、检查证据与核查步骤。
+10. [历史预取与纠错](docs/phases/PHASE_3.md)：liburing、DRAM/VRAM 租约、纠错轨迹和同步参考核查。
 9. [阶段完成记录](docs/phases/README.md)：各阶段完成后的代码入口、检查证据与核查步骤。
 
 ## 系统机制

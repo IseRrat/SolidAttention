@@ -19,6 +19,9 @@
 | D13 | 文件块和 attention 工作集共用布局开关；交错读取保留 `[B,2,D]`，attention 使用 stride 视图 | 阶段 2，interleaved-layout、gathered-flash-attention |
 | D14 | 同类型融合权重保留完整量化行；混合类型逐行转为 FP32；额外 buffer 单独记录 | 阶段 2，fused-kv-projection |
 | D15 | 消融独立控制布局和投影，回放相同输入与选择集合；分项观测采用统一同步模式 | 阶段 2，layout_ablation.py、execution-profile |
+| D16 | liburing 原 READ CQE 结束主机槽位写入期；取消 CQE 单独统计，短读按剩余部分继续 | 阶段 3，uring-io、prefetch-and-residency |
+| D17 | DRAM 与设备各用固定槽位表；复制完成释放主机 pin，attention 完成释放设备 pin，纠错保持有效块原位 | 阶段 3，DeviceCache、prefetched-flash-attention |
+| D18 | 预取尾块先完成原读取，再以新 generation 保留不可变前缀、补齐最新行；详细轨迹由独立开关控制 | 阶段 3，plan_read、prefetch_trace |
 
 ## 参数锁定任务
 

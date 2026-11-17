@@ -2,6 +2,7 @@
 
 #include "solid/config.hpp"
 #include "solid/session.hpp"
+#include "solid/device_cache.hpp"
 #include <exception>
 #include <memory>
 #include <mutex>
@@ -33,13 +34,14 @@ private:
 class AttentionNode {
 public:
     AttentionNode(AttentionSession & session, std::shared_ptr<AttentionFrame> frame, std::uint32_t layer,
-                  float scale, std::shared_ptr<AttentionFailure> failure = {}, bool gathered = false);
+                  float scale, std::shared_ptr<AttentionFailure> failure = {}, bool gathered = false, class GgmlPrefetch * prefetch = nullptr);
     ~AttentionNode();
     ggml_tensor * build(ggml_context * context, ggml_tensor * query, ggml_tensor * key, ggml_tensor * value,
                        ggml_tensor * packed_kv = nullptr, ggml_backend_sched * scheduler = nullptr,
                        ggml_backend * decode_backend = nullptr);
     void check() const;
     ggml_tensor * host_node() const;
+    void complete_attention();
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
@@ -57,13 +59,19 @@ public:
     void finish();
     SessionStats stats() const;
     SparseBudget budget() const;
-    std::unique_ptr<AttentionNode> node(std::shared_ptr<AttentionFrame> frame, std::uint32_t layer, float scale, bool gathered = false);
+    std::unique_ptr<AttentionNode> node(std::shared_ptr<AttentionFrame> frame, std::uint32_t layer, float scale,
+                                      bool gathered = false, ggml_backend * backend = nullptr);
     bool gathered_decode(std::uint64_t position) const;
     bool fused_projection() const;
     const class KvProjection & projection(std::uint32_t layer) const;
     std::uint64_t projection_buffer_bytes() const;
     std::uint64_t projection_initialization_ns() const;
     std::vector<std::string> projection_weight_types() const;
+    bool prefetch_enabled() const;
+    void begin_prefetch(std::uint32_t layer, std::uint64_t position);
+    bool observe(ggml_tensor * tensor, bool ask) noexcept;
+    void quiesce();
+    DeviceCacheStats device_stats() const;
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;

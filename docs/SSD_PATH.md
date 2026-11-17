@@ -14,6 +14,7 @@
 | `offload-interleaved.json` | SSD dense，交错布局与融合 KV 投影 |
 | `offload-sparse-interleaved.json` | SSD sparse，交错布局与融合 KV 投影 |
 | `indram-sparse-interleaved.json` | 内存 sparse，交错工作集与融合 KV 投影 |
+| `offload-prefetch.json` | SSD sparse，liburing 历史预取、版本化主机/设备槽位与补读纠错 |
 
 `attention.gpu_decode=false` 将 decode 切换到 CPU 流式数值参考。Flash Attention 的计算后端随模型层的分配，由 GGML 调度；选块和同步文件读取在 CPU 执行。
 
@@ -28,6 +29,8 @@
 - `AttentionAdapter::check()` 在每次计算完成后传递 I/O、位置和数值错误；`flush()` 完成 prefill 与请求末尾的回写。
 
 阶段 2 的 `layout`、`fuse_kv_projection`、`profile` 和 `selection_replay` 字段控制交错布局、单次 KV 投影、分项计时及固定集合回放。实现、数据形状和四组消融入口见 [阶段 2 完成记录](phases/PHASE_2.md)。
+
+阶段 3 的 `prefetch` 接入 liburing 与固定设备块槽位，正式选择通过物理槽位 mask 进入 attention。配置、完成事件、取消协议与对照步骤见 [阶段 3 完成记录](phases/PHASE_3.md)。
 
 入口支持 Llama、Qwen2 的单序列文本 decode、统一层形状和 FP16 KV。模型形状在 adapter 构造时检查。每个模型绑定一个会话，位置从 0 连续追加。
 

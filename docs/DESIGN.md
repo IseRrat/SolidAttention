@@ -94,6 +94,8 @@ unused = predicted - actual
 
 取消请求提交后，槽位保持占用直至原操作完成或确认取消。generation 用于通知归属校验；物理写入完成状态控制缓冲区释放。预测数量按剩余容量裁剪，实际集合容量在提交前检查。
 
+阶段 3 的 liburing 路径以原 READ CQE 结束内核写入期。主机槽位和设备槽位分别管理 producer/readers；H2D 完成事件释放主机源租约，Flash Attention 后端同步后释放设备读者。尾块等待旧读取完成后保留不可变前缀并补齐新行，设备 mask 按实际物理槽位构建。代码、容量公式和完成记录见 [阶段 3](phases/PHASE_3.md)。
+
 ## 8. SSD-aware 调度
 
 微任务包括 Q 投影、KV 投影、选择、SSD 读取、H2D、attention、D2H、SSD 回写和 FFN。每条任务依赖使用完成事件表达：

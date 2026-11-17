@@ -132,7 +132,8 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     if (j.contains("attention")) {
         const auto & a = j.at("attention");
         const std::set<std::string> allowed = {"storage", "sparse", "gpu_decode", "layout", "fuse_kv_projection", "profile", "block_tokens", "context_budget_tokens",
-            "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "selection_replay"};
+            "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "selection_replay",
+            "prefetch", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head"};
         if (!a.is_object()) throw std::invalid_argument("attention must be an object");
         for (const auto & item : a.items()) if (allowed.count(item.key()) == 0) throw std::invalid_argument("unknown attention key: " + item.key());
         auto & target = result.attention;
@@ -153,6 +154,17 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
             target.selection_replay = resolve(base, a.at("selection_replay").get<std::string>());
         }
         if (a.contains("gpu_decode")) target.gpu_decode = a.at("gpu_decode").get<bool>();
+        if (a.contains("prefetch")) target.prefetch = a.at("prefetch").get<bool>();
+        if (a.contains("prefetch_trace")) target.prefetch_trace = a.at("prefetch_trace").get<bool>();
+        if (a.contains("prefetch_queue_depth")) {
+            target.prefetch_queue_depth = positive(a, "prefetch_queue_depth");
+            if (target.prefetch_queue_depth < 2 || target.prefetch_queue_depth > 16384) throw std::invalid_argument("prefetch_queue_depth must be in [2,16384]");
+        }
+        if (a.contains("prefetch_slots_per_head")) target.prefetch_slots_per_head = positive(a, "prefetch_slots_per_head");
+        if (target.prefetch && (target.in_memory || !target.sparse || !target.interleaved || !target.gpu_decode)) {
+            throw std::invalid_argument("prefetch requires SSD sparse interleaved storage and GGML decode");
+        }
+        if (!target.prefetch && (a.contains("prefetch_queue_depth") || a.contains("prefetch_slots_per_head") || a.contains("prefetch_trace"))) throw std::invalid_argument("prefetch options require prefetch=true");
         if (a.contains("block_tokens")) target.block_tokens = positive(a, "block_tokens");
         if (a.contains("representative_count")) target.representative_count = positive(a, "representative_count");
         if (target.representative_count > target.block_tokens) throw std::invalid_argument("representative_count exceeds block_tokens");
@@ -169,6 +181,9 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
             }
         } else if (a.contains("init_tokens") || a.contains("local_tokens")) {
             throw std::invalid_argument("explicit init/local require context_budget_tokens");
+        }
+        if (target.prefetch_slots_per_head > (static_cast<std::uint64_t>(result.context_tokens) + target.block_tokens - 1) / target.block_tokens) {
+            throw std::invalid_argument("prefetch_slots_per_head exceeds context block count");
         }
         target.session_file = a.contains("session_file") ? resolve(base, a.at("session_file").get<std::string>()) :
             result.output.parent_path() / "kv.cache";

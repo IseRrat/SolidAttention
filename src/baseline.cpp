@@ -93,6 +93,28 @@ struct BackendLifetime {
     BackendLifetime() { ggml_backend_load_all(); llama_backend_init(); }
     ~BackendLifetime() { llama_backend_free(); }
 };
+struct EvaluationBridge {
+    solid::AttentionAdapter * adapter;
+    solid::ExecutionProfile * profile;
+    static bool evaluate(ggml_tensor * tensor, bool ask, void * userdata) {
+        auto & self = *static_cast<EvaluationBridge *>(userdata);
+        const bool a = self.adapter ? self.adapter->observe(tensor, ask) : !ask;
+        const bool p = self.profile ? solid::ExecutionProfile::evaluate(tensor, ask, self.profile) : !ask;
+        return ask ? a || p : a && p;
+    }
+};
+struct AdapterContextLifetime {
+    llama_context * context;
+    solid::AttentionAdapter * adapter;
+    ~AdapterContextLifetime() {
+        if (adapter) {
+            llama_synchronize(context);
+            // quiesce drains device writes before reporting trace errors; retain
+            // the original run error while the context is being unwound.
+            try { adapter->quiesce(); } catch (...) {}
+        }
+    }
+};
 } // namespace
 
 int main(int argc, char ** argv) {
@@ -161,10 +183,6 @@ int main(int argc, char ** argv) {
         cp.flash_attn_type = config.flash_attention ? LLAMA_FLASH_ATTN_TYPE_ENABLED : LLAMA_FLASH_ATTN_TYPE_DISABLED;
         cp.offload_kqv = config.kv_on_gpu;
         cp.no_perf = false;
-        if (config.attention.profile) {
-            cp.cb_eval = solid::ExecutionProfile::evaluate;
-            cp.cb_eval_user_data = &profile;
-        }
         std::unique_ptr<solid::AttentionAdapter> adapter;
         const auto adapter_start = Clock::now();
         if (config.attention.enabled) {
@@ -173,9 +191,15 @@ int main(int argc, char ** argv) {
                        tokens.size(), config.output.parent_path() / "selection.jsonl");
         }
         const double adapter_ms = milliseconds(adapter_start);
+        EvaluationBridge evaluation{adapter.get(), config.attention.profile ? &profile : nullptr};
+        if (config.attention.profile || config.attention.prefetch) {
+            cp.cb_eval = EvaluationBridge::evaluate;
+            cp.cb_eval_user_data = &evaluation;
+        }
         const auto context_start = Clock::now();
         std::unique_ptr<llama_context, decltype(&llama_free)> ctx(llama_init_from_model(model.get(), cp), llama_free);
         if (!ctx) throw std::runtime_error("context initialization failed");
+        AdapterContextLifetime adapter_context{ctx.get(), adapter.get()};
         const double context_ms = milliseconds(context_start);
         std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> batch(llama_batch_ext_init(ctx.get()), llama_batch_ext_free);
         if (!batch) throw std::runtime_error("batch allocation failed");
@@ -267,10 +291,12 @@ int main(int argc, char ** argv) {
         if (adapter) {
             const auto stats = adapter->stats();
             const auto budget = adapter->budget();
+            const auto device = adapter->device_stats();
             result["attention"] = {
                 {"storage", config.attention.in_memory ? "memory" : "ssd"}, {"sparse", config.attention.sparse},
                 {"layout", config.attention.interleaved ? "interleaved" : "separate"},
                 {"fuse_kv_projection", config.attention.fuse_kv_projection},
+                {"prefetch", config.attention.prefetch},
                 {"projection_extra_weight_bytes", adapter->projection_buffer_bytes()},
                 {"projection_initialization_ms", adapter->projection_initialization_ns() / 1e6},
                 {"projection_weight_types", adapter->projection_weight_types()},
@@ -283,13 +309,40 @@ int main(int argc, char ** argv) {
                 {"attention_queries", stats.attention_queries}, {"selected_tokens", stats.selected_tokens},
                 {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"kv_buffer_bytes", stats.kv_resident_bytes},
                 {"representative_buffer_bytes", stats.representative_bytes},
-                {"read_requests", stats.io.read_requests}, {"read_bytes", stats.io.read_bytes},
+                {"read_requests", stats.io.read_requests + stats.prefetch.io.read_requests},
+                {"read_bytes", stats.io.read_bytes + stats.prefetch.io.read_bytes},
                 {"write_requests", stats.io.write_requests}, {"write_bytes", stats.io.write_bytes},
                 {"io_read_ms", stats.io.read_ns / 1e6}, {"io_write_ms", stats.io.write_ns / 1e6},
                 {"append_ms", stats.append_ns / 1e6}, {"selection_ms", stats.selection_ns / 1e6},
                 {"gather_inclusive_ms", stats.gather_ns / 1e6}, {"gather_copy_bytes", stats.gather_copy_bytes},
                 {"streaming_attention_inclusive_ms", stats.streaming_attention_ns / 1e6}
             };
+            if (config.attention.prefetch) {
+                result["prefetch"] = {
+                    {"io_engine", "liburing"}, {"queue_depth", config.attention.prefetch_queue_depth},
+                    {"slots_per_head", stats.prefetch.slots_per_head},
+                    {"trace_enabled", config.attention.prefetch_trace},
+                    {"predicted_blocks", stats.prefetch.predicted_blocks}, {"ready_hits", stats.prefetch.ready_hits},
+                    {"inflight_hits", stats.prefetch.inflight_hits}, {"missing_blocks", stats.prefetch.missing_blocks},
+                    {"unused_blocks", stats.prefetch.unused_blocks}, {"refreshed_blocks", stats.prefetch.refreshed_blocks},
+                    {"stale_completions", stats.prefetch.stale_completions}, {"host_buffer_bytes", stats.prefetch.host_bytes},
+                    {"wait_ms", stats.prefetch.wait_ns / 1e6}, {"resolve_inclusive_ms", stats.prefetch.resolve_ns / 1e6},
+                    {"async_read_requests", stats.prefetch.io.read_requests}, {"async_read_bytes", stats.prefetch.io.read_bytes},
+                    {"completed_reads", stats.prefetch.io.completed_reads}, {"cancel_requests", stats.prefetch.io.cancel_requests},
+                    {"cancel_completions", stats.prefetch.io.cancel_completions}, {"read_completion_latency_sum_ms", stats.prefetch.io.completion_ns / 1e6},
+                    {"cancel_successes", stats.prefetch.io.cancel_successes}, {"cancel_not_found", stats.prefetch.io.cancel_not_found},
+                    {"cancel_busy", stats.prefetch.io.cancel_busy}, {"cancel_errors", stats.prefetch.io.cancel_errors},
+                    {"device_uploads", device.uploads}, {"device_upload_bytes", device.upload_bytes},
+                    {"device_reused_blocks", device.reused_blocks}, {"device_overwritten_blocks", device.overwritten_blocks},
+                    {"device_stale_events", device.stale_events}, {"device_buffer_bytes", device.resident_bytes}
+                };
+                const auto prefetch_trace = config.output.parent_path() / "prefetch.jsonl";
+                if (config.attention.prefetch_trace) result["prefetch_trace_sha256"] = solid::sha256_file(prefetch_trace);
+                // A one-output request completes in prefill and creates the device
+                // cache only when a decode graph is built.
+                const auto residency = config.output.parent_path() / "residency.jsonl";
+                if (std::filesystem::exists(residency)) result["residency_trace_sha256"] = solid::sha256_file(residency);
+            }
             result["selection_trace_sha256"] = solid::sha256_file(config.output.parent_path() / "selection.jsonl");
             if (!config.attention.selection_replay.empty()) result["selection_replay_sha256"] = solid::sha256_file(config.attention.selection_replay);
         }

@@ -71,6 +71,11 @@ def verify_build_info(info, root=ROOT):
             raise ValueError(f"runner was built from different source: {name}")
 
 
+def verify_features(config, info):
+    if config.get("attention", {}).get("prefetch") and not info.get("features", {}).get("uring"):
+        raise ValueError("prefetch requires a runner built with SOLID_URING=ON")
+
+
 def atomic_json(path, data):
     temporary = path.with_suffix(path.suffix + ".tmp")
     with temporary.open("w", encoding="utf-8", newline="\n") as stream:
@@ -126,6 +131,7 @@ def main():
     config_path = args.config.resolve(strict=True)
     subprocess.run([str(runner), "--validate-config", str(config_path)], check=True)
     config = json.loads(config_path.read_text(encoding="utf-8"))
+    verify_features(config, build_info)
     for key in ("model", "prompt", "output"):
         config[key] = str((config_path.parent / config[key]).resolve())
     if "session_file" in config.get("attention", {}):

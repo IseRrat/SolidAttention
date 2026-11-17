@@ -53,6 +53,16 @@ int main() {
         if (!interleaved.interleaved || !interleaved.fuse_kv_projection || !interleaved.profile) throw std::runtime_error("layout configuration parsing");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"unknown\"}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"fuse_kv_projection\":1}}");
+        const auto async_mode = ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"interleaved\",\"prefetch\":true";
+        write(prefix + async_mode + ",\"prefetch_queue_depth\":2,\"prefetch_slots_per_head\":4}}");
+        if (!solid::RunConfig::load(config).attention.prefetch) throw std::runtime_error("prefetch config parsing");
+        reject(prefix + async_mode + ",\"prefetch_queue_depth\":1}}");
+        reject(prefix + async_mode + ",\"prefetch_slots_per_head\":1000}}");
+        reject(prefix + async_mode + ",\"gpu_decode\":false}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"memory\",\"sparse\":true,\"layout\":\"interleaved\",\"prefetch\":true}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":false,\"layout\":\"interleaved\",\"prefetch\":true}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"prefetch\":true}}");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"prefetch_queue_depth\":4}}");
         auto change = [&](const std::string & from, const std::string & to) {
             auto content = prefix + "}";
             content.replace(content.find(from), from.size(), to);

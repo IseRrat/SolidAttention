@@ -17,11 +17,18 @@ std::uint64_t elapsed(Clock::time_point start) {
 }
 AttentionSession::AttentionSession(std::unique_ptr<KvStore> store, std::uint32_t query_heads, SparseBudget budget,
                                    bool sparse, std::uint64_t prefill_tokens, const std::filesystem::path & selection_trace,
-                                   const std::filesystem::path & selection_replay) :
+                                   const std::filesystem::path & selection_replay, std::unique_ptr<AsyncReader> reader,
+                                   std::uint32_t prefetch_slots_per_head, const std::filesystem::path & prefetch_trace) :
     store_(std::move(store)), query_heads_(query_heads), budget_(budget), sparse_(sparse), prefill_tokens_(prefill_tokens) {
     if (!store_ || query_heads == 0 || query_heads % store_->geometry().heads != 0 ||
         prefill_tokens == 0 || prefill_tokens > store_->geometry().capacity_tokens) throw std::invalid_argument("invalid attention session");
     if (sparse_) representatives_ = std::make_unique<RepresentativeIndex>(store_->geometry(), query_heads, budget);
+    if (reader) {
+        if (!sparse_ || geometry().layout != KvLayout::interleaved) throw std::invalid_argument("prefetch requires sparse interleaved KV");
+        if (!prefetch_slots_per_head) prefetch_slots_per_head = static_cast<std::uint32_t>(std::min<std::uint64_t>(geometry().blocks_per_head(),
+            (static_cast<std::uint64_t>(budget.total) + geometry().block_tokens - 1) / geometry().block_tokens + 3));
+        prefetch_ = std::make_unique<Prefetcher>(*store_, budget, prefetch_slots_per_head, std::move(reader), prefetch_trace);
+    }
     if (!selection_replay.empty()) {
         if (!sparse_) throw std::invalid_argument("selection replay requires sparse attention");
         if (!selection_trace.empty() && std::filesystem::weakly_canonical(selection_trace) == std::filesystem::weakly_canonical(selection_replay)) {
@@ -174,6 +181,33 @@ std::vector<Half> AttentionSession::gather(std::uint32_t layer, std::uint64_t po
         return packed;
     } catch (...) { failed_ = true; throw; }
 }
+Prefetcher & AttentionSession::prefetcher() {
+    if (!prefetch_) throw std::logic_error("prefetch is disabled");
+    return *prefetch_;
+}
+void AttentionSession::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
+    if (failed_) throw std::runtime_error("attention session failed");
+    if (prefetch_ && position >= prefill_tokens_ && position < geometry().capacity_tokens) {
+        try { prefetch_->begin(layer, position); } catch (...) { failed_ = true; throw; }
+    }
+}
+std::vector<HeadSelection> AttentionSession::select_decode(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
+                                                          const std::vector<float> & keys, const std::vector<float> & values, bool interleaved_inputs) {
+    if (failed_) throw std::runtime_error("attention session failed");
+    if (!prefetch_ || position < prefill_tokens_ || query.size() != static_cast<std::size_t>(query_heads_) * geometry().dimension ||
+        keys.size() != static_cast<std::size_t>(geometry().heads) * geometry().dimension * (interleaved_inputs ? 2 : 1) ||
+        (interleaved_inputs ? !values.empty() : values.size() != keys.size())) throw std::invalid_argument("invalid prefetched decode input");
+    try {
+        append_token(layer, position, query, keys.data(), interleaved_inputs ? nullptr : values.data());
+        const auto start = Clock::now();
+        auto selected = select(layer, position, query);
+        stats_.selection_ns += elapsed(start);
+        record(layer, position, selected);
+        for (const auto & head : selected) stats_.selected_tokens += head.positions.size();
+        ++stats_.attention_queries;
+        return selected;
+    } catch (...) { failed_ = true; throw; }
+}
 void AttentionSession::record(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & selection) {
     if (!trace_.is_open()) return;
     for (std::size_t head = 0; head < selection.size(); ++head) {
@@ -244,6 +278,7 @@ void AttentionSession::flush() {
     } catch (...) { failed_ = true; throw; }
 }
 void AttentionSession::finish() {
+    if (prefetch_) prefetch_->finish();
     flush();
     if (replay_.is_open()) {
         replay_ >> std::ws;
@@ -258,6 +293,7 @@ SessionStats AttentionSession::stats() const {
     result.kv_resident_bytes = store_->resident_bytes();
     result.representative_bytes = representatives_ ? representatives_->resident_bytes() : 0;
     result.io = store_->io_stats();
+    if (prefetch_) result.prefetch = prefetch_->stats();
     return result;
 }
 } // namespace solid

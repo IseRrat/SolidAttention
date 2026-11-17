@@ -55,3 +55,17 @@ bash scripts/check.sh --cuda
 最终入口 `bash scripts/check.sh --cuda` 通过 CUDA 编译、17 项 CTest、14 项 Python 检查及源码指纹核对。数学检查使用 CPU 后端与合成张量，文件检查使用临时文件。模型数值、CUDA 运行与设备性能的实验环境入口见 [阶段 2 完成记录](phases/PHASE_2.md)。
 
 `bash scripts/check.sh --unit-only` 的 Debug 核心构建、3 项 CTest 和 14 项 Python 检查通过。15 篇 Markdown 的本地链接、标题锚点、代码块与文风检查通过，配置 JSON 解析通过。
+
+## 2026-11-17：历史预取与纠错
+
+| 检查范围 | 证据 |
+| --- | --- |
+| liburing 2.5 | 临时文件、有限队列、短读/EOF、原 READ 与取消 CQE、取消排空 |
+| 历史预测与纠错 | 按层/头的历史、冷启动、命中、全错 selected、在途命中、缺块补读与容量拒绝 |
+| 版本与顺序 | 尾块不可变前缀、脏行转发、逆序完成、取消确认先到、旧 generation 与重复通知 |
+| DRAM/设备租约 | H2D pin、attention pin、完成后释放、有效块原位与 payload 保留 |
+| 计算图 | 两层 GQA、真实 liburing/内存读取、任意物理槽位 mask、CPU Flash Attention 对同步稀疏参考 |
+| 完成与清理 | GGML scheduler 完成回调、独立/交错多片段 I/O 失败、缓冲区排空 |
+| 配置与工具 | 预取选项与构建特性、固定输入、选择差异、覆盖/epoch 审计及运行来源 |
+
+`bash scripts/check.sh --cuda` 通过 CUDA 编译与链接、21 项 CTest、19 项 Python 检查和源码指纹核对。`bash scripts/check.sh --sanitize` 的 5 项核心 CTest 与地址、泄漏、未定义行为检查通过。输入为合成张量与临时文件，数学计算使用 CPU 后端。模型与设备实验入口见 [阶段 3 完成记录](phases/PHASE_3.md)。

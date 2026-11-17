@@ -20,6 +20,10 @@ struct AttentionConfig {
     bool interleaved = false;
     bool fuse_kv_projection = false;
     bool profile = false;
+    bool prefetch = false;
+    bool prefetch_trace = false;
+    std::uint32_t prefetch_queue_depth = 64;
+    std::uint32_t prefetch_slots_per_head = 0;
     std::uint32_t block_tokens = 32;
     std::uint32_t context_budget_tokens = 0;
     std::uint32_t init_tokens = 0;

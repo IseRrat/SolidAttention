@@ -1,6 +1,7 @@
 #pragma once
 
 #include "solid/attention.hpp"
+#include "solid/prefetch.hpp"
 #include <fstream>
 #include <memory>
 
@@ -17,13 +18,15 @@ struct SessionStats {
     std::uint64_t gather_ns = 0;
     std::uint64_t gather_copy_bytes = 0;
     std::uint64_t streaming_attention_ns = 0;
+    PrefetchStats prefetch;
 };
 
 class AttentionSession {
 public:
     AttentionSession(std::unique_ptr<KvStore> store, std::uint32_t query_heads, SparseBudget budget,
                      bool sparse, std::uint64_t prefill_tokens, const std::filesystem::path & selection_trace = {},
-                     const std::filesystem::path & selection_replay = {});
+                     const std::filesystem::path & selection_replay = {}, std::unique_ptr<AsyncReader> reader = {},
+                     std::uint32_t prefetch_slots_per_head = 0, const std::filesystem::path & prefetch_trace = {});
     std::vector<float> process(std::uint32_t layer, std::uint64_t first_position, std::size_t tokens,
                                const std::vector<float> & queries, const std::vector<float> & keys,
                                const std::vector<float> & values, float scale, bool interleaved_inputs = false);
@@ -37,9 +40,16 @@ public:
     const KvGeometry & geometry() const { return store_->geometry(); }
     std::uint32_t query_heads() const { return query_heads_; }
     SparseBudget budget() const { return budget_; }
+    bool prefetch_enabled() const { return prefetch_ != nullptr; }
+    Prefetcher & prefetcher();
+    void begin_prefetch(std::uint32_t layer, std::uint64_t position);
+    std::vector<HeadSelection> select_decode(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
+                                            const std::vector<float> & keys, const std::vector<float> & values,
+                                            bool interleaved_inputs = false);
 private:
     std::unique_ptr<KvStore> store_;
     std::unique_ptr<RepresentativeIndex> representatives_;
+    std::unique_ptr<Prefetcher> prefetch_;
     std::uint32_t query_heads_;
     SparseBudget budget_;
     bool sparse_;

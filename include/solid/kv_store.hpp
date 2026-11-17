@@ -53,12 +53,19 @@ struct IoStats {
     std::uint64_t write_ns = 0;
 };
 
+struct KvReadSegment {
+    std::uint64_t file_offset = 0;
+    std::size_t buffer_offset = 0;
+    std::size_t bytes = 0;
+};
+
 class RandomAccessFile {
 public:
     virtual ~RandomAccessFile() = default;
     virtual std::size_t read_at(void * destination, std::size_t bytes, std::uint64_t offset) = 0;
     virtual std::size_t write_at(const void * source, std::size_t bytes, std::uint64_t offset) = 0;
     virtual void resize(std::uint64_t bytes) = 0;
+    virtual int native_handle() const { return -1; }
 };
 
 std::unique_ptr<RandomAccessFile> create_session_file(const std::filesystem::path & path, bool remove_on_close);
@@ -77,6 +84,11 @@ public:
     virtual std::uint64_t length(std::uint32_t layer) const = 0;
     virtual std::uint64_t resident_bytes() const = 0;
     virtual IoStats io_stats() const { return {}; }
+    virtual int native_handle() const { return -1; }
+    // Existing rows [0,prefix) are immutable. Only the newly committed suffix
+    // requires I/O; dirty suffix rows are forwarded before submission.
+    virtual std::vector<KvReadSegment> plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
+                                                KvBlock & destination, std::uint32_t prefix = 0);
 protected:
     KvGeometry geometry_;
     void validate_append(std::uint32_t layer, std::uint64_t position, std::uint64_t length,
@@ -109,6 +121,9 @@ public:
     std::uint64_t resident_bytes() const override;
     IoStats io_stats() const override { return stats_; }
     bool failed() const { return failed_; }
+    int native_handle() const override { return file_->native_handle(); }
+    std::vector<KvReadSegment> plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
+                                        KvBlock & destination, std::uint32_t prefix = 0) override;
 private:
     struct Pending {
         std::uint64_t first = 0;

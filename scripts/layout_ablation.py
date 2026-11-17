@@ -35,6 +35,9 @@ def create(reference, destination, results, profile=False):
     config = prepare(reference, reference.parent / "config.json", results / "unused/result.json")
     base = config["attention"]
     base.pop("session_file", None)
+    for key in ("prefetch_queue_depth", "prefetch_slots_per_head", "prefetch_trace"):
+        base.pop(key, None)
+    base["prefetch"] = False
     base["keep_session_file"] = False
     base["selection_replay"] = str(selection)
     base["profile"] = profile
