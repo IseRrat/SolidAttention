@@ -106,3 +106,15 @@ bash scripts/check.sh --cuda
 `bash scripts/check.sh --cuda` 通过 CUDA 编译与链接、29 项 CTest、42 项 Python 检查和最终源码指纹核对。`--sanitize` 的 6 项核心 CTest、地址、泄漏与未定义行为检查通过。18 篇 Markdown 的链接、标题锚点、代码块、文风及配置 JSON 检查通过。
 
 新增验证使用零张量 GGUF、合成 token/logits、假进程与临时文件。绘图依赖安装在已忽略的构建目录，合成 PNG/PDF 完成可视核查。模型、设备与 fio 实验在实验环境按 [阶段 5](phases/PHASE_5.md) 执行。
+
+## 2026-11-17：工程审查与收尾
+
+| 检查范围 | 证据 |
+| --- | --- |
+| attention 错误路径 | CPU 延迟复制后端复现提前读取；修复后两种 overlap 模式先排空上传并保留原始错误 |
+| 启动与监控 | manifest/cgroup 故障后停止子进程；二次记录失败保留首个错误；零 RSS 样本记录 null |
+| 中断与进程组 | SIGTERM 处理器恢复、退出竞态、超时强制清理、真实合成父子进程组结束 |
+| 完成核查 | 首次执行、续跑及 collector 共用校验；短输出、未应用限额、空/错误干扰记录拒绝 |
+| scorer 来源 | 绕过同名模块缓存、源字节哈希与评分后校验、导入状态恢复 |
+
+CUDA 编译与链接、30 项 CTest、Linux 54 项 Python 检查及源码指纹通过。核心库 6 项 CTest 的地址、泄漏和未定义行为检查通过。详细触发、修复与入口见 [工程审查记录](ENGINEERING_REVIEW.md)。输入为 CPU 合成张量、临时文件及合成子进程。

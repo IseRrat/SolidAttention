@@ -9,10 +9,10 @@ from pathlib import Path
 import platform
 import re
 import shutil
-import signal
 import subprocess
 import sys
 import time
+from process_lifetime import stop_process, termination_signals
 
 ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM = "ef6bc6f367082338006c8379bc7bcab3e1584766"
@@ -121,6 +121,56 @@ def cgroup_memory(pid=None, group=None):
         return {}
 
 
+def run_monitored(manifest, run_dir, output):
+    """Own the runner from creation through monitoring, cleanup and recording."""
+    start = time.monotonic()
+    process = None
+    primary = None
+    peak_rss = 0
+    rss_samples = 0
+    with termination_signals(), (run_dir / "stdout.txt").open("wb") as stdout, \
+            (run_dir / "stderr.txt").open("wb") as stderr, (run_dir / "memory.jsonl").open("w",encoding="utf-8") as memory:
+        try:
+            process = subprocess.Popen(manifest["command"],stdout=stdout,stderr=stderr,start_new_session=True)
+            manifest["status"] = "running"
+            manifest["cgroup_start"] = cgroup_memory(process.pid)
+            manifest["proc_io_start"] = process_io(process.pid)
+            atomic_json(run_dir / "manifest.json",manifest)
+            while process.poll() is None:
+                sample = process_memory(process.pid)
+                peak_rss = max(peak_rss,sample.get("VmHWM_bytes",sample.get("VmRSS_bytes",0)))
+                if "VmHWM_bytes" in sample or "VmRSS_bytes" in sample: rss_samples += 1
+                memory.write(json.dumps({"seconds":time.monotonic()-start,**sample,"proc_io":process_io(process.pid)})+"\n")
+                manifest["cgroup_last"] = cgroup_memory(process.pid)
+                time.sleep(.1)
+        except BaseException as error:
+            primary = error
+            if process is not None:
+                try: stop_process(process,group=True,timeout=5)
+                except BaseException as cleanup_error: manifest["cleanup_error"] = str(cleanup_error)
+        manifest["returncode"] = process.returncode if process is not None else None
+        manifest["elapsed_seconds"] = time.monotonic()-start
+        manifest["sampled_peak_rss_bytes"] = peak_rss if rss_samples else None
+        manifest["rss_samples"] = rss_samples
+        manifest["status"] = ("interrupted" if isinstance(primary,KeyboardInterrupt) else "failed") if primary else (
+            "complete" if process.returncode == 0 and output.is_file() else "failed")
+        try:
+            group = manifest.get("cgroup_start",{}).get("path")
+            manifest["cgroup_end"] = cgroup_memory(group=group) if group else {}
+            if manifest["status"] == "complete": manifest["result_sha256"] = digest(output)
+            stdout.flush(); stderr.flush(); memory.flush()
+            manifest["artifacts_sha256"] = {name:digest(run_dir/name) for name in ("stdout.txt","stderr.txt","memory.jsonl")}
+        except BaseException as error:
+            if primary is None: primary = error; manifest["status"] = "failed"
+            else: manifest["recording_error"] = str(error)
+        if primary is not None: manifest["error"] = str(primary)
+        try: atomic_json(run_dir / "manifest.json",manifest)
+        except BaseException:
+            if primary is None: raise
+        if primary is not None: raise primary
+    return manifest
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path, nargs="?")
@@ -204,50 +254,7 @@ def main():
     if args.prepare_only:
         print(run_dir)
         return 0
-    with (run_dir / "stdout.txt").open("wb") as stdout, (run_dir / "stderr.txt").open("wb") as stderr, \
-            (run_dir / "memory.jsonl").open("w", encoding="utf-8") as memory:
-        process = subprocess.Popen(manifest["command"], stdout=stdout, stderr=stderr)
-        start = time.monotonic()
-        manifest["status"] = "running"
-        manifest["cgroup_start"] = cgroup_memory(process.pid)
-        manifest["proc_io_start"] = process_io(process.pid)
-        atomic_json(run_dir / "manifest.json", manifest)
-        peak_rss = 0
-        def interrupt(signum, frame):
-            raise KeyboardInterrupt(f"received signal {signum}")
-        previous_handler = signal.signal(signal.SIGTERM, interrupt)
-        try:
-            while process.poll() is None:
-                sample = process_memory(process.pid)
-                peak_rss = max(peak_rss, sample.get("VmHWM_bytes", sample.get("VmRSS_bytes", 0)))
-                memory.write(json.dumps({"seconds": time.monotonic() - start, **sample, "proc_io":process_io(process.pid)}) + "\n")
-                manifest["cgroup_last"] = cgroup_memory(process.pid)
-                time.sleep(0.1)
-        except BaseException:
-            process.terminate()
-            try:
-                process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-            manifest["status"] = "interrupted"
-            manifest["returncode"] = process.returncode
-            atomic_json(run_dir / "manifest.json", manifest)
-            raise
-        finally:
-            signal.signal(signal.SIGTERM, previous_handler)
-            group = manifest["cgroup_start"].get("path")
-            manifest["cgroup_end"] = cgroup_memory(group=group) if group else {}
-            atomic_json(run_dir / "manifest.json", manifest)
-        manifest["returncode"] = process.returncode
-        manifest["elapsed_seconds"] = time.monotonic() - start
-        manifest["sampled_peak_rss_bytes"] = peak_rss
-        manifest["status"] = "complete" if process.returncode == 0 and output.is_file() else "failed"
-        if manifest["status"] == "complete":
-            manifest["result_sha256"] = digest(output)
-        stdout.flush(); stderr.flush(); memory.flush()
-        manifest["artifacts_sha256"] = {name:digest(run_dir/name) for name in ("stdout.txt","stderr.txt","memory.jsonl")}
-        atomic_json(run_dir / "manifest.json", manifest)
+    run_monitored(manifest,run_dir,output)
     print(run_dir)
     return 0 if manifest["status"] == "complete" else 1
 

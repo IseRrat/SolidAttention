@@ -163,5 +163,49 @@ class ExperimentTests(unittest.TestCase):
             path.write_text("Starting thread\n"+json.dumps(first)+"\n"+json.dumps(final)+"\n{\"jobs\":")
             self.assertEqual(runtime.fio_observations(path),[first,final])
 
+    @unittest.skipUnless(sys.platform.startswith("linux"),"external executor uses POSIX file locks")
+    def test_executor_rejects_short_output_before_marking_complete(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); spec,_=fixture(root); path=experiments.create(spec,root/"plan")
+            runner=root/"fake-runner"; runner.write_bytes(b"synthetic runner")
+            class FakeProcess:
+                returncode=0
+                def __init__(self,argv,**kwargs): write_run(argv[2],common.digest(runner),timings=(2,))
+                def poll(self): return 0
+            with mock.patch.object(experiments.subprocess,"Popen",FakeProcess):
+                state=experiments.execute(path,runner,limit=1)
+            record=next(iter(state["jobs"].values()))
+            self.assertEqual(record["status"],"failed")
+            self.assertIn("fixed output length",record["error"])
+
+    @unittest.skipUnless(sys.platform.startswith("linux"),"external executor uses POSIX file locks")
+    def test_resume_rechecks_measurement_validity_before_skipping(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); spec,_=fixture(root); path=experiments.create(spec,root/"plan")
+            runner=root/"fake-runner"; runner.write_bytes(b"synthetic runner")
+            row=common.load(path)["jobs"][0]
+            write_run(row["config"],common.digest(runner),timings=(2,))
+            write(path.parent/"execution.json",{"plan_sha256":common.digest(path),"runner_sha256":common.digest(runner),"jobs":{row["id"]:{"status":"complete"}}})
+            with mock.patch.object(experiments.subprocess,"Popen") as spawn:
+                with self.assertRaisesRegex(ValueError,"fixed output length"): experiments.execute(path,runner)
+            spawn.assert_not_called()
+
+    def test_audit_requires_applied_limits_and_nonempty_interference_reads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); spec,_=fixture(root); path=experiments.create(spec,root/"plan")
+            row=common.load(path)["jobs"][0]; result,_=write_run(row["config"])
+            settings={"name":"limited","session_root":str(root),"cache_state":"os-managed","memory_max_bytes":1024,"swap_max_bytes":None}
+            self.assertIn("--property=MemorySwapMax=0",runtime.isolated_command(["synthetic"],settings))
+            with self.assertRaisesRegex(ValueError,"observed cgroup"): experiments.audited_job(row,settings,root)
+            manifest=common.load(result.parent/"manifest.json"); manifest["cgroup_end"]={"memory.max":"1024","memory.swap.max":"0"}; write(result.parent/"manifest.json",manifest)
+            settings["background"]={"kind":"random-read","file":str(root/"load.data"),"rate":1,"iodepth":1}
+            for jobs in ([],[{"error":0,"read":{"total_ios":0}}],[{"error":5,"read":{"total_ios":1}}]):
+                write(root/"fio.json",{"jobs":jobs})
+                with self.assertRaisesRegex(ValueError,"fio report"): experiments.audited_job(row,settings,root)
+            write(root/"fio.json",{"jobs":[{"error":0,"read":{"total_ios":1}}]})
+            self.assertEqual(experiments.audited_job(row,settings,root)[-1],[{"total_ios":1}])
+            with self.assertRaisesRegex(ValueError,"requires memory_max_bytes"):
+                runtime.condition(dict(settings,memory_max_bytes=None,swap_max_bytes=0))
+
 
 if __name__=="__main__": unittest.main()

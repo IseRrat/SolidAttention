@@ -102,6 +102,10 @@ struct AttentionNode::Impl {
         } catch (...) {
             self.failure->capture(std::current_exception(), self.layer, self.frame->positions.empty() ? 0 : self.frame->positions.front());
             if (self.prefetch) {
+                // The remaining graph uses a finite fallback row. Finish every
+                // producer before that graph can read the shared device bank.
+                try { self.prefetch->quiesce(); }
+                catch (...) { self.failure->capture(std::current_exception(), self.layer, self.frame->positions.empty() ? 0 : self.frame->positions.front()); }
                 self.epoch = self.prefetch->attention_epoch();
                 auto * data = static_cast<Half *>(destination->data);
                 std::fill_n(data, ggml_nelements(destination), Half{0xfc00});

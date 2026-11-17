@@ -9,15 +9,14 @@ from pathlib import Path
 import platform
 import random
 import re
-import os
-import signal
 import subprocess
 import sys
 import time
 
 from experiment_common import (absolute_config, audit_run, check_hash, digest, distribution, load,
                                model_hashes, number, run_metrics, token_ids, atomic_json)
-from experiment_runtime import Background, condition, fio_command, fio_observations, isolated_command
+from experiment_runtime import Background, condition, fio_command, fio_observations, isolated_command, swap_limit
+from process_lifetime import stop_process, termination_signals
 
 ROOT = Path(__file__).resolve().parents[1]
 VARIANTS = {"origin", "quant", "indram", "indram-sparse", "offload", "offload-sparse", "interleaved", "prefetch", "overlap", "solid"}
@@ -155,6 +154,26 @@ def read_plan(path):
     return path,plan
 
 
+def audited_job(row, settings, attempt, runner_sha=None):
+    result,run,config = audit_run(Path(row["result"]),row["config"],row["config_sha256"])
+    if runner_sha is not None and run["runner_sha256"] != runner_sha: raise ValueError("runner differs from completed run")
+    if len(result["generated_token_ids"]) != config["max_new_tokens"] or result["stop_reason"] != "length":
+        raise ValueError("performance run did not produce the fixed output length")
+    metrics = run_metrics(result)
+    group = run.get("cgroup_end",run.get("cgroup_last",{}))
+    if settings.get("memory_max_bytes") is not None and (
+            group.get("memory.max") != str(settings["memory_max_bytes"]) or group.get("memory.swap.max") != str(swap_limit(settings))):
+        raise ValueError("observed cgroup limits differ from the experiment condition")
+    reads = None
+    if settings.get("background"):
+        observations = fio_observations(Path(attempt)/"fio.json")
+        jobs = observations[-1].get("jobs",[]) if observations else []
+        if not jobs or any(job["error"] or not job["read"]["total_ios"] for job in jobs):
+            raise ValueError("fio report is missing, contains errors or has no completed reads")
+        reads = [job["read"] for job in jobs]
+    return result,run,config,metrics,group,reads
+
+
 def execute(plan_path, runner, limit=None):
     if platform.system() != "Linux": raise ValueError("execute experiment plans in the Linux experiment environment")
     plan_path,plan = read_plan(plan_path)
@@ -166,7 +185,7 @@ def execute(plan_path, runner, limit=None):
     lock_path = plan_path.parent/"execution.lock"
     # POSIX locks are released by the kernel after interruption; resume keeps all attempt files.
     import fcntl
-    with lock_path.open("a+") as lock:
+    with termination_signals(), lock_path.open("a+") as lock:
         try: fcntl.flock(lock,fcntl.LOCK_EX|fcntl.LOCK_NB)
         except BlockingIOError: raise ValueError("another executor owns this experiment plan")
         if ledger.exists():
@@ -174,19 +193,19 @@ def execute(plan_path, runner, limit=None):
             if any(state[key] != value for key,value in identity.items()): raise ValueError("execution inputs changed")
         completed = 0
         for row in plan["jobs"]:
+            settings = plan["conditions"][row["group"]["condition"]]
+            attempt = plan_path.parent/"attempts"/row["id"]
             old = state["jobs"].get(row["id"])
             if old:
                 if old["status"] == "running":
                     old["status"] = "interrupted"
                     atomic_json(ledger,state)
-                if old["status"] == "complete": audit_run(row["result"],row["config"],row["config_sha256"])
+                if old["status"] == "complete": audited_job(row,settings,attempt,identity["runner_sha256"])
                 # Terminal failures remain visible; reruns use a new plan.
                 continue
             if limit is not None and completed >= limit: break
             output = Path(row["result"])
-            attempt = plan_path.parent/"attempts"/row["id"]
             attempt.mkdir(parents=True,exist_ok=False)
-            settings = plan["conditions"][row["group"]["condition"]]
             config = load(row["config"])
             protected = [config["model"],config["prompt"],output,config.get("attention",{}).get("session_file",output)]
             protected.extend(part["path"] for part in config.get("additional_model_files",[]))
@@ -204,21 +223,19 @@ def execute(plan_path, runner, limit=None):
                     try:
                         while process.poll() is None:
                             load_process.check(); time.sleep(.1)
-                    except BaseException:
-                        os.killpg(process.pid,signal.SIGTERM)
-                        try: process.wait(timeout=10)
-                        except subprocess.TimeoutExpired:
-                            os.killpg(process.pid,signal.SIGKILL); process.wait()
+                    except BaseException as primary:
+                        try: stop_process(process,group=True)
+                        except BaseException as cleanup: raise primary from cleanup
                         raise
                     load_process.check()
                 record["returncode"] = process.returncode
                 if process.returncode: record["status"] = "failed"
                 else:
-                    audit_run(output,row["config"],row["config_sha256"])
+                    audited_job(row,settings,attempt,identity["runner_sha256"])
                     record["status"] = "complete"
             except KeyboardInterrupt:
                 record["status"] = "interrupted"; raise
-            except (OSError,ValueError,RuntimeError) as error:
+            except (OSError,ValueError,RuntimeError,KeyError,TypeError) as error:
                 record.update(status="failed",error=str(error))
             finally:
                 record["elapsed_seconds"] = time.monotonic()-start
@@ -246,27 +263,18 @@ def collect(plan_path, destination):
             if Path(artifact).name != artifact: raise ValueError("invalid attempt artifact name")
             check_hash(plan_path.parent/"attempts"/row["id"]/artifact,sha)
         if record["status"] == "complete":
-            result,run,config = audit_run(result_path,row["config"],row["config_sha256"])
+            settings = plan["conditions"][row["group"]["condition"]]
+            result,run,config,metrics,group,reads = audited_job(row,settings,plan_path.parent/"attempts"/row["id"],state.get("runner_sha256"))
             key = run["code_commit"],run["runner_sha256"],run["upstream_commit"]
             if identity is None: identity = key
             elif identity != key: raise ValueError("experiment runs mix code or runner identities")
             if state.get("runner_sha256") != run["runner_sha256"]: raise ValueError("ledger runner differs from completed runs")
-            if plan["kind"] == "performance" and (len(result["generated_token_ids"]) != config["max_new_tokens"] or result["stop_reason"] != "length"):
-                raise ValueError("performance run did not produce the fixed output length")
-            item["metrics"] = run_metrics(result)
+            item["metrics"] = metrics
             item["manifest_sha256"] = digest(result_path.parent/"manifest.json")
             item["result_sha256"] = digest(result_path)
             item["sampled_peak_rss_bytes"] = run.get("sampled_peak_rss_bytes")
-            item["cgroup_end"] = run.get("cgroup_end",run.get("cgroup_last",{}))
-            settings = plan["conditions"][row["group"]["condition"]]
-            if settings.get("memory_max_bytes") is not None:
-                if (item["cgroup_end"].get("memory.max") != str(settings["memory_max_bytes"]) or
-                        item["cgroup_end"].get("memory.swap.max") != str(settings.get("swap_max_bytes",0))):
-                    raise ValueError("observed cgroup limits differ from the experiment condition")
-            if settings.get("background"):
-                observations = fio_observations(plan_path.parent/"attempts"/row["id"]/"fio.json")
-                if not observations or any(job["error"] for job in observations[-1]["jobs"]): raise ValueError("fio report is missing or contains I/O errors")
-                item["fio_observed_reads"] = [job["read"] for job in observations[-1]["jobs"]]
+            item["cgroup_end"] = group
+            if reads is not None: item["fio_observed_reads"] = reads
         elif "manifest_sha256" in record:
             failed = load(result_path.parent/"manifest.json")
             item["failure"] = {key:failed.get(key) for key in ("status","returncode","cgroup_start","cgroup_end")}

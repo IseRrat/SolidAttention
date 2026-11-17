@@ -110,6 +110,8 @@ device_payload_tokens_per_head = align_up(S*B, 32)
 
 worker 的异常在 join 时传回主线程，adapter 保存首个错误并在采样前抛出。清理先 join，再同步计算与复制、确认上传、释放设备读者、结束主机预取，最后销毁缓冲和文件。中断帧的剩余任务写为 `failed`；离线核查器拒绝失败或未闭合的帧。
 
+计算图中的错误分支先完成 `GgmlPrefetch::quiesce()`，再向剩余 attention 节点提供收尾 mask。独立复制流已释放 KV bank 后，后续节点才读取设备数据。延迟复制回归与错误保留证据见 [工程审查记录](../ENGINEERING_REVIEW.md)。
+
 ## 7. 轨迹与计时口径
 
 `schedule_trace=true` 输出 `schedule.jsonl`；每条定义记录 frame/layer/position、模式、task、资源、前驱和成本估计。事件记录 start/complete/failed、完成依据及绝对 `steady_clock_ns` 时间。预取和驻留轨迹增加同一主机时钟的 `timestamp_ns`，供时间轴关联。

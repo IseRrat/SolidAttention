@@ -2,6 +2,13 @@ import importlib.util
 from pathlib import Path
 import tempfile
 import unittest
+import json
+import signal
+import sys
+from unittest import mock
+
+sys.path.insert(0,str(Path(__file__).resolve().parents[1]/"scripts"))
+import process_lifetime
 
 spec = importlib.util.spec_from_file_location("launcher", Path(__file__).resolve().parents[1] / "scripts/run_baseline.py")
 launcher = importlib.util.module_from_spec(spec)
@@ -9,6 +16,53 @@ spec.loader.exec_module(launcher)
 
 
 class LauncherTests(unittest.TestCase):
+    def test_failure_recording_running_manifest_stops_the_spawned_runner(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            process=mock.Mock(pid=99999999,returncode=None)
+            def wait(**kwargs): process.returncode=-15; return -15
+            process.wait.side_effect=wait
+            real_write=launcher.atomic_json
+            def write(path,value):
+                if value["status"]=="running": raise OSError("injected manifest disk failure")
+                real_write(path,value)
+            with mock.patch.object(launcher.subprocess,"Popen",return_value=process), \
+                    mock.patch.object(launcher,"cgroup_memory",return_value={}), \
+                    mock.patch.object(launcher,"process_io",return_value={}), \
+                    mock.patch.object(launcher,"atomic_json",side_effect=write), \
+                    mock.patch.object(process_lifetime.os,"killpg",create=True) as stop:
+                with self.assertRaisesRegex(OSError,"manifest disk failure"):
+                    launcher.run_monitored({"command":["synthetic"]},root,root/"result.json")
+            process.wait.assert_called_once()
+            self.assertIn(mock.call(process.pid,signal.SIGTERM),stop.call_args_list)
+            state=json.loads((root/"manifest.json").read_text())
+            self.assertEqual(state["status"],"failed")
+            self.assertEqual(state["returncode"],-15)
+
+    def test_secondary_record_failure_preserves_original_startup_error(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); process=mock.Mock(pid=99999999,returncode=-15)
+            with mock.patch.object(launcher.subprocess,"Popen",return_value=process), \
+                    mock.patch.object(launcher,"cgroup_memory",side_effect=RuntimeError("original startup failure")), \
+                    mock.patch.object(launcher,"atomic_json",side_effect=OSError("secondary record failure")), \
+                    mock.patch.object(process_lifetime.os,"killpg",create=True):
+                with self.assertRaisesRegex(RuntimeError,"original startup failure"):
+                    launcher.run_monitored({"command":["synthetic"]},root,root/"result.json")
+            process.wait.assert_called_once()
+
+    def test_successful_short_runner_records_flushed_artifacts(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary); output=root/"result.json"; output.write_text('{}')
+            process=mock.Mock(pid=99999999,returncode=0); process.poll.return_value=0
+            with mock.patch.object(launcher.subprocess,"Popen",return_value=process), \
+                    mock.patch.object(launcher,"cgroup_memory",return_value={}), \
+                    mock.patch.object(launcher,"process_io",return_value={}):
+                state=launcher.run_monitored({"command":["synthetic"]},root,output)
+            self.assertEqual(state["status"],"complete")
+            self.assertIsNone(state["sampled_peak_rss_bytes"])
+            self.assertEqual(state["rss_samples"],0)
+            for name,sha in state["artifacts_sha256"].items(): self.assertEqual(launcher.digest(root/name),sha)
+
     def test_prefetch_requires_uring_build_feature(self):
         launcher.verify_features({}, {})
         launcher.verify_features({"attention": {"prefetch": True}}, {"features": {"uring": True}})

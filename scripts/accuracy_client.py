@@ -13,6 +13,7 @@ import uuid
 from compare_logits import load_result
 from experiment_common import absolute_config, atomic_json, audit_run, digest, model_hashes, number, token_ids
 from experiments import variant_config
+from process_lifetime import run_owned
 
 ROOT = Path(__file__).resolve().parents[1]
 
@@ -69,7 +70,7 @@ class RunnerClient:
         config.update(prompt=str(prompt),output=str(folder/"unused.json"))
         atomic_json(folder/"config.json",config)
         with (folder/"stderr.txt").open("wb") as errors:
-            result = subprocess.run([str(self.runner),"--tokenize",str(folder/"config.json")],stdout=subprocess.PIPE,stderr=errors,check=True)
+            result = run_owned([str(self.runner),"--tokenize",str(folder/"config.json")],stdout=subprocess.PIPE,stderr=errors,check=True)
         bundle = json.loads(result.stdout)
         if bundle["model_parts_sha256"] != model_hashes(config) or bundle["source_sha256"] != digest(prompt): raise ValueError("tokenizer identity differs")
         tokens = token_ids(bundle["token_ids"])
@@ -97,7 +98,7 @@ class RunnerClient:
                 config["attention"].update(context_budget_tokens=total,init_tokens=initial,local_tokens=deterministic-initial)
         path = folder/"source.json"; atomic_json(path,config)
         with (folder/"stdout.txt").open("wb") as stdout,(folder/"stderr.txt").open("wb") as stderr:
-            subprocess.run([sys.executable,str(ROOT/"scripts/run_baseline.py"),str(path),"--runner",str(self.runner)],stdout=stdout,stderr=stderr,check=True)
+            run_owned([sys.executable,str(ROOT/"scripts/run_baseline.py"),str(path),"--runner",str(self.runner)],stdout=stdout,stderr=stderr,check=True)
         value,manifest,_ = audit_run(Path(config["output"]),path,digest(path))
         return value,{"result":config["output"],"result_sha256":digest(Path(config["output"])),
                       "manifest_sha256":digest(Path(config["output"]).parent/"manifest.json"),

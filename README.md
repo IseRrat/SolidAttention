@@ -18,6 +18,7 @@
 10. [历史预取与纠错](docs/phases/PHASE_3.md)：liburing、DRAM/VRAM 租约、纠错轨迹和同步参考核查。
 11. [微任务调度](docs/phases/PHASE_4.md)：计算/I/O 重叠、同步复用、三组固定集合对照与任务轨迹核查。
 12. [论文实验代码](docs/phases/PHASE_5.md)：精确输入、实验矩阵、续跑与汇总、准确率接口、官方评分和可追溯绘图。
+13. [工程审查记录](docs/ENGINEERING_REVIEW.md)：异步错误清理、子进程管理、实验完成核查和 scorer 来源修复。
 
 ## 系统机制
 

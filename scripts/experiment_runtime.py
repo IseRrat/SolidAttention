@@ -2,12 +2,12 @@
 import os
 import json
 from pathlib import Path
-import signal
 import subprocess
 import time
 import uuid
 
 from experiment_common import number
+from process_lifetime import stop_process
 
 
 def condition(value):
@@ -17,6 +17,8 @@ def condition(value):
         raise ValueError("cache_state must describe the externally controlled page cache")
     for key in ("memory_max_bytes", "swap_max_bytes"):
         if value.get(key) is not None: number(value[key], integer=True, minimum=1 if key == "memory_max_bytes" else 0)
+    if value.get("swap_max_bytes") is not None and value.get("memory_max_bytes") is None:
+        raise ValueError("swap_max_bytes requires memory_max_bytes")
     cpus = value.get("cpus", [])
     if not isinstance(cpus, list) or len(cpus) != len(set(cpus)): raise ValueError("CPU affinity must contain unique CPU IDs")
     for cpu in cpus: number(cpu, integer=True)
@@ -35,8 +37,12 @@ def isolated_command(command, settings):
     if settings.get("memory_max_bytes") is not None:
         command = ["systemd-run", "--user", "--scope", "--quiet", "--unit=solid-"+uuid.uuid4().hex,
                    "--property=MemoryMax="+str(settings["memory_max_bytes"]),
-                   "--property=MemorySwapMax="+str(settings.get("swap_max_bytes",0)), *command]
+                   "--property=MemorySwapMax="+str(swap_limit(settings)), *command]
     return command
+
+
+def swap_limit(settings):
+    return 0 if settings.get("swap_max_bytes") is None else settings["swap_max_bytes"]
 
 
 def fio_command(settings, directory, protected=()):
@@ -96,10 +102,11 @@ class Background:
 
     def __exit__(self, *unused):
         if self.process and self.process.poll() is None:
-            os.killpg(self.process.pid, signal.SIGINT)
-            try: self.process.wait(timeout=10)
-            except subprocess.TimeoutExpired:
-                os.killpg(self.process.pid, signal.SIGKILL)
-                self.process.wait()
+            # fio's SIGINT handler writes its final statistics before exiting.
+            import signal
+            try: os.killpg(self.process.pid,signal.SIGINT)
+            except ProcessLookupError: pass
+            try: self.process.wait(timeout=5)
+            except subprocess.TimeoutExpired: stop_process(self.process,group=True,timeout=5)
         if self.output: self.output.close()
         if self.error: self.error.close()

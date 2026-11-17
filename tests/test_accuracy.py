@@ -120,5 +120,21 @@ class AccuracyTests(unittest.TestCase):
             metadata=common.load(sources[1]/"export.json"); metadata["model_identity"]["kv_dtype"]="q4_0"; fixtures.write(sources[1]/"export.json",metadata)
             with self.assertRaisesRegex(ValueError,"different models"): accuracy.merge_exports(sources,root/"bad")
 
+    def test_official_metrics_ignore_module_cache_and_restore_import_state(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            (root/"eval.py").write_text("from metrics import score\ndef scorer(*args): return score\n")
+            (root/"metrics.py").write_text("score = 37.0\n")
+            cached=types.ModuleType("metrics"); cached.score=-1
+            old_path=sys.path[:]; old_bytecode=sys.dont_write_bytecode
+            with mock.patch.dict(sys.modules,{"metrics":cached}):
+                with accuracy.official_longbench(root) as (official,hashes):
+                    self.assertEqual(official.scorer(),37)
+                    self.assertEqual(hashes["metrics.py"],common.digest(root/"metrics.py"))
+                self.assertIs(sys.modules["metrics"],cached)
+            self.assertEqual(sys.path,old_path)
+            self.assertEqual(sys.dont_write_bytecode,old_bytecode)
+            self.assertFalse((root/"__pycache__").exists())
+
 
 if __name__=="__main__": unittest.main()

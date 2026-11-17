@@ -65,11 +65,15 @@ python3 scripts/experiments.py collect results/paper-plan/plan.json results/pape
 
 执行器使用 POSIX 独占文件锁，`--limit` 控制本次推进的任务数。重启后核查已完成运行并跳过，继续 pending 任务。失败与中断作为终态保留；重新测量使用新计划。`execution.json` 保存命令、时间、退出码、错误、日志和干扰文件哈希。
 
+执行器在标记 complete、续跑跳过和汇总时共用 `audited_job`，同时核查输出长度、token 计时、cgroup 限额和干扰读取。运行器与准确率后端使用独立进程 session，SIGTERM/异常触发完整清理。进程与完成状态的回归检查见 [工程审查记录](../ENGINEERING_REVIEW.md)。
+
 ## 4. 内存限制、SSD 与干扰
 
 默认 condition 采用 `17179869184` 字节（16 GiB）的内存上限和零 swap。执行器通过 `systemd-run --user --scope` 在启动 launcher 前设置 `MemoryMax/MemorySwapMax`，所需 memory controller 由实验环境提供。CPU 亲和性通过 condition 的 `cpus` 配置，空列表使用环境调度。
 
 launcher 保存 cgroup 起止的 `memory.max/peak/stat/events`、`memory.swap.max`、`io.stat` 和有效 CPU 集合；每 100 ms 保存进程内存及 `/proc/PID/io`。汇总核对观测到的内存/swap 上限与计划。cgroup 范围包含 launcher 和模型进程。
+
+`rss_samples` 记录有效 RSS 采样数；零采样时峰值保存为 `null`。启用内存上限且 `swap_max_bytes=null` 时采用零 swap。
 
 SSD 模板为 [cuda-io.json](../../configs/experiments/cuda-io.json)。先在实验环境配置两个 `session_root` 挂载路径及已存在的 fio 测试文件，再准备计划：
 
@@ -138,6 +142,8 @@ python3 scripts/accuracy.py score-longbench results/qasper-pred /path/to/LongBen
 各数据集导出后，用 `accuracy.py merge DESTINATION EXPORT_DIRECTORY...` 合并成八任务预测目录。合并核对模型、精度、调度、代码身份和每个输入文件的哈希，拒绝重复数据集；随后对合并目录执行 `score-longbench`，生成供表 1 汇总使用的八任务分数。
 
 评分接口依据 [LongBench eval.py](https://github.com/THUDM/LongBench/blob/main/LongBench/eval.py) 及 [metrics.py](https://github.com/THUDM/LongBench/blob/main/LongBench/metrics.py)。数据、prompt 模板、模型指令包装和 scorer revision 在正式评测前一起锁定。
+
+scorer 的两个模块按源字节加载，评分后校验源码哈希、Git 状态并恢复模块缓存与搜索路径，保持实际执行代码与记录的版本一致。
 
 ## 8. OpenCompass 与表 1 汇总
 

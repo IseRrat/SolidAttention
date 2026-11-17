@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 """Prepare rendered evaluation samples, generate predictions and use official LongBench scoring."""
 import argparse
+from contextlib import contextmanager
 import hashlib
 import importlib.util
 import json
@@ -117,6 +118,38 @@ def export(manifest, predictions, destination):
     return output
 
 
+@contextmanager
+def official_longbench(root):
+    """Load both official modules from their source bytes for this invocation."""
+    keys = ("metrics","solid_official_longbench")
+    missing = object()
+    previous = {key:sys.modules.get(key,missing) for key in keys}
+    search_path = sys.path[:]
+    bytecode = sys.dont_write_bytecode
+    hashes = {}
+    try:
+        sys.path.insert(0,str(root))
+        sys.dont_write_bytecode = True
+        modules = []
+        for key,filename in zip(keys,("metrics.py","eval.py")):
+            path = root/filename
+            source = path.read_bytes()
+            hashes[filename] = hashlib.sha256(source).hexdigest()
+            spec = importlib.util.spec_from_file_location(key,path)
+            module = importlib.util.module_from_spec(spec)
+            sys.modules[key] = module
+            exec(compile(source,str(path),"exec"),module.__dict__)
+            modules.append(module)
+        yield modules[-1],hashes
+        for filename,sha in hashes.items(): check_hash(root/filename,sha)
+    finally:
+        for key,value in previous.items():
+            if value is missing: sys.modules.pop(key,None)
+            else: sys.modules[key] = value
+        sys.path[:] = search_path
+        sys.dont_write_bytecode = bytecode
+
+
 def score_longbench(directory, repository, revision, destination):
     directory,repository = Path(directory).resolve(strict=True),Path(repository).resolve(strict=True)
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision): raise ValueError("pin a full official LongBench commit SHA")
@@ -126,23 +159,22 @@ def score_longbench(directory, repository, revision, destination):
     for source in metadata.get("sources",[]): check_hash(source["path"],source["sha256"])
     root = repository/"LongBench"
     if not (root/"eval.py").is_file(): raise ValueError("expected LongBench/eval.py in the official repository")
-    sys.path.insert(0,str(root))
-    spec = importlib.util.spec_from_file_location("solid_official_longbench",root/"eval.py")
-    official = importlib.util.module_from_spec(spec); spec.loader.exec_module(official)
     scores,counts = {},{}
     if not metadata["files"]: raise ValueError("empty prediction export")
-    for filename,sha in metadata["files"].items():
-        dataset = Path(filename).stem
-        if Path(filename).name != filename or dataset not in LONGBENCH: raise ValueError("unsupported LongBench dataset")
-        check_hash(directory/filename,sha)
-        rows = [json.loads(line) for line in (directory/filename).read_text(encoding="utf-8").splitlines()]
-        if not rows: raise ValueError("empty LongBench prediction file")
-        if any(row["all_classes"] != rows[0]["all_classes"] for row in rows): raise ValueError("inconsistent class lists")
-        score = official.scorer(dataset,[row["pred"] for row in rows],[row["answers"] for row in rows],rows[0]["all_classes"])
-        number(score)
-        scores[dataset] = score; counts[dataset] = len(rows)
+    with official_longbench(root) as (official,source_hashes):
+        for filename,sha in metadata["files"].items():
+            dataset = Path(filename).stem
+            if Path(filename).name != filename or dataset not in LONGBENCH: raise ValueError("unsupported LongBench dataset")
+            check_hash(directory/filename,sha)
+            rows = [json.loads(line) for line in (directory/filename).read_text(encoding="utf-8").splitlines()]
+            if not rows: raise ValueError("empty LongBench prediction file")
+            if any(row["all_classes"] != rows[0]["all_classes"] for row in rows): raise ValueError("inconsistent class lists")
+            score = official.scorer(dataset,[row["pred"] for row in rows],[row["answers"] for row in rows],rows[0]["all_classes"])
+            number(score)
+            scores[dataset] = score; counts[dataset] = len(rows)
+    if git("rev-parse","HEAD") != revision or git("status","--porcelain"): raise ValueError("LongBench checkout changed while scoring")
     result = {"scores_percent":scores,"sample_counts":counts,"official_revision":revision,
-              "official_files_sha256":{file:digest(root/file) for file in ("eval.py","metrics.py")},
+              "official_files_sha256":source_hashes,
               "export_sha256":digest(directory/"export.json"),"provenance":metadata["provenance"],"model_identity":metadata["model_identity"]}
     destination = Path(destination)
     if destination.exists(): raise ValueError("score output already exists")
