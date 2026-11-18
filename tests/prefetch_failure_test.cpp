@@ -2,6 +2,7 @@
 #include "prefetch_fakes.hpp"
 #include "solid/ggml_prefetch.hpp"
 #include "solid/llama_adapter.hpp"
+#include "representative_builder_cases.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-backend-impl.h"
@@ -28,7 +29,7 @@ struct Fault {
         std::memcpy(dst->data,dst->src[0]->data,ggml_nbytes(dst));
     }
 };
-void failed_graph(solid::ScheduleMode mode) {
+void failed_graph(solid::ScheduleMode mode,bool direct) {
     DeferredCopies copies;
     std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
     backend->device = &copies.device;
@@ -37,6 +38,7 @@ void failed_graph(solid::ScheduleMode mode) {
     solid::AttentionSession session(std::make_unique<solid::MemoryKvStore>(g),1,{4,1,1,1},true,4,{}, {},std::make_unique<Reader>(),6);
     std::vector<float> q(128,0.1f),k(128,0.2f),v(128,0.3f);
     for (std::uint64_t position = 0; position < 4; ++position) (void) session.process(0,position,1,q,k,v,0.125f);
+    if (direct) session.set_ranker(std::make_unique<test_builder::Emulator>(g,1,solid::SparseBudget{4,1,1,1},true));
     solid::GgmlPrefetch cache(session,backend.get(),{},mode);
     std::unique_ptr<ggml_context,decltype(&ggml_free)> context(ggml_init({1024*1024,nullptr,true}),ggml_free);
     auto * query = ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,128,1,1);
@@ -71,8 +73,10 @@ void failed_graph(solid::ScheduleMode mode) {
 }
 int main() {
     try {
-        failed_graph(solid::ScheduleMode::overlap);
-        failed_graph(solid::ScheduleMode::sync_reuse);
+        for (bool direct:{false,true}) {
+            failed_graph(solid::ScheduleMode::overlap,direct);
+            failed_graph(solid::ScheduleMode::sync_reuse,direct);
+        }
         std::cout << "failed attention drains independent uploads and preserves its first error\n"; return 0;
     }
     catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }

@@ -77,7 +77,20 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
     anchor = "        ggml_backend_tensor_get_async(backend, input, input_cpy->data, 0, ggml_nbytes(input));\n"
     backend = replace_once(backend, anchor, "        solid_copy_scope solid_copy(input, backend, sched->backends[next->backend_id]);\n" + anchor)
     cuda = (source.parent / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
-    cuda = '#include "solid/cuda_completion.cuh"\n' + cuda
+    cuda = '#include "solid/cuda_completion.cuh"\n#include "solid/device_ops.cuh"\n' + cuda
+    anchor = '''        case GGML_OP_FILL:
+            ggml_cuda_op_fill(ctx, dst);
+            break;'''
+    cuda = replace_once(cuda, anchor, '''        case GGML_OP_CUSTOM:
+            if (!solid::device_op_supported(dst)) return false;
+            CUDA_CHECK(solid::cuda_device_op(dst, ctx.stream()));
+            break;
+''' + anchor)
+    anchor = '''        case GGML_OP_FLASH_ATTN_EXT:
+            return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);'''
+    cuda = replace_once(cuda, anchor, '''        case GGML_OP_CUSTOM:
+            return solid::device_op_supported(op);
+''' + anchor)
     anchor = '''        case GGML_OP_FLASH_ATTN_EXT:
             ggml_cuda_flash_attn_ext(ctx, dst);
             break;'''

@@ -96,13 +96,28 @@ __global__ void select_top_blocks(double * scores, const std::uint64_t * ids, co
     }
 }
 
-__global__ void builder_mean_query(const float * query, double * mean, std::uint32_t heads,
+__global__ void builder_mean_query(const float * query, double * mean, int * error, std::uint32_t heads,
                                     std::uint32_t width, std::uint32_t group) {
     const auto total = static_cast<std::uint64_t>(heads)*width;
     for (auto i = static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
          i < total; i += static_cast<std::uint64_t>(gridDim.x)*blockDim.x) {
         mean[i] = representative_mean(query, static_cast<std::uint32_t>(i/width), static_cast<std::uint32_t>(i%width), width, group);
+        if (!isfinite(mean[i])) atomicExch(error, 1);
     }
+}
+__global__ void builder_append_keys(const Half * source, Half * target, int * error,
+                                    std::size_t head_stride, std::uint32_t heads, std::uint32_t width) {
+    const auto total = static_cast<std::uint64_t>(heads)*width;
+    for (auto i = static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+         i < total; i += static_cast<std::uint64_t>(gridDim.x)*blockDim.x) {
+        const auto key = source[(i/width)*head_stride+i%width];
+        if (!isfinite(__half2float(__ushort_as_half(key)))) atomicExch(error, 1);
+        target[i] = key;
+    }
+}
+__global__ void validate_query_values(const float * query, std::uint64_t count, int * error) {
+    for (auto i = static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
+         i < count; i += static_cast<std::uint64_t>(gridDim.x)*blockDim.x) if (!isfinite(query[i])) atomicExch(error,1);
 }
 struct DeviceHalf {
     __device__ float operator()(Half bits) const { return __half2float(__ushort_as_half(bits)); }
@@ -212,6 +227,7 @@ public:
     }
     std::uint32_t builder_window() const override { return local_; }
     const char * builder_name() const override { return local_ ? "cuda_window_fp64" : "cpu"; }
+    std::optional<DeviceMemory> direct_memory() const override { return DeviceMemory::cuda; }
     void seed_builder(std::uint32_t layer, const RepresentativeSeed & seed) override {
         check();
         if (!local_ || layer >= geometry_.layers || builders_[layer].initialized) throw std::invalid_argument("CUDA builder initialization state");
@@ -250,11 +266,21 @@ public:
         } catch (...) { fail(); throw; }
     }
     std::optional<BuiltRepresentatives> build_query(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query) override {
+        if (query.size() != product(query_heads_, geometry_.dimension)) throw std::invalid_argument("CUDA builder query shape");
+        for (const auto q : query) if (!std::isfinite(q)) throw std::invalid_argument("non-finite CUDA builder query");
+        return build_query_impl(layer, position, query.data(), false);
+    }
+    std::optional<BuiltRepresentatives> build_query_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query) override {
+        validate_device_query(query, DeviceMemory::cuda, query_heads_, geometry_.dimension);
+        validate_pointer(query.data);
+        auto result = build_query_impl(layer, position, query.data, true);
+        ++stats_.device_builder_queries;
+        return result;
+    }
+    std::optional<BuiltRepresentatives> build_query_impl(std::uint32_t layer, std::uint64_t position, const float * query, bool device) {
         check();
         if (!local_ || layer >= geometry_.layers || !builders_[layer].initialized || builders_[layer].query_pending ||
-            builders_[layer].length != position || position >= geometry_.capacity_tokens ||
-            query.size() != product(query_heads_, geometry_.dimension)) throw std::invalid_argument("CUDA builder query state or shape");
-        for (const auto q : query) if (!std::isfinite(q)) throw std::invalid_argument("non-finite CUDA builder query");
+            builders_[layer].length != position || position >= geometry_.capacity_tokens) throw std::invalid_argument("CUDA builder query state or shape");
         auto & state = builders_[layer];
         const auto pending = std::min<std::uint64_t>(position, local_);
         const bool complete = position >= local_ && (position-local_+1)%geometry_.block_tokens == 0;
@@ -265,18 +291,24 @@ public:
             result->positions.resize(product(geometry_.heads, representatives_));
             result->scores.resize(result->positions.size());
         }
-        if (pending) {
+        if (pending || device) {
             DeviceScope scope(device_);
             try {
-                checked(cudaMemcpyAsync(query_, query.data(), product(query.size(), sizeof(float)), cudaMemcpyHostToDevice, stream_), "upload builder query");
+                if (!device) {
+                    const auto bytes = product(product(query_heads_, geometry_.dimension), sizeof(float));
+                    checked(cudaMemcpyAsync(query_, query, bytes, cudaMemcpyHostToDevice, stream_), "upload builder query");
+                    stats_.query_upload_bytes += bytes;
+                }
                 checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear builder status");
                 const auto mean_grid = static_cast<unsigned>(std::min<std::uint64_t>((static_cast<std::uint64_t>(geometry_.heads)*geometry_.dimension+255)/256,65535));
-                builder_mean_query<<<mean_grid,256,0,stream_>>>(query_, mean_query_, geometry_.heads, geometry_.dimension, query_heads_/geometry_.heads);
+                builder_mean_query<<<mean_grid,256,0,stream_>>>(device ? query : query_, mean_query_, error_device_, geometry_.heads, geometry_.dimension, query_heads_/geometry_.heads);
                 checked(cudaGetLastError(), "launch builder GQA mean");
                 const auto score_grid = static_cast<unsigned>(std::min<std::uint64_t>((pending*geometry_.heads+255)/256,65535));
-                builder_update_scores<<<score_grid,256,0,stream_>>>(state.keys, state.scores, mean_query_, error_device_, position-pending,
-                    pending, local_, geometry_.heads, geometry_.dimension);
-                checked(cudaGetLastError(), "launch representative window update");
+                if (pending) {
+                    builder_update_scores<<<score_grid,256,0,stream_>>>(state.keys, state.scores, mean_query_, error_device_, position-pending,
+                        pending, local_, geometry_.heads, geometry_.dimension);
+                    checked(cudaGetLastError(), "launch representative window update");
+                }
                 if (position >= local_) {
                     builder_finalize<<<(geometry_.heads+127)/128,128,0,stream_>>>(state.keys, state.scores, state.top_keys, state.top_positions,
                         state.top_scores, static_cast<Half *>(banks_[layer]), built_positions_, built_scores_, position, local_, geometry_.heads,
@@ -309,36 +341,90 @@ public:
         try {
             const auto slot = position%local_;
             checked(cudaMemcpyAsync(state.keys+slot*keys.size(), keys.data(), product(keys.size(), sizeof(Half)), cudaMemcpyHostToDevice, stream_), "append builder key");
+            stats_.builder_key_upload_bytes += product(keys.size(), sizeof(Half));
             checked(cudaMemsetAsync(state.scores+slot*geometry_.heads, 0, product(geometry_.heads, sizeof(double)), stream_), "reset new representative score");
             checked(cudaStreamSynchronize(stream_), "complete builder append");
             ++state.length; state.query_pending = false; ++stats_.builder_appends;
         } catch (...) { fail(); throw; }
     }
+    void build_append_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys) override {
+        check();
+        validate_device_keys(keys, DeviceMemory::cuda, geometry_.heads, geometry_.dimension);
+        if (!local_ || layer >= geometry_.layers || !builders_[layer].initialized || !builders_[layer].query_pending ||
+            builders_[layer].length != position || position >= geometry_.capacity_tokens) throw std::invalid_argument("CUDA device append state");
+        validate_pointer(keys.data);
+        auto & state = builders_[layer];
+        DeviceScope scope(device_);
+        try {
+            checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear device append status");
+            const auto count = product(geometry_.heads, geometry_.dimension);
+            const auto grid = static_cast<unsigned>(std::min<std::size_t>((count+255)/256,65535));
+            builder_append_keys<<<grid,256,0,stream_>>>(keys.data, state.keys+(position%local_)*count, error_device_, keys.head_stride, geometry_.heads, geometry_.dimension);
+            checked(cudaGetLastError(), "launch device representative append");
+            checked(cudaMemsetAsync(state.scores+(position%local_)*geometry_.heads, 0, product(geometry_.heads, sizeof(double)), stream_), "reset device representative score");
+            checked(cudaMemcpyAsync(&error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, stream_), "download device append status");
+            checked(cudaStreamSynchronize(stream_), "complete device representative append");
+            if (error_) throw std::runtime_error("non-finite device representative key");
+            ++state.length; state.query_pending = false; ++stats_.builder_appends; ++stats_.device_builder_appends;
+        } catch (...) { fail(); throw; }
+    }
     std::vector<std::vector<std::uint64_t>> rank(std::uint32_t layer, const std::vector<float> & query,
                                                 const BlockCandidates & candidates) override {
+        if (query.size() != product(query_heads_, geometry_.dimension)) throw std::invalid_argument("CUDA ranking query shape");
+        for (const auto q : query) if (!std::isfinite(q)) throw std::invalid_argument("non-finite CUDA ranking query");
+        return rank_impl(layer, query.data(), candidates, false);
+    }
+    std::vector<std::vector<std::uint64_t>> rank_device(std::uint32_t layer, DeviceQuery query,
+                                                       const BlockCandidates & candidates) override {
+        validate_device_query(query, DeviceMemory::cuda, query_heads_, geometry_.dimension);
+        validate_pointer(query.data);
+        auto result = rank_impl(layer, query.data, candidates, true);
+        ++stats_.device_rank_queries;
+        return result;
+    }
+    std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const float * query,
+                                                    const BlockCandidates & candidates, bool device) {
         check();
-        if (layer >= geometry_.layers || query.size() != product(query_heads_, geometry_.dimension) ||
+        if (layer >= geometry_.layers ||
             candidates.blocks.size() != candidates.tokens.size() || candidates.blocks.size() > geometry_.blocks_per_head() ||
             candidates.remaining > budget_) throw std::invalid_argument("CUDA ranking shape or budget");
-        for (const auto q : query) if (!std::isfinite(q)) throw std::invalid_argument("non-finite CUDA ranking query");
         for (std::size_t i = 0; i < candidates.blocks.size(); ++i) {
             if (candidates.blocks[i] >= published_[layer] || (i && candidates.blocks[i] <= candidates.blocks[i-1]) ||
                 !candidates.tokens[i] || candidates.tokens[i] > geometry_.block_tokens) throw std::invalid_argument("invalid CUDA rank candidate");
         }
         std::vector<std::vector<std::uint64_t>> result(geometry_.heads);
-        if (!candidates.remaining || candidates.blocks.empty()) return result;
+        if (!candidates.remaining || candidates.blocks.empty()) {
+            if (device) {
+                DeviceScope scope(device_);
+                try {
+                    checked(cudaMemsetAsync(error_device_,0,sizeof(int),stream_),"clear empty rank status");
+                    const auto count=product(query_heads_,geometry_.dimension);
+                    const auto grid=static_cast<unsigned>(std::min<std::size_t>((count+255)/256,65535));
+                    validate_query_values<<<grid,256,0,stream_>>>(query,count,error_device_);
+                    checked(cudaGetLastError(),"validate empty rank query");
+                    checked(cudaMemcpyAsync(&error_,error_device_,sizeof(int),cudaMemcpyDeviceToHost,stream_),"download empty rank status");
+                    checked(cudaStreamSynchronize(stream_),"complete empty rank validation");
+                    if (error_) throw std::runtime_error("non-finite device ranking query");
+                } catch (...) { fail(); throw; }
+            }
+            return result;
+        }
         const auto count = candidates.blocks.size();
         const auto stride = static_cast<std::uint32_t>(std::min<std::size_t>(candidates.remaining, count));
         const auto bytes = product(product(geometry_.heads, stride), sizeof(std::uint64_t));
         DeviceScope scope(device_);
         try {
-            checked(cudaMemcpyAsync(query_, query.data(), product(query.size(), sizeof(float)), cudaMemcpyHostToDevice, stream_), "upload rank query");
+            if (!device) {
+                const auto bytes = product(product(query_heads_, geometry_.dimension), sizeof(float));
+                checked(cudaMemcpyAsync(query_, query, bytes, cudaMemcpyHostToDevice, stream_), "upload rank query");
+                stats_.query_upload_bytes += bytes;
+            }
             checked(cudaMemcpyAsync(ids_, candidates.blocks.data(), product(count, sizeof(std::uint64_t)), cudaMemcpyHostToDevice, stream_), "upload rank candidates");
             checked(cudaMemcpyAsync(costs_, candidates.tokens.data(), product(count, sizeof(std::uint32_t)), cudaMemcpyHostToDevice, stream_), "upload rank costs");
             checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear rank status");
             checked(cudaMemsetAsync(output_device_, 0xff, bytes, stream_), "clear rank output");
             const auto grid = static_cast<unsigned>(std::min<std::uint64_t>((count * geometry_.heads + 255) / 256, 65535));
-            score_blocks<<<grid, 256, 0, stream_>>>(static_cast<const __half *>(banks_[layer]), query_, ids_, scores_, error_device_,
+            score_blocks<<<grid, 256, 0, stream_>>>(static_cast<const __half *>(banks_[layer]), device ? query : query_, ids_, scores_, error_device_,
                 count, geometry_.heads, query_heads_ / geometry_.heads, representatives_, geometry_.dimension);
             checked(cudaGetLastError(), "launch block relevance kernel");
             select_top_blocks<<<geometry_.heads, 256, 0, stream_>>>(scores_, ids_, costs_, output_device_, count, candidates.remaining, stride);
@@ -362,6 +448,15 @@ public:
     RankerStats stats() const override { return stats_; }
     const char * name() const override { return "cuda_fp64_topk"; }
 private:
+    void validate_pointer(const void * pointer) const {
+        check();
+        DeviceScope scope(device_);
+        cudaPointerAttributes attributes{};
+        checked(cudaPointerGetAttributes(&attributes, pointer), "inspect borrowed CUDA input");
+        if ((attributes.type != cudaMemoryTypeDevice && attributes.type != cudaMemoryTypeManaged) || attributes.device != device_) {
+            throw std::invalid_argument("borrowed CUDA input belongs to another memory space or device");
+        }
+    }
     template<class T> void allocate(T *& pointer, std::size_t bytes) {
         checked(cudaMalloc(reinterpret_cast<void **>(&pointer), bytes), "allocate CUDA ranker buffer");
         stats_.device_bytes += bytes;

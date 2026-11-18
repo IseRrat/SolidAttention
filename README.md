@@ -2,7 +2,7 @@
 
 复现 FAST 2026 论文 **SolidAttention: Low-Latency SSD-based Serving on Memory-Constrained PCs**，在 llama.cpp 上实现 SSD KV cache、动态稀疏注意力、历史预取和计算/I/O 重叠。
 
-首条路线采用 Linux + CUDA，单请求 decode，INT4 模型权重和 FP16 KV cache。当前交付包括交错布局、CUDA 代表构造/块评分/top-k、有界 GPU 分块 prefill、历史预取、独立 I/O 与协调线程、固定图重叠和实验工具。后续核心代码按 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md) 补齐预测期与跨层调度、设备事件及双后端，再开展模型与设备评测。
+首条路线采用 Linux + CUDA，单请求 decode，INT4 模型权重和 FP16 KV cache。当前交付包括交错布局、CUDA 代表构造/块评分/top-k、decode 设备 Q/K 接入、有界 GPU 分块 prefill、历史预取、独立 I/O 与协调线程、设备完成事件和实验工具。后续核心代码按 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md) 推进 prefill 设备输入、完整资源图及双后端，再开展模型与设备评测。
 
 ## 开发入口
 
@@ -31,6 +31,8 @@
 20. [历史块事件 DAG 与资源分派](docs/implementation/BLOCK_EVENT_SCHEDULER.md)：块级读取/H2D 依赖、关键路径/LST、实际队列顺序与两级轨迹核查。
 
 21. [CUDA attention 完成事件](docs/implementation/NATIVE_COMPLETION.md)：图捕获与重放通知、槽位释放、后继上传、正式选择接管和设备计时。
+
+22. [Decode 设备 Q/K 与 FP16 KV](docs/implementation/DEVICE_INPUTS.md)：设备输入借用、图保活依赖、三种调度共用路径、FP16 consolidator 和核查入口。
 
 ## 系统机制
 

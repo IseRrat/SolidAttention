@@ -22,6 +22,9 @@ public:
                  const std::vector<Half> & keys);
     void observe_query(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query);
     void append_keys(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & keys);
+    void observe_query_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query);
+    void append_keys_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys);
+    std::optional<DeviceMemory> direct_memory() const { return ranker_ && ranker_->builder_window() ? ranker_->direct_memory() : std::optional<DeviceMemory>{}; }
     bool ready(std::uint32_t layer, std::uint64_t block) const;
     double score(std::uint32_t layer, std::uint32_t head, std::uint64_t block, const std::vector<float> & query) const;
     std::vector<std::uint64_t> representative_positions(std::uint32_t layer, std::uint32_t head, std::uint64_t block) const;
@@ -32,6 +35,8 @@ public:
     const char * ranker_name() const { return ranker_ ? ranker_->name() : "cpu"; }
     const char * builder_name() const { return ranker_ ? ranker_->builder_name() : "cpu"; }
     std::vector<std::vector<std::uint64_t>> rank_blocks(std::uint32_t layer, const std::vector<float> & query,
+                                                       const BlockCandidates & candidates) const;
+    std::vector<std::vector<std::uint64_t>> rank_blocks(std::uint32_t layer, DeviceQuery query,
                                                        const BlockCandidates & candidates) const;
 private:
     struct Representative { std::uint64_t position; double score; std::vector<Half> key; };
@@ -49,6 +54,8 @@ private:
     RepresentativeSeed builder_seed(std::uint32_t layer) const;
     void accept_built(std::uint32_t layer, std::uint64_t position, const std::optional<BuiltRepresentatives> & built);
     std::size_t index(std::uint32_t layer, std::uint32_t head) const;
+    std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const std::vector<float> * query,
+                                                     const DeviceQuery * device, const BlockCandidates & candidates) const;
 };
 
 struct HeadSelection {
@@ -59,6 +66,9 @@ struct HeadSelection {
 std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
                                         const RepresentativeIndex & representatives, std::uint32_t layer,
                                         std::uint64_t position, const std::vector<float> & query);
+std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
+                                        const RepresentativeIndex & representatives, std::uint32_t layer,
+                                        std::uint64_t position, DeviceQuery query);
 
 // Q contains query-head-major vectors. K/V retain absolute positions and FP16 precision.
 std::vector<float> streamed_attention(KvStore & store, std::uint32_t layer, std::uint64_t position,

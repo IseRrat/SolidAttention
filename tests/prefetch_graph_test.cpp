@@ -2,6 +2,7 @@
 #include "representative_builder_cases.hpp"
 #include "solid/ggml_prefetch.hpp"
 #include "solid/llama_adapter.hpp"
+#include "solid/device_ops.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
@@ -56,7 +57,7 @@ struct OverlapBarrier {
         std::memcpy(dst->data, dst->src[0]->data, ggml_nbytes(dst));
     }
 };
-void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces, bool builder,bool native) {
+void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces, bool builder,bool native,bool direct,bool packed) {
     constexpr int dimension = 128, kv_heads = 2, query_heads = 4;
     const solid::KvGeometry geometry{2, kv_heads, dimension, 2, 32, 64, solid::KvLayout::interleaved};
     const solid::SparseBudget budget{6, 1, 1, 1};
@@ -79,7 +80,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     }
     solid::AttentionSession session(std::move(store), query_heads, budget, true, 6, {}, {}, std::move(reader), 6);
     solid::AttentionSession reference(std::make_unique<solid::MemoryKvStore>(geometry), query_heads, budget, true, 6);
-    if (builder) session.set_ranker(std::make_unique<test_builder::Emulator>(geometry, query_heads, budget));
+    if (builder || direct) session.set_ranker(std::make_unique<test_builder::Emulator>(geometry, query_heads, budget,direct));
     const float scale = 1 / std::sqrt(static_cast<float>(dimension));
     std::vector<float> query(query_heads * dimension), key(kv_heads * dimension), value(key.size());
     const auto inputs = [&](int layer, int p) {
@@ -105,7 +106,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     std::unique_ptr<ggml_context, decltype(&ggml_free)> context(ggml_init({4 * 1024 * 1024, nullptr, true}), ggml_free);
     auto * q = ggml_new_tensor_3d(context.get(), GGML_TYPE_F32, dimension, query_heads, 1);
     ggml_set_input(q);
-    ggml_tensor * keys[2]; ggml_tensor * values[2];
+    ggml_tensor * keys[2]; ggml_tensor * values[2]; ggml_tensor * packed_kv[2]{};
     std::shared_ptr<solid::AttentionFrame> frames[2];
     std::unique_ptr<solid::AttentionNode> operations[2];
     ggml_tensor * outputs[2];
@@ -122,7 +123,27 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         if (controlled && layer == 0) projected_key = ggml_custom_4d(context.get(), GGML_TYPE_F32, dimension, kv_heads, 1, 1,
             &keys[layer], 1, OverlapBarrier::compute, 1, &barrier);
         operations[layer] = std::make_unique<solid::AttentionNode>(session, frames[layer], layer, scale, nullptr, true, &device);
-        outputs[layer] = operations[layer]->build(context.get(), query_tensor, projected_key, values[layer]);
+        if (packed) {
+            packed_kv[layer] = ggml_concat(context.get(),projected_key,values[layer],0);
+            projected_key = ggml_view_3d(context.get(),packed_kv[layer],dimension,kv_heads,1,
+                dimension*2*sizeof(float),dimension*kv_heads*2*sizeof(float),0);
+            values[layer] = ggml_view_3d(context.get(),packed_kv[layer],dimension,kv_heads,1,
+                dimension*2*sizeof(float),dimension*kv_heads*2*sizeof(float),dimension*sizeof(float));
+        }
+        outputs[layer] = operations[layer]->build(context.get(), query_tensor, projected_key, values[layer],packed_kv[layer]);
+        ggml_set_output(outputs[layer]);
+        if (direct) {
+            auto * kv=operations[layer]->host_node()->src[0];
+            require(solid::device_op(kv)==solid::DeviceOp::consolidate_kv,"device KV consolidator missing");
+            if (mode!=solid::ScheduleMode::naive) {
+                require(solid::graph_depends_on(kv,operations[layer]->selection_node()),"device KV must depend on early selection");
+                require(kv->src[2]==operations[layer]->selection_node()->src[0]->src[0],"Q lifetime dependency is missing");
+            } else require(kv->src[2]==kv->src[3]->src[0] && solid::device_op(kv->src[3])==solid::DeviceOp::query_token,
+                "serial KV lacks its GPU query frontier");
+            auto * mask=operations[layer]->attention_node()->src[3]->src[0];
+            require(solid::device_op(mask)==solid::DeviceOp::release_mask && mask->src[1]==kv &&
+                mask->src[2]==kv->src[2] && solid::graph_depends_on(mask,operations[layer]->host_node()),"Q/KV release must follow host append");
+        }
         if (operations[layer]->selection_node()) {
             if (layer) {
                 const bool covers = solid::graph_depends_on(query_tensor, operations[layer-1]->attention_node());
@@ -136,8 +157,8 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     }
     ggml_build_forward_expand(graph, outputs[1]);
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(
-        ggml_backend_alloc_ctx_tensors(context.get(), backend.get()), ggml_backend_buffer_free);
-    require(buffer != nullptr, "prefetch graph allocation");
+        direct ? nullptr : ggml_backend_alloc_ctx_tensors(context.get(), backend.get()), ggml_backend_buffer_free);
+    require(direct || buffer != nullptr, "prefetch graph allocation");
     ggml_backend_t backends[] = {backend.get()};
     std::unique_ptr<ggml_backend_sched, decltype(&ggml_backend_sched_free)> scheduler(
         ggml_backend_sched_new(backends, nullptr, 1, 1024, false, true), ggml_backend_sched_free);
@@ -146,6 +167,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     ggml_backend_sched_set_eval_callback(scheduler.get(), Observer::evaluate, &observer);
     for (int p = 6; p < 12; ++p) {
         device.begin_prefetch(0, p); // Before current Q/K/V are available.
+        if (direct) require(ggml_backend_sched_alloc_graph(scheduler.get(),graph),"reusing direct graph allocation");
         std::vector<float> expected[2];
         for (int layer = 0; layer < 2; ++layer) {
             inputs(layer, p);
@@ -153,7 +175,9 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
             frames[layer]->positions = {static_cast<std::uint64_t>(p)};
             ggml_backend_tensor_set(q, query.data(), 0, query.size() * sizeof(float));
             ggml_backend_tensor_set(keys[layer], key.data(), 0, key.size() * sizeof(float));
-            ggml_backend_tensor_set(values[layer], value.data(), 0, value.size() * sizeof(float));
+            // Packed views are produced from the separate source leaf.
+            auto * value_input=packed?packed_kv[layer]->src[1]:values[layer];
+            ggml_backend_tensor_set(value_input, value.data(), 0, value.size() * sizeof(float));
         }
         require(ggml_backend_sched_graph_compute(scheduler.get(), graph) == GGML_STATUS_SUCCESS, "prefetch graph execution");
         device.process_complete();
@@ -178,8 +202,11 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     else require(observer.completions == 12, "scheduler failed to confirm each layer's attention completion");
     if (controlled) require(stats.miss_projection_overlap_ns > 0, "missing I/O and KV projection did not overlap");
     if (disk) require(session.stats().prefetch.io.completed_reads > 0, "GGML path did not complete liburing reads");
-    if (builder) require(session.stats().ranking.builder_queries == 24 && session.stats().ranking.builder_appends == 24 &&
+    if (builder || direct) require(session.stats().ranking.builder_queries == 24 && session.stats().ranking.builder_appends == 24 &&
         session.stats().ranking.built_blocks == 10, "graph did not execute representative builder across prefill and decode");
+    if (direct) require(session.stats().direct_decode_queries==12 && session.stats().ranking.device_builder_queries==12 &&
+        session.stats().ranking.device_builder_appends==12 && session.stats().ranking.device_rank_queries>0 &&
+        session.stats().decode_kv_download_bytes==12ull*kv_heads*dimension*2*sizeof(solid::Half),"device decode counters or FP16 transfer size");
     device.quiesce(); session.finish();
     if (!directory.empty()) {
         std::ofstream output(directory / "stats.json");
@@ -199,17 +226,19 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
 int main(int argc, char ** argv) {
     try {
         const auto mode = solid::parse_schedule_mode(argc > 1 ? argv[1] : "naive");
-        bool builder=false,native=false;
+        bool builder=false,native=false,direct=false,packed=false;
         int index=2;
         for (;index<argc && std::string(argv[index]).rfind("--",0)==0;++index) {
             const std::string option=argv[index];
             if (option=="--builder") builder=true;
             else if (option=="--native-events") native=true;
+            else if (option=="--direct") direct=true;
+            else if (option=="--packed") packed=true;
             else throw std::invalid_argument("unknown graph check option");
         }
         const std::filesystem::path traces = argc > index ? argv[index] : "";
-        run(false, mode, traces, builder,native);
-        if (solid::uring_available()) run(true, mode, traces, builder,native);
+        run(false, mode, traces, builder,native,direct,packed);
+        if (solid::uring_available()) run(true, mode, traces, builder,native,direct,packed);
         std::cout << "multi-layer prefetch, liburing, GQA slot masks and CPU Flash Attention parity passed\n";
         return 0;
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }

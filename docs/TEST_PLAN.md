@@ -6,6 +6,8 @@
 
 微任务调度使用 [阶段 4](phases/PHASE_4.md) 的三组固定集合对照。检查覆盖 DAG/LST、Q 提前选择、worker 并发、延迟 pin、后继 Q 完成证明，以及真实合成图轨迹与统计的跨语言核对。
 
+[Decode 设备输入](implementation/DEVICE_INPUTS.md) 核对三种调度的同一 Q/K 接口、FP16 位模式、strided K/V、重复图分配、显式保活和异常排空。CPU 合成图执行数值对照；实验机设备程序核对实际 CUDA split 图、图重放及 decode 的 Q/K 上传差值。
+
 论文实验代码入口见 [阶段 5](phases/PHASE_5.md)。CUDA 矩阵模板覆盖精确长度、内存、预取、块/预算、SSD 差异和干扰；准确率接口连接固定版本的 OpenCompass 与 LongBench，汇总和图表保留运行来源。
 
 ## 1. 参考路径与数值对照

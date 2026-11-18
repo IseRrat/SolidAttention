@@ -25,6 +25,10 @@ public:
     StreamCompletionToken * completion_token(std::uint32_t layer) const;
     bool completion_host_marker() const;
     void select_early(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, bool query_covers_attention);
+    std::optional<DeviceMemory> direct_memory() const;
+    void select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool query_covers_attention);
+    std::vector<Half> decode_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys,
+                                  std::optional<DeviceQuery> serial_query = {});
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);
     ScheduleStats schedule_stats() const;
     // The caller keeps the context/backend alive until this has returned.
@@ -33,5 +37,9 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
+    void select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device, bool covers);
+    std::vector<Half> decode_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
+                                  const std::vector<float> & keys, const std::vector<float> & values, bool packed,
+                                  const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query);
 };
 } // namespace solid

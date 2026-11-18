@@ -21,10 +21,10 @@ foreach(SOLID_SOURCE IN LISTS SOLID_LLAMA_SOURCES)
 endforeach()
 set_property(TARGET llama PROPERTY SOURCES "${SOLID_ADAPTED_SOURCES}")
 target_sources(llama PRIVATE "${PROJECT_SOURCE_DIR}/src/llama_adapter.cpp" "${PROJECT_SOURCE_DIR}/src/projection.cpp"
-                            "${PROJECT_SOURCE_DIR}/src/ggml_prefetch.cpp")
+                            "${PROJECT_SOURCE_DIR}/src/ggml_prefetch.cpp" "${PROJECT_SOURCE_DIR}/src/device_ops.cpp")
 set_source_files_properties("${SOLID_OVERLAY}/llama-graph.cpp" "${SOLID_OVERLAY}/llama-context.cpp"
     "${PROJECT_SOURCE_DIR}/src/llama_adapter.cpp" "${PROJECT_SOURCE_DIR}/src/projection.cpp"
-    "${PROJECT_SOURCE_DIR}/src/ggml_prefetch.cpp"
+    "${PROJECT_SOURCE_DIR}/src/ggml_prefetch.cpp" "${PROJECT_SOURCE_DIR}/src/device_ops.cpp"
     TARGET_DIRECTORY llama PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(llama PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(llama PRIVATE solid_core)

@@ -95,6 +95,23 @@ void RepresentativeIndex::append_keys(std::uint32_t layer, std::uint64_t positio
     query_pending_[layer] = false;
     ++lengths_[layer];
 }
+void RepresentativeIndex::observe_query_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query) {
+    const auto memory = direct_memory();
+    if (!memory || position != lengths_.at(layer) || position >= geometry_.capacity_tokens || query_pending_.at(layer)) {
+        throw std::invalid_argument("device representative query state");
+    }
+    validate_device_query(query, *memory, query_heads_, geometry_.dimension);
+    accept_built(layer, position, ranker_->build_query_device(layer, position, query));
+    query_pending_[layer] = true;
+}
+void RepresentativeIndex::append_keys_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys) {
+    const auto memory = direct_memory();
+    if (!memory || position != lengths_.at(layer) || !query_pending_.at(layer)) throw std::invalid_argument("device representative append state");
+    validate_device_keys(keys, *memory, geometry_.heads, geometry_.dimension);
+    ranker_->build_append_device(layer, position, keys);
+    query_pending_[layer] = false;
+    ++lengths_[layer];
+}
 bool RepresentativeIndex::ready(std::uint32_t layer, std::uint64_t block) const {
     return blocks_.at(index(layer, 0)).at(block).finalized == geometry_.block_tokens;
 }
@@ -212,11 +229,22 @@ void RepresentativeIndex::accept_built(std::uint32_t layer, std::uint64_t positi
 }
 std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
     std::uint32_t layer, const std::vector<float> & query, const BlockCandidates & candidates) const {
-    if (layer >= geometry_.layers || query.size() != static_cast<std::size_t>(query_heads_) * geometry_.dimension ||
-        candidates.blocks.size() != candidates.tokens.size() || candidates.remaining > budget_.total) {
+    if (query.size() != static_cast<std::size_t>(query_heads_) * geometry_.dimension) throw std::invalid_argument("block query shape");
+    finite_query(query);
+    return rank_impl(layer, &query, nullptr, candidates);
+}
+std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
+    std::uint32_t layer, DeviceQuery query, const BlockCandidates & candidates) const {
+    const auto memory = direct_memory();
+    if (!memory) throw std::logic_error("direct device ranking is disabled");
+    validate_device_query(query, *memory, query_heads_, geometry_.dimension);
+    return rank_impl(layer, nullptr, &query, candidates);
+}
+std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
+    std::uint32_t layer, const std::vector<float> * query, const DeviceQuery * device, const BlockCandidates & candidates) const {
+    if (layer >= geometry_.layers || candidates.blocks.size() != candidates.tokens.size() || candidates.remaining > budget_.total) {
         throw std::invalid_argument("block ranking shape or budget");
     }
-    finite_query(query);
     std::uint64_t available = 0;
     for (std::size_t i = 0; i < candidates.blocks.size(); ++i) {
         if ((i && candidates.blocks[i] <= candidates.blocks[i-1]) || candidates.blocks[i] >= geometry_.blocks_per_head() ||
@@ -228,12 +256,13 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
     const auto needed = std::min<std::uint64_t>(available, candidates.remaining);
     std::vector<std::vector<std::uint64_t>> result(geometry_.heads);
     if (!needed) return result;
-    if (ranker_) result = ranker_->rank(layer, query, candidates);
+    if (device) result = ranker_->rank_device(layer, *device, candidates);
+    else if (ranker_) result = ranker_->rank(layer, *query, candidates);
     else for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
         std::vector<std::pair<double, std::uint64_t>> best;
         const auto better = [](const auto & a, const auto & b) { return a.first == b.first ? a.second < b.second : a.first > b.first; };
         for (const auto block : candidates.blocks) {
-            best.emplace_back(score(layer, head, block, query), block);
+            best.emplace_back(score(layer, head, block, *query), block);
             std::push_heap(best.begin(), best.end(), better);
             if (best.size() > candidates.remaining) { std::pop_heap(best.begin(), best.end(), better); best.pop_back(); }
         }
@@ -280,15 +309,11 @@ std::uint64_t RepresentativeIndex::resident_bytes() const {
     }
     return total;
 }
-std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
+template<class Query> static std::vector<HeadSelection> select_blocks_impl(const KvGeometry & geometry, const SparseBudget & budget,
                                         const RepresentativeIndex & representatives, std::uint32_t layer,
-                                        std::uint64_t position, const std::vector<float> & query) {
+                                        std::uint64_t position, const Query & query) {
     budget.validate(geometry);
     if (position >= geometry.capacity_tokens) throw std::out_of_range("selection position");
-    if (query.size() != static_cast<std::size_t>(representatives.query_heads()) * geometry.dimension) {
-        throw std::invalid_argument("selection query shape");
-    }
-    finite_query(query);
     const auto count = position + 1;
     std::vector<HeadSelection> result(geometry.heads);
     std::set<std::uint64_t> deterministic;
@@ -327,6 +352,21 @@ std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const Spar
         }
     }
     return result;
+}
+std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
+                                        const RepresentativeIndex & representatives, std::uint32_t layer,
+                                        std::uint64_t position, const std::vector<float> & query) {
+    if (query.size() != static_cast<std::size_t>(representatives.query_heads())*geometry.dimension) throw std::invalid_argument("selection query shape");
+    finite_query(query);
+    return select_blocks_impl(geometry, budget, representatives, layer, position, query);
+}
+std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
+                                        const RepresentativeIndex & representatives, std::uint32_t layer,
+                                        std::uint64_t position, DeviceQuery query) {
+    const auto memory = representatives.direct_memory();
+    if (!memory) throw std::logic_error("direct device selection is disabled");
+    validate_device_query(query, *memory, representatives.query_heads(), geometry.dimension);
+    return select_blocks_impl(geometry, budget, representatives, layer, position, query);
 }
 std::vector<float> streamed_attention(KvStore & store, std::uint32_t layer, std::uint64_t position,
                                       std::uint32_t query_heads, const std::vector<float> & query, float scale,

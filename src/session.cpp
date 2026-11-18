@@ -285,6 +285,7 @@ std::vector<HeadSelection> AttentionSession::select_before_kv(std::uint32_t laye
         auto selected = select(layer, position, query);
         stats_.selection_ns += elapsed(start);
         early_ = std::make_pair(layer, position);
+        direct_early_ = false;
         record(layer, position, selected);
         for (const auto & head : selected) stats_.selected_tokens += head.positions.size();
         return selected;
@@ -292,7 +293,7 @@ std::vector<HeadSelection> AttentionSession::select_before_kv(std::uint32_t laye
 }
 void AttentionSession::append_after_selection(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                              const std::vector<float> & keys, const std::vector<float> & values, bool packed) {
-    if (failed_ || !early_ || *early_ != std::make_pair(layer, position) ||
+    if (failed_ || !early_ || direct_early_ || *early_ != std::make_pair(layer, position) ||
         query.size() != static_cast<std::size_t>(query_heads_) * geometry().dimension ||
         keys.size() != static_cast<std::size_t>(geometry().heads) * geometry().dimension * (packed ? 2 : 1) ||
         (packed ? !values.empty() : values.size() != keys.size())) throw std::invalid_argument("late KV does not match early selection");
@@ -300,6 +301,39 @@ void AttentionSession::append_after_selection(std::uint32_t layer, std::uint64_t
         append_token(layer, position, query, keys.data(), packed ? nullptr : values.data(), true);
         early_.reset();
         ++stats_.attention_queries;
+    } catch (...) { failed_ = true; throw; }
+}
+std::vector<HeadSelection> AttentionSession::select_before_kv_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query) {
+    if (failed_ || early_ || !prefetch_ || !direct_memory() || position < prefill_tokens_ || store_->length(layer) != position) {
+        throw std::logic_error("device early selection requires an uncommitted decode position");
+    }
+    try {
+        const auto start = Clock::now();
+        representatives_->observe_query_device(layer, position, query);
+        auto selected = select_blocks(geometry(), budget_, *representatives_, layer, position, query);
+        stats_.selection_ns += elapsed(start);
+        early_ = std::make_pair(layer, position);
+        direct_early_ = true;
+        record(layer, position, selected);
+        for (const auto & head : selected) stats_.selected_tokens += head.positions.size();
+        return selected;
+    } catch (...) { failed_ = true; throw; }
+}
+void AttentionSession::append_after_selection_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys) {
+    if (failed_ || !early_ || !direct_early_ || *early_ != std::make_pair(layer, position) ||
+        kv.size() != static_cast<std::size_t>(geometry().heads)*geometry().dimension*2) {
+        throw std::invalid_argument("device late KV does not match early selection");
+    }
+    try {
+        for (const auto value : kv) if (!std::isfinite(from_half(value))) throw std::invalid_argument("non-finite device KV offload");
+        const auto start = Clock::now();
+        representatives_->append_keys_device(layer, position, keys);
+        store_->append_interleaved(layer, position, kv);
+        stats_.append_ns += elapsed(start);
+        stats_.decode_kv_download_bytes += kv.size()*sizeof(Half);
+        ++stats_.direct_decode_queries;
+        ++stats_.attention_queries;
+        early_.reset(); direct_early_ = false;
     } catch (...) { failed_ = true; throw; }
 }
 void AttentionSession::record(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & selection) {

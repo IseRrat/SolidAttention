@@ -26,6 +26,7 @@ struct SessionStats {
     std::uint64_t gather_copy_bytes = 0;
     std::uint64_t streaming_attention_ns = 0;
     std::uint64_t tiled_prefill_ns = 0;
+    std::uint64_t direct_decode_queries = 0, decode_kv_download_bytes = 0;
     PrefetchStats prefetch;
 };
 
@@ -60,6 +61,9 @@ public:
     std::vector<HeadSelection> select_before_kv(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query);
     void append_after_selection(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                 const std::vector<float> & keys, const std::vector<float> & values, bool interleaved_inputs);
+    std::optional<DeviceMemory> direct_memory() const { return representatives_ && !replay_.is_open() ? representatives_->direct_memory() : std::optional<DeviceMemory>{}; }
+    std::vector<HeadSelection> select_before_kv_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query);
+    void append_after_selection_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys);
     void flush_full_layer(std::uint32_t layer) { store_->flush_full_layer(layer); }
 private:
     std::unique_ptr<KvStore> store_;
@@ -76,6 +80,7 @@ private:
     std::ifstream replay_;
     bool failed_ = false;
     std::optional<std::pair<std::uint32_t, std::uint64_t>> early_;
+    bool direct_early_ = false;
     void append_token(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                       const float * keys, const float * values, bool query_observed = false);
     void record(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & selection);

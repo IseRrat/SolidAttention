@@ -46,6 +46,8 @@ CUDA 数学使用 FP64 并关闭 FMA 收缩，保持 CPU 的 query、维度累�
 
 `selection_backend=auto/cpu/cuda` 继续控制选择路径。CUDA 路径在首个 attention 图初始化，代表构造覆盖 prefill 和 decode；`cpu` 使用原有参考。固定选择回放沿用 CPU 路径。工厂参数 `local=0` 提供仅评分后端，用于独立算子核查。
 
+CUDA 预取 decode 已接入设备 Q 和交错 FP16 K，三种调度共用借用接口。主机 prefill 接口继续提供 Q/K；输入类型、图保活和上传计数见 [设备输入](DEVICE_INPUTS.md)。
+
 ## 4. 分配与记录
 
 每层构造工作区字节数为：

@@ -27,8 +27,34 @@ class Emulator final : public solid::BlockRanker {
         solid::RepresentativeSeed top;
     };
 public:
-    Emulator(solid::KvGeometry geometry, std::uint32_t query_heads, solid::SparseBudget budget) :
-        g(geometry), qh(query_heads), b(budget), layers(geometry.layers), prefixes(geometry.layers,0) {}
+    Emulator(solid::KvGeometry geometry, std::uint32_t query_heads, solid::SparseBudget budget, bool direct = false) :
+        g(geometry), qh(query_heads), b(budget), layers(geometry.layers), prefixes(geometry.layers,0), direct_(direct) {}
+    std::optional<solid::DeviceMemory> direct_memory() const override {
+        return direct_ ? std::optional<solid::DeviceMemory>{solid::DeviceMemory::host_emulator} : std::optional<solid::DeviceMemory>{};
+    }
+    std::vector<float> device_query(solid::DeviceQuery query) const {
+        require(direct_,"direct emulator is disabled");
+        solid::validate_device_query(query,solid::DeviceMemory::host_emulator,qh,g.dimension);
+        std::vector<float> values(query.data,query.data+query.elements);
+        for (auto q:values) require(std::isfinite(q),"non-finite device query");
+        return values;
+    }
+    std::optional<solid::BuiltRepresentatives> build_query_device(std::uint32_t layer,std::uint64_t p,solid::DeviceQuery query) override {
+        auto result=build_query(layer,p,device_query(query)); ++stats_.device_builder_queries; return result;
+    }
+    void build_append_device(std::uint32_t layer,std::uint64_t p,solid::DeviceKeys keys) override {
+        require(direct_,"direct emulator is disabled");
+        solid::validate_device_keys(keys,solid::DeviceMemory::host_emulator,g.heads,g.dimension);
+        std::vector<solid::Half> values(static_cast<std::size_t>(g.heads)*g.dimension);
+        for (std::uint32_t h=0;h<g.heads;++h) for (std::uint32_t d=0;d<g.dimension;++d) {
+            const auto k=keys.data[h*keys.head_stride+d];
+            require(std::isfinite(solid::from_half(k)),"non-finite device key"); values[h*g.dimension+d]=k;
+        }
+        build_append(layer,p,values); ++stats_.device_builder_appends;
+    }
+    std::vector<std::vector<std::uint64_t>> rank_device(std::uint32_t layer,solid::DeviceQuery query,const solid::BlockCandidates & candidates) override {
+        auto result=rank(layer,device_query(query),candidates); ++stats_.device_rank_queries; return result;
+    }
     void publish(std::uint32_t layer, std::uint64_t first, std::uint64_t count, const std::vector<solid::Half> & keys) override {
         const auto size = static_cast<std::size_t>(g.heads)*b.representatives*g.dimension;
         require(first == prefixes.at(layer) && keys.size() == count*size, "emulator publication prefix");
@@ -145,6 +171,7 @@ public:
     std::map<std::pair<std::uint32_t,std::uint64_t>,std::vector<solid::Half>> bank;
     solid::RankerStats stats_;
     int corrupt = 0;
+    bool direct_ = false;
 };
 
 template<class Factory> void run_case(Factory factory, solid::KvGeometry g, std::uint32_t qh, solid::SparseBudget budget,

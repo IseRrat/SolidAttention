@@ -38,11 +38,13 @@
 
 - CUDA attention 设备事件、图重放通知、后继 H2D、Q 边界交接及设备计时，完成记录见 [原生完成事件](implementation/NATIVE_COMPLETION.md)。
 
+- Decode 设备 Q/K、FP16 consolidator、图保活依赖和三种调度共用输入，完成记录见 [设备输入](implementation/DEVICE_INPUTS.md)。
+
 ## 3. 论文路径与后续核心代码
 
 | 核查项 | 当前执行路径 | 后续代码与核查要求 |
 | --- | --- | --- |
-| GPU 算子覆盖，§3.1、§4、§7 | Q/KV 经主机前沿接入 [CUDA 代表构造](implementation/GPU_REPRESENTATIVES.md) 和 [评分/top-k](implementation/GPU_SELECTION.md)；CPU 维护候选与核查镜像；decode attention 复用 GGML GPU 算子 | 补齐直接消费设备 Q 与交错 KV 更新；逐算子记录输入输出、dtype、stride、设备和依赖 |
+| GPU 算子覆盖，§3.1、§4、§7 | [Decode 设备输入](implementation/DEVICE_INPUTS.md) 直接供 CUDA 代表构造、评分和 K 追加使用；GPU 转换 FP16 交错 KV 后交给主机存储；图引用覆盖私有流消费；CPU 维护候选与核查镜像 | 继续扩展 prefill 设备输入；逐算子补齐设备区间与完整资源图 |
 | 长输入 prefill | [CUDA 分块 prefill](implementation/GPU_PREFILL.md) 在固定 Q/KV 池上累计因果 attention；代表使用 GPU 窗口构造；CPU 流式路径用于参考 | 继续接入设备 Q/K，核查模型级误差、峰值与性能 |
 | 算法 1 的调度范围，§6.1 | [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 在历史工作集建立逐块 READ→H2D→汇合；关键路径/LST 传入独立 I/O 队列并决定就绪复制次序；外层保留 12 项任务 | 继续将预测期读取、当前 KV 的 D2H/回写及跨层槽位释放连接统一资源图；CUDA attention 事件已解锁后继上传 |
 | selected 优先，§6.1 | [块读取流水](implementation/BLOCK_READ_PIPELINE.md) 先确定集合，再跨 head 按 selected 优先派发；正式所需请求提升，完成块逐个进入 H2D；受限队列核对实际次序及最终汇合 | 历史正式工作集已连接块级成本、关键路径/LST 和资源分派；继续把预测期成本与跨层依赖纳入图 |
@@ -54,7 +56,7 @@ prefill 的 GPU 分块方案属于长上下文工程补齐；论文 §7 对实�
 
 ## 4. 后续开发顺序与交付
 
-1. 在 CUDA 代表构造/评分/top-k、分块 prefill 基础上补齐直接消费设备 Q 和交错 KV 更新的数据流。
+1. 在 decode 设备 Q/K 接入基础上扩展 prefill 设备输入与批量代表更新。
 2. 在历史 READ/H2D 块图基础上纳入预测期读取、D2H/回写与跨层槽位事件。
 3. 在 CUDA attention 事件基础上完善 Q/KV 投影及其他传输的设备观测。
 4. 复核 CUDA 全路径，补齐 SYCL 与统一内存接入。

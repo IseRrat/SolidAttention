@@ -1,6 +1,7 @@
 #pragma once
 
 #include "solid/kv_store.hpp"
+#include "solid/device_input.hpp"
 #include <memory>
 #include <optional>
 #include <stdexcept>
@@ -23,6 +24,8 @@ struct RankerStats {
     std::uint64_t builder_queries = 0;
     std::uint64_t builder_appends = 0;
     std::uint64_t built_blocks = 0;
+    std::uint64_t device_rank_queries = 0, device_builder_queries = 0, device_builder_appends = 0;
+    std::uint64_t query_upload_bytes = 0, builder_key_upload_bytes = 0;
 };
 struct RepresentativeSeed {
     std::uint64_t length = 0;
@@ -58,6 +61,16 @@ public:
     virtual const char * name() const = 0;
     virtual std::uint32_t builder_window() const { return 0; }
     virtual const char * builder_name() const { return "cpu"; }
+    virtual std::optional<DeviceMemory> direct_memory() const { return {}; }
+    virtual std::vector<std::vector<std::uint64_t>> rank_device(std::uint32_t, DeviceQuery, const BlockCandidates &) {
+        throw std::logic_error("direct device ranking is disabled");
+    }
+    virtual std::optional<BuiltRepresentatives> build_query_device(std::uint32_t, std::uint64_t, DeviceQuery) {
+        throw std::logic_error("direct device representative query is disabled");
+    }
+    virtual void build_append_device(std::uint32_t, std::uint64_t, DeviceKeys) {
+        throw std::logic_error("direct device representative append is disabled");
+    }
     virtual void seed_builder(std::uint32_t, const RepresentativeSeed &) { throw std::logic_error("representative builder is disabled"); }
     // A complete block is committed to the ranker's bank before it is returned.
     virtual std::optional<BuiltRepresentatives> build_query(std::uint32_t, std::uint64_t, const std::vector<float> &) {

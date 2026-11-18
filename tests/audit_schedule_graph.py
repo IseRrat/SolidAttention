@@ -10,10 +10,12 @@ from compare_prefetch import audit_residency
 from schedule_ablation import audit_schedule, audit_block_schedule, MODES, NAMES
 
 with tempfile.TemporaryDirectory(prefix="solid-schedule-audit-") as temporary:
-    for name, mode in list(zip(NAMES,MODES))+[("native-events","overlap+sync_reuse")]:
+    for name, mode in list(zip(NAMES,MODES))+[("native-events","overlap+sync_reuse"),("device-input","overlap+sync_reuse"),("device-serial","naive")]:
         directory = Path(temporary) / name
         directory.mkdir()
         flags=["--native-events"] if name=="native-events" else []
+        if name=="device-input": flags=["--direct","--packed","--native-events"]
+        if name=="device-serial": flags=["--direct","--packed"]
         subprocess.run([sys.argv[1], mode,*flags,str(directory)], check=True, timeout=45)
         for folder in directory.iterdir():
             observed = audit_schedule(folder / "schedule.jsonl", mode)

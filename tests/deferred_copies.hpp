@@ -23,6 +23,7 @@ struct DeferredCopies {
     DeferredCopies() {
         device.context = this;
         device.iface.get_name = [](ggml_backend_dev_t) { return "deferred-cpu-test"; };
+        device.iface.get_type = [](ggml_backend_dev_t) { return GGML_BACKEND_DEVICE_TYPE_CPU; };
         device.iface.get_buffer_type = [](ggml_backend_dev_t) { return ggml_backend_cpu_buffer_type(); };
         device.iface.get_host_buffer_type = device.iface.get_buffer_type;
         device.iface.init_backend = [](ggml_backend_dev_t dev, const char *) {

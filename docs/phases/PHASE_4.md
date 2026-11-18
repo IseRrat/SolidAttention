@@ -169,3 +169,5 @@ python3 scripts/schedule_ablation.py compare results/schedule-configs/schedule-a
 本机输入为合成张量与临时文件，数学计算使用 CPU 后端。模型数值、CUDA 复制与计算并发、设备延迟、显存峰值及论文实验在实验环境按上述入口核查。阶段索引见 [完成记录](README.md)，后续实验见 [阶段 5](../ROADMAP.md#阶段-5论文实验)。
 
 2026-11-18 接入逐块历史 H2D。overlap 的历史上传依赖选择，与纠错读取重叠；追加等待 KV 下载、纠错读取和历史上传共同完成。当前仍记录 12 项聚合任务，完成记录见 [块读取流水](../implementation/BLOCK_READ_PIPELINE.md)。
+
+2026-11-18 接入 [Decode 设备 Q/K](../implementation/DEVICE_INPUTS.md)。三种调度共用设备 Q、FP16 KV 转换与设备 K 追加；重叠模式通过标量建立 CPU 选择前沿，串行模式在 KV 到达后选择。图引用明确覆盖借用生命周期；设备输入和主机输入的层图、块图、错误排空及数值均纳入核查。

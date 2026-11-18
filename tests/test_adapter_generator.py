@@ -29,6 +29,10 @@ class GeneratorTests(unittest.TestCase):
             self.assertEqual(first_cuda,(output/"ggml-cuda.cu").read_bytes())
             self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_attention_begin("),1)
             self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_attention_end("),1)
+            self.assertEqual(first_cuda.count(b"case GGML_OP_CUSTOM:"),2)
+            self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_device_op(dst, ctx.stream()))"),1)
+            self.assertIn(b"return solid::device_op_supported(op);",first_cuda)
+            self.assertIn(b"if (!solid::device_op_supported(dst)) return false;",first_cuda)
             self.assertLess(first_cuda.index(b"CUDA_CHECK(solid::cuda_attention_begin("),
                             first_cuda.index(b"CUDA_CHECK(solid::cuda_attention_end("))
             self.assertIn(b"solid::adapter_attention", first["llama-graph.cpp"])

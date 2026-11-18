@@ -172,6 +172,7 @@ struct LayerWork {
     TaskDag dag;
     std::shared_ptr<BlockStage> blocks;
     bool consumed = false;
+    bool direct = false;
     LayerWork(std::uint32_t layer, std::uint64_t position, ScheduleMode mode, ScheduleTrace & trace,
                std::uint64_t id, const std::array<std::uint64_t, task_count> & estimates) :
         layer(layer), position(position), dag([&] {
@@ -198,6 +199,7 @@ struct LayerWork {
 }
 struct GgmlPrefetch::Impl {
     AttentionSession & session;
+    ggml_backend_t backend;
     ScheduleMode mode;
     TaskWorker worker;
     mutable std::mutex mutex;
@@ -214,18 +216,18 @@ struct GgmlPrefetch::Impl {
     bool quiesced = true;
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
           const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied) :
-        session(s), mode(mode), worker(cpu), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
+        session(s), backend(backend), mode(mode), worker(cpu), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
             schedule.parent_path()/(schedule.stem().string()+".blocks"+schedule.extension().string())),
         events(attention_events(s,backend,mode,std::move(supplied))),
         transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode,events.get()),
         device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) {
         estimates.fill(1); totals.coordinator_cpu=cpu; totals.completion_backend=events?events->name():"graph_boundaries";
     }
-    std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position) {
+    std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position,bool direct=false) {
         if (work && !work->dag.finished()) throw std::logic_error("new layer started before previous completion proof");
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
         work = std::make_shared<LayerWork>(layer, position, mode, trace, ++sequence, estimates);
-        work->dag.fence({q_ready,q_d2h}, trace.now(), "query_download_complete");
+        work->dag.fence({q_ready,q_d2h}, trace.now(), direct?"query_device_input_ready":"query_download_complete");
         return work;
     }
     void finish_frame(const std::string & proof,std::optional<std::uint64_t> device_ns={}) {
@@ -327,6 +329,23 @@ void GgmlPrefetch::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
     impl_->session.begin_prefetch(layer, position);
 }
 void GgmlPrefetch::select_early(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, bool covers) {
+    select_impl(layer, position, query, nullptr, covers);
+}
+std::optional<DeviceMemory> GgmlPrefetch::direct_memory() const {
+    const auto memory = impl_->session.direct_memory();
+    if (!memory) return {};
+    if (*memory == DeviceMemory::host_emulator && ggml_backend_dev_type(ggml_backend_get_device(impl_->backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) return memory;
+#ifdef SOLID_HAVE_CUDA_SELECTION
+    if (*memory == DeviceMemory::cuda && ggml_backend_is_cuda(impl_->backend)) return memory;
+#endif
+    return {};
+}
+void GgmlPrefetch::select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool covers) {
+    const auto memory = direct_memory();
+    if (!memory || query.memory != *memory) throw std::invalid_argument("device selection backend mismatch");
+    select_impl(layer, position, {}, &query, covers);
+}
+void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device, bool covers) {
     if (!early_enabled()) throw std::logic_error("early selection is disabled");
     if (impl_->events) {
         if (covers) impl_->events->boundary(AttentionProof::query_boundary);
@@ -344,10 +363,11 @@ void GgmlPrefetch::select_early(std::uint32_t layer, std::uint64_t position, con
         }
     }
     impl_->session.begin_prefetch(layer, position);
-    const auto work = impl_->new_work(layer, position);
+    const auto work = impl_->new_work(layer, position,device!=nullptr);
     work->query = query;
+    work->direct = device != nullptr;
     work->dag.start(select_task, impl_->trace.now());
-    work->selection = impl_->session.select_before_kv(layer, position, query);
+    work->selection = device ? impl_->session.select_before_kv_device(layer, position, *device) : impl_->session.select_before_kv(layer, position, query);
     work->dag.complete(select_task, impl_->trace.now());
     work->dag.start(kv_projection, impl_->trace.now());
     ++impl_->totals.worker_jobs;
@@ -379,10 +399,23 @@ void GgmlPrefetch::select_early(std::uint32_t layer, std::uint64_t position, con
 }
 std::vector<Half> GgmlPrefetch::decode(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                       const std::vector<float> & keys, const std::vector<float> & values, bool packed) {
+    return decode_impl(layer, position, query, keys, values, packed, nullptr, nullptr, nullptr);
+}
+std::vector<Half> GgmlPrefetch::decode_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys,
+                                          std::optional<DeviceQuery> serial_query) {
+    return decode_impl(layer, position, {}, {}, {}, true, &kv, &keys, serial_query?&*serial_query:nullptr);
+}
+std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
+                                          const std::vector<float> & keys, const std::vector<float> & values, bool packed,
+                                          const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query) {
     const auto current = impl_->work;
+    if ((half != nullptr) != (device != nullptr) || (half && (early_enabled() == (serial_query!=nullptr)))) {
+        throw std::invalid_argument("device decode query frontier mismatch");
+    }
     if (early_enabled()) {
         if (!current || current->layer != layer || current->position != position || current->consumed) throw std::logic_error("KV arrived without its early query");
-        current->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), "kv_download_complete");
+        if (current->direct != (half != nullptr)) throw std::logic_error("KV memory does not match early query");
+        current->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), half?"kv_fp16_download_complete":"kv_download_complete");
     }
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -390,10 +423,13 @@ std::vector<Half> GgmlPrefetch::decode(std::uint32_t layer, std::uint64_t positi
     auto work = current;
     if (!early_enabled()) {
         impl_->device.wait_transfers(); impl_->session.begin_prefetch(layer, position);
-        work = impl_->new_work(layer, position);
-        work->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), "serial_kv_download_complete");
+        work = impl_->new_work(layer, position,half!=nullptr);
+        work->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), half?"serial_kv_fp16_download_complete":"serial_kv_download_complete");
         work->dag.start(append, impl_->trace.now());
-        work->selection = impl_->session.select_decode(layer, position, query, keys, values, packed);
+        if (half) {
+            work->selection = impl_->session.select_before_kv_device(layer,position,*serial_query);
+            impl_->session.append_after_selection_half(layer,position,*half,*device);
+        } else work->selection = impl_->session.select_decode(layer, position, query, keys, values, packed);
         work->dag.complete(append, impl_->trace.now());
         work->dag.fence({select_task}, impl_->trace.now(), "serial_selection_complete");
         work->dag.start(miss_read, impl_->trace.now());
@@ -401,7 +437,8 @@ std::vector<Half> GgmlPrefetch::decode(std::uint32_t layer, std::uint64_t positi
         if (reuses_sync()) impl_->device.wait_transfers_coalesced(); else impl_->device.wait_transfers();
         work->dag.complete(history_h2d, impl_->trace.now(), "historical_copy_complete");
         work->dag.start(append, impl_->trace.now());
-        impl_->session.append_after_selection(layer, position, work->query, keys, values, packed);
+        if (half) impl_->session.append_after_selection_half(layer, position, *half, *device);
+        else impl_->session.append_after_selection(layer, position, work->query, keys, values, packed);
         work->dag.complete(append, impl_->trace.now());
     }
     auto & host = impl_->session.prefetcher();
