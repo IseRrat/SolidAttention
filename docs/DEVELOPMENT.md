@@ -30,6 +30,8 @@ bash scripts/check.sh --cuda
 
 Linux 默认启用 `SOLID_URING`，准备 `liburing-dev` 开发包。纯可移植核心构建可设置 `-DSOLID_URING=OFF`；预取入口检查对应构建特性。`bash scripts/check.sh --sanitize` 对核心库与配置运行地址、泄漏和未定义行为检查。
 
+`bash scripts/check.sh --sanitize-adapter` 在独立 CPU 构建目录检查当前 KV 复制、三种设备输入图、融合输入、复制失败排空与原生完成协议。7 项检查启用地址、泄漏和未定义行为检查，覆盖 GGML 适配器及异步张量描述符。
+
 `solid-baseline --build-info` 输出编译时的源码哈希。`scripts/run_baseline.py --check-build` 校验二进制与当前源码是否一致；启动实验前自动执行同一检查。
 
 ## 在实验环境运行原版基线
@@ -73,7 +75,7 @@ liburing 历史预取、同步参考对照与轨迹核查见 [阶段 3](phases/P
 
 精确 token、实验准备/执行/续跑/汇总、cgroup 与只读 fio、OpenCompass/LongBench 接口、准确率表和绘图命令见 [阶段 5](phases/PHASE_5.md)。`--tokenize CONFIG` 读取词表并输出 token JSON；原生 `kv_dtype=q4_0` 供准确率对照，自定义 attention 使用 F16。
 
-异常路径、独立复制排空、SIGTERM/子进程清理和实验完成状态的检查见 [工程审查记录](ENGINEERING_REVIEW.md)。当前完整入口覆盖 50 项 CTest 和 62 项 Python 检查；合成进程组检查在 Linux 执行。
+异常路径、独立复制排空、SIGTERM/子进程清理和实验完成状态的检查见 [工程审查记录](ENGINEERING_REVIEW.md)。当前完整入口覆盖 51 项 CTest 和 64 项 Python 检查；合成进程组检查在 Linux 执行。
 
 CUDA 评分与 top-k 的内核接入、`selection_backend`、分配计数及实验环境设备检查见 [GPU 选择完成记录](implementation/GPU_SELECTION.md)。本机完整检查编译设备检查程序，数学执行使用 CPU 合成数据。
 
@@ -81,7 +83,7 @@ CUDA 窗口构造、完整状态接管和预取调度图衔接见 [GPU 代表构
 
 CUDA 分块 prefill、配置、内存峰值与池释放见 [GPU prefill 完成记录](implementation/GPU_PREFILL.md)。加入该路径后，核心库 9 项 CTest 通过地址、泄漏和未定义行为检查。
 
-独立 I/O 与协调线程、`io_cpu/coordinator_cpu`、物理核预留、有界队列及取消协议见 [I/O 线程完成记录](implementation/IO_WORKERS.md)。当前核心库 14 项 CTest 通过地址、泄漏和未定义行为检查。
+独立 I/O 与协调线程、`io_cpu/coordinator_cpu`、物理核预留、有界队列及取消协议见 [I/O 线程完成记录](implementation/IO_WORKERS.md)。当前核心库 15 项 CTest 通过地址、泄漏和未定义行为检查。
 
 selected 优先、正式请求提升、SSD/H2D 流水和依赖汇合见 [块读取流水完成记录](implementation/BLOCK_READ_PIPELINE.md)。
 
@@ -92,3 +94,5 @@ CUDA attention 原生事件、图重放通知、后台 H2D、正式选择接管�
 Decode 设备 Q/K、FP16 consolidator、三种调度共用输入及计算图保活检查见 [设备输入完成记录](implementation/DEVICE_INPUTS.md)。`solid-cuda-device-input-test --run-device-check 0` 在实验机核对真实 CUDA split 图和同图多轮复用；本机完整入口只编译该程序。
 
 Prefill 设备 Q/当前 KV、批量代表、设备输出视图和图结果内存见 [Prefill 设备接入](implementation/PREFILL_DEVICE_INPUTS.md)。本机运行 CPU split 图、临时文件、读取失败和预取 decode 交接；`solid-cuda-device-prefill-test --run-device-check 0` 在实验机执行设备核查。原生通知用例可通过 `solid-native-completion-test --repeat 30` 重复核对唤醒与回收。
+
+当前 KV 行 D2D、尾块前缀原槽复用和历史缺口 H2D 见 [当前设备 KV](implementation/CURRENT_DEVICE_KV.md)。三种模式及延迟复制失败纳入 CPU 图核查；设备检查程序同时核对当前行复制计数。

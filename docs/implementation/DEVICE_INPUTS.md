@@ -34,6 +34,8 @@ Q 布局为连续 FP32 `[Hq,D]`；交错 KV 为 FP16 `[Hkv,2,D]`。K 借用视�
 
 每层每个 decode token 交给主机追加的 KV 为 `Hkv*2*D*sizeof(Half)` 字节。代表构造和评分直接读取设备 Q，代表环直接读取设备 K。[Prefill 设备接入](PREFILL_DEVICE_INPUTS.md) 覆盖批量 Q/K、历史 tile 分区和设备输出；主机接口继续用于参考。
 
+[当前设备 KV](CURRENT_DEVICE_KV.md) 将 consolidator 的当前行直接 D2D 到 attention bank，保留同层/head/block 的可用设备前缀，只从主机补齐历史缺口。释放 mask 的 Q/KV 图引用覆盖复制期，票据持有独立张量描述符；对应传输字节及版本进入驻留核查。
+
 ## 3. 生命周期与图重放
 
 借用接口要求生产者先完成，所有者保留输入分配至调用返回。CUDA 消费函数核对内存类型与 device ordinal，使用自有 non-blocking stream，在归还借用源前完成该 stream。空候选和初始空窗口也核查设备 Q 的有限值。

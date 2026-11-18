@@ -145,7 +145,7 @@ struct AttentionNode::Impl {
                     if (!early) serial_query = DeviceQuery{static_cast<const float *>(self.device_query->data),
                         static_cast<std::size_t>(ggml_nelements(self.device_query)),*self.direct};
                     result = self.prefetch->decode_half(self.layer,self.frame->positions.front(),kv,
-                        {static_cast<const Half *>(self.device_kv->data),kv.size(),static_cast<std::size_t>(self.device_kv->ne[0]),*self.direct},serial_query);
+                        {static_cast<const Half *>(self.device_kv->data),kv.size(),static_cast<std::size_t>(self.device_kv->ne[0]),*self.direct},serial_query,self.device_kv);
                 } else result = early ? self.prefetch->decode(self.layer, self.frame->positions.front(), {}, inputs[0], self.packed_inputs ? std::vector<float>{} : inputs[1], self.packed_inputs) :
                     self.prefetch->decode(self.layer, self.frame->positions.front(), inputs[0], inputs[1], inputs[2], self.packed_inputs);
                 self.epoch = self.prefetch->attention_epoch();

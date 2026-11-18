@@ -22,7 +22,9 @@ with tempfile.TemporaryDirectory(prefix="solid-schedule-audit-") as temporary:
             expected = json.loads((folder / "stats.json").read_text())
             if observed != expected:
                 raise ValueError(f"schedule trace differs from C++ metrics: {name}/{folder.name}: {observed} != {expected}")
-            audit_residency(folder / "residency.jsonl", 2, 6)
+            residency=audit_residency(folder / "residency.jsonl", 2, 6)
+            for key,value in json.loads((folder/"device-stats.json").read_text()).items():
+                if residency.get(key,0)!=value: raise ValueError(f"device row transfer metrics differ: {name}/{folder.name}/{key}")
             blocks=audit_block_schedule(folder/"schedule.blocks.jsonl",mode,folder/"schedule.jsonl")
             if blocks != json.loads((folder/"block-stats.json").read_text()):
                 raise ValueError(f"block schedule trace differs from C++ metrics: {name}/{folder.name}")

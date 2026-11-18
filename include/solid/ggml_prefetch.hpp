@@ -28,7 +28,7 @@ public:
     std::optional<DeviceMemory> direct_memory() const;
     void select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool query_covers_attention);
     std::vector<Half> decode_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys,
-                                  std::optional<DeviceQuery> serial_query = {});
+                                  std::optional<DeviceQuery> serial_query = {},ggml_tensor * device_source = nullptr);
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);
     ScheduleStats schedule_stats() const;
     // The caller keeps the context/backend alive until this has returned.
@@ -40,6 +40,6 @@ private:
     void select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device, bool covers);
     std::vector<Half> decode_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                   const std::vector<float> & keys, const std::vector<float> & values, bool packed,
-                                  const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query);
+                                  const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * device_source);
 };
 } // namespace solid

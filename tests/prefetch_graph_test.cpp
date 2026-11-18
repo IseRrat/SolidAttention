@@ -226,6 +226,8 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         session.stats().direct_decode_queries==12 && session.stats().ranking.device_builder_queries==24 &&
         session.stats().ranking.device_builder_appends==24 && session.stats().ranking.device_rank_queries>0 &&
         session.stats().decode_kv_download_bytes==12ull*kv_heads*dimension*2*sizeof(solid::Half),"device decode counters or FP16 transfer size");
+    if (direct) require(device.stats().current_device_rows==12ull*kv_heads &&
+        device.stats().current_device_bytes==12ull*kv_heads*dimension*2*sizeof(solid::Half),"current KV did not use device row transfers");
     device.quiesce(); session.finish();
     if (!directory.empty()) {
         std::ofstream output(directory / "stats.json");
@@ -239,6 +241,12 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         blocks<<nlohmann::json({{"block_frames",stats.block_frames},{"block_tasks",stats.block_tasks},
             {"block_critical_path_ns",stats.block_critical_path_ns}}).dump();
         require(blocks.good(),"block trace stats write failed");
+        const auto copies=device.stats();
+        std::ofstream transfers(directory/"device-stats.json");
+        transfers<<nlohmann::json({{"current_device_rows",copies.current_device_rows},{"current_device_bytes",copies.current_device_bytes},
+            {"current_host_bytes",copies.current_host_bytes},{"refreshed_device_tails",copies.refreshed_tails},
+            {"retained_device_prefix_bytes",copies.retained_prefix_bytes}}).dump();
+        require(transfers.good(),"device copy stats write failed");
     }
 }
 }

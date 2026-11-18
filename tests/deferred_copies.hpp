@@ -19,6 +19,7 @@ struct DeferredCopies {
     std::vector<Copy> pending;
     std::uint64_t submitted = 0, completed = 0;
     bool observed_pending = false;
+    bool fail_device_copy=false;
     std::function<void()> on_upload;
     DeferredCopies() {
         device.context = this;
@@ -36,6 +37,15 @@ struct DeferredCopies {
                 { std::lock_guard<std::mutex> lock(self.mutex); self.pending.push_back({tensor,source,offset,bytes,++self.submitted}); }
                 self.cv.notify_all();
                 if (self.on_upload) self.on_upload();
+            };
+            stream->iface.cpy_tensor_async=[](ggml_backend_t source_backend,ggml_backend_t target_backend,const ggml_tensor * source,ggml_tensor * target) {
+                auto & self=*static_cast<DeferredCopies *>(target_backend->context);
+                require(source_backend==target_backend,"device row copy used the compute stream");
+                { std::lock_guard<std::mutex> lock(self.mutex); self.pending.push_back({target,source->data,0,ggml_nbytes(target),++self.submitted}); }
+                self.cv.notify_all();
+                if (self.fail_device_copy) throw std::runtime_error("injected current device copy failure");
+                if (self.on_upload) self.on_upload();
+                return true;
             };
             stream->iface.synchronize = [](ggml_backend_t backend) { static_cast<DeferredCopies *>(backend->context)->flush(UINT64_MAX); };
             stream->iface.event_record = [](ggml_backend_t backend, ggml_backend_event_t event) {

@@ -42,11 +42,13 @@
 
 - Prefill 设备 Q/当前 KV、批量代表、历史分区和设备结果视图，完成记录见 [Prefill 设备接入](implementation/PREFILL_DEVICE_INPUTS.md)。
 
+- 当前 decode KV 的设备内复制、尾块前缀原槽复用、缺口 H2D 和复制描述符保活，完成记录见 [当前设备 KV](implementation/CURRENT_DEVICE_KV.md)。
+
 ## 3. 论文路径与后续核心代码
 
 | 核查项 | 当前执行路径 | 后续代码与核查要求 |
 | --- | --- | --- |
-| GPU 算子覆盖，§3.1、§4、§7 | [Decode 设备输入](implementation/DEVICE_INPUTS.md) 直接供 CUDA 代表构造、评分和 K 追加使用；[Prefill 设备接入](implementation/PREFILL_DEVICE_INPUTS.md) 使用设备 Q/当前 KV、批量代表和设备结果；CPU 维护候选与核查镜像 | 继续接入当前 decode KV 到设备 bank；逐算子补齐设备区间与完整资源图 |
+| GPU 算子覆盖，§3.1、§4、§7 | [Decode 设备输入](implementation/DEVICE_INPUTS.md) 供 CUDA 代表构造、评分和 K 追加使用；[Prefill 设备接入](implementation/PREFILL_DEVICE_INPUTS.md) 使用设备 Q/当前 KV、批量代表和设备结果；[当前设备 KV](implementation/CURRENT_DEVICE_KV.md) 将当前行直接复制到 bank 并保留可用前缀 | 逐算子补齐设备区间与完整资源图 |
 | 长输入 prefill | [CUDA 分块 prefill](implementation/GPU_PREFILL.md) 使用固定 tile 和 FP32 在线 softmax；[设备输入/输出](implementation/PREFILL_DEVICE_INPUTS.md) 覆盖批量代表、历史/当前分区、未对齐批次、图结果与 decode 交接 | 在实验环境核查模型级误差、资源峰值与性能 |
 | 算法 1 的调度范围，§6.1 | [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 在历史工作集建立逐块 READ→H2D→汇合；关键路径/LST 传入独立 I/O 队列并决定就绪复制次序；外层保留 12 项任务 | 继续将预测期读取、当前 KV 的 D2H/回写及跨层槽位释放连接统一资源图；CUDA attention 事件已解锁后继上传 |
 | selected 优先，§6.1 | [块读取流水](implementation/BLOCK_READ_PIPELINE.md) 先确定集合，再跨 head 按 selected 优先派发；正式所需请求提升，完成块逐个进入 H2D；受限队列核对实际次序及最终汇合 | 历史正式工作集已连接块级成本、关键路径/LST 和资源分派；继续把预测期成本与跨层依赖纳入图 |
@@ -58,10 +60,9 @@ prefill 的 GPU 分块方案属于长上下文工程补齐；论文 §7 对实�
 
 ## 4. 后续开发顺序与交付
 
-1. 在 prefill/decode 设备输入基础上接入当前 decode KV 到设备 bank，核对版本、槽位与源租约。
-2. 在历史 READ/H2D 块图基础上纳入预测期读取、D2H/回写与跨层槽位事件。
-3. 在 CUDA attention 事件基础上完善 Q/KV 投影及其他传输的设备观测。
-4. 复核 CUDA 全路径，补齐 SYCL 与统一内存接入。
-5. 每项完成代码与检查后更新所属阶段记录，再进入模型及设备评测。
+1. 在历史 READ/H2D 块图基础上纳入预测期读取、D2H/回写与跨层槽位事件。
+2. 在 CUDA attention 事件基础上完善 Q/KV 投影及其他传输的设备观测。
+3. 复核 CUDA 全路径，补齐 SYCL 与统一内存接入。
+4. 每项完成代码与检查后更新所属阶段记录，再进入模型及设备评测。
 
 本机核查使用编译、合成张量、临时文件和错误注入。模型推理、性能、准确率与真实设备实验在实验环境执行。

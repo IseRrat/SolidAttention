@@ -2,6 +2,7 @@
 #include <algorithm>
 #include <chrono>
 #include <limits>
+#include <set>
 #include <stdexcept>
 
 namespace solid {
@@ -26,13 +27,22 @@ std::uint32_t DeviceCache::tokens_per_head() const {
     if (tokens > static_cast<std::uint64_t>(INT32_MAX)) throw std::overflow_error("device cache length exceeds backend limits");
     return static_cast<std::uint32_t>(tokens);
 }
-void DeviceCache::event(const char * name, const SlotLease & lease) {
+void DeviceCache::event(const char * name, const SlotLease & lease,const CurrentDeviceKv * current,std::uint32_t retained,std::uint64_t source_generation) {
     if (!trace_.is_open()) return;
     trace_ << "{\"event\":\"" << name << "\",\"timestamp_ns\":"
            << std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now().time_since_epoch()).count()
            << ",\"epoch\":" << epoch_ << ",\"layer\":" << lease.identity.layer
            << ",\"kv_head\":" << lease.identity.head << ",\"block\":" << lease.identity.block << ",\"version\":" << lease.identity.version
-           << ",\"slot\":" << lease.slot << ",\"generation\":" << lease.generation << "}\n";
+           << ",\"slot\":" << lease.slot << ",\"generation\":" << lease.generation;
+    if (current) {
+        const auto row=current->position%geometry_.block_tokens;
+        const auto row_bytes=static_cast<std::uint64_t>(2)*geometry_.dimension*sizeof(Half);
+        trace_ << ",\"copy_kind\":\"current_device\",\"current_position\":" << current->position
+               << ",\"retained_prefix_tokens\":" << retained << ",\"prefix_generation\":" << source_generation
+               << ",\"row_bytes\":" << row_bytes << ",\"host_copy_bytes\":" << (row-retained)*row_bytes
+               << ",\"device_copy_bytes\":" << row_bytes;
+    }
+    trace_ << "}\n";
     if (!trace_) throw std::runtime_error("device residency trace write failed");
 }
 void DeviceCache::poll_transfers(bool wait) {
@@ -97,6 +107,50 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
     }
     return *device;
 }
+std::optional<SlotLease> DeviceCache::prefix(const BlockIdentity & identity) const {
+    std::optional<SlotLease> best;
+    for (std::uint32_t i=0;i<slots_.size();++i) {
+        const auto & entry=slots_.entry(i);
+        if (entry.state!=SlotState::ready || entry.producer || entry.readers) continue;
+        const auto & old=entry.identity;
+        if (old.layer==identity.layer && old.head==identity.head && old.block==identity.block && old.version<identity.version &&
+            (!best || old.version>best->identity.version)) best=slots_.lease(i);
+    }
+    return best;
+}
+SlotLease DeviceCache::upload_current(const SlotLease & host,const CurrentDeviceKv & current,const std::optional<SlotLease> & previous) {
+    const auto row=static_cast<std::uint32_t>(current.position%geometry_.block_tokens);
+    if (host.identity.layer!=current.layer || host.identity.block!=current.position/geometry_.block_tokens || host.identity.version!=row+1) {
+        throw std::invalid_argument("current device KV identity differs from host snapshot");
+    }
+    const auto retained=previous?static_cast<std::uint32_t>(previous->identity.version):0;
+    if (retained>row) throw std::logic_error("current device prefix extends beyond the historical rows");
+    const auto device=previous?std::optional<SlotLease>{slots_.refresh(*previous,host.identity)}:slots_.acquire(host.identity);
+    if (!device) throw std::runtime_error("current device slot capacity exceeded");
+    std::uint64_t ticket=0;
+    bool pinned=false;
+    try {
+        host_.pin(host); pinned=true;
+        const auto & block=host_.block(host);
+        if (previous) event("overwrite_available",*previous);
+        ticket=transport_.upload_current(device->slot,block,current,retained);
+        transfers_.push_back({ticket,host,*device,{}});
+        const auto row_bytes=static_cast<std::uint64_t>(2)*geometry_.dimension*sizeof(Half);
+        ++stats_.uploads; ++stats_.current_device_rows; stats_.current_device_bytes+=row_bytes;
+        stats_.upload_bytes+=(row-retained)*row_bytes; stats_.current_host_bytes+=(row-retained)*row_bytes;
+        stats_.retained_prefix_bytes+=retained*row_bytes;
+        if (previous) { ++stats_.refreshed_tails; ++stats_.overwritten_blocks; }
+        event("upload",*device,&current,retained,previous?previous->generation:0);
+    } catch (...) {
+        transport_.drain();
+        if (!transfers_.empty() && transfers_.back().device==*device) transfers_.pop_back();
+        if (ticket) (void) transport_.complete(ticket,true);
+        if (pinned) host_.unpin(host);
+        slots_.retire(*device); slots_.complete(*device);
+        throw;
+    }
+    return *device;
+}
 void DeviceCache::prefetch_ready() {
     if (!attention_.empty()) throw std::logic_error("prefetch upload while device attention still owns slots");
     poll_transfers(false);
@@ -116,25 +170,63 @@ void DeviceCache::stage(const std::vector<SlotLease> & host_leases) {
     retain(actual);
     for (const auto & lease : host_leases) (void) upload(lease);
 }
-void DeviceCache::begin_stage(const std::vector<BlockIdentity> & identities) {
+void DeviceCache::begin_stage(const std::vector<BlockIdentity> & identities,std::optional<CurrentBlock> current) {
     if (!attention_.empty()) throw std::logic_error("streamed stage before previous attention completed");
-    wait_transfers(); retain(identities);
+    if (current && (current->layer>=geometry_.layers || current->position>=geometry_.capacity_tokens)) throw std::invalid_argument("current prefix stage position");
+    wait_transfers();
+    auto keep=identities;
+    if (current) for (std::uint32_t head=0;head<geometry_.heads;++head) {
+        const BlockIdentity identity{current->layer,head,current->position/geometry_.block_tokens,current->position%geometry_.block_tokens+1};
+        if (const auto old=prefix(identity)) keep.push_back(old->identity);
+    }
+    retain(keep);
 }
 void DeviceCache::stage_ready(const SlotLease & lease,const std::shared_ptr<BlockStage> & stage) {
     if (!attention_.empty()) throw std::logic_error("streamed upload while attention owns slots");
     poll_transfers(false); (void) upload(lease,stage);
 }
-std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection, bool deferred_upload) {
+std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection, bool deferred_upload,const CurrentDeviceKv * current) {
     if (!attention_.empty()) throw std::logic_error("previous device attention has not completed");
     if (selection.size() != geometry_.heads) throw std::invalid_argument("device selection head count");
+    if (current) {
+        const auto memory=transport_.current_memory();
+        if (!memory || current->layer>=geometry_.layers || current->position>=geometry_.capacity_tokens) throw std::invalid_argument("current device KV backend or position");
+        validate_device_kv(current->kv,*memory,geometry_.heads,geometry_.dimension,1);
+        std::set<std::pair<std::uint32_t,std::uint64_t>> unique;
+        for (const auto & lease:host_leases) {
+            const auto & id=lease.identity;
+            if (id.layer!=current->layer || id.head>=geometry_.heads || !id.version || id.version>geometry_.block_tokens ||
+                id.block>current->position/geometry_.block_tokens || !unique.emplace(id.head,id.block).second) {
+                throw std::invalid_argument("current device working set identities");
+            }
+        }
+        for (std::uint32_t head=0;head<geometry_.heads;++head) {
+            const BlockIdentity expected{current->layer,head,current->position/geometry_.block_tokens,current->position%geometry_.block_tokens+1};
+            if (selection[head].positions.empty() || selection[head].positions.back()!=current->position ||
+                std::none_of(host_leases.begin(),host_leases.end(),[&](const SlotLease & lease) { return lease.identity==expected; })) {
+                throw std::invalid_argument("current device KV is absent from the formal working set");
+            }
+        }
+    }
     wait_transfers();
     std::vector<BlockIdentity> actual;
     for (const auto & lease : host_leases) actual.push_back(lease.identity);
+    std::vector<std::optional<SlotLease>> prefixes(host_leases.size());
+    if (current) for (std::size_t i=0;i<host_leases.size();++i) {
+        const auto & id=host_leases[i].identity;
+        if (id.layer==current->layer && id.block==current->position/geometry_.block_tokens && !slots_.find(id)) {
+            prefixes[i]=prefix(id); if (prefixes[i]) actual.push_back(prefixes[i]->identity);
+        }
+    }
     retain(actual);
     std::vector<SlotLease> used;
-    for (const auto & host : host_leases) {
+    for (std::size_t i=0;i<host_leases.size();++i) {
+        const auto & host=host_leases[i];
         auto device = slots_.find(host.identity);
         if (device) ++stats_.reused_blocks;
+        else if (current && host.identity.layer==current->layer && host.identity.block==current->position/geometry_.block_tokens) {
+            device=upload_current(host,*current,prefixes[i]);
+        }
         else device = upload(host);
         used.push_back(*device);
     }

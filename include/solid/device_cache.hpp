@@ -2,12 +2,28 @@
 #include "solid/prefetch.hpp"
 
 namespace solid {
+struct CurrentDeviceKv {
+    std::uint32_t layer=0;
+    std::uint64_t position=0;
+    DeviceKvBatch kv;
+};
+struct CurrentBlock {
+    std::uint32_t layer=0;
+    std::uint64_t position=0;
+};
 class DeviceTransport {
 public:
     virtual ~DeviceTransport() = default;
     // Upload must preserve the source until completion. An exception must drain
     // any copy started by this call before returning control to the caller.
     virtual std::uint64_t upload(std::uint32_t slot, const KvBlock & block) = 0;
+    virtual std::optional<DeviceMemory> current_memory() const { return {}; }
+    // Retain prefix rows [0,prefix), upload the missing historical rows, and
+    // copy the current device row. The borrowed device source stays live until
+    // the ticket completes; exceptions drain any started writers/readers.
+    virtual std::uint64_t upload_current(std::uint32_t,const KvBlock &,const CurrentDeviceKv &,std::uint32_t) {
+        throw std::logic_error("current device KV transfer is disabled");
+    }
     virtual bool complete(std::uint64_t ticket, bool wait) = 0;
     // Wait for issued copies; ticket receipts remain valid for complete().
     virtual void drain() = 0;
@@ -21,6 +37,8 @@ struct DeviceCacheStats {
     std::uint64_t overwritten_blocks = 0;
     std::uint64_t stale_events = 0;
     std::uint64_t resident_bytes = 0;
+    std::uint64_t current_device_rows=0,current_device_bytes=0,current_host_bytes=0;
+    std::uint64_t refreshed_tails=0,retained_prefix_bytes=0;
 };
 class DeviceCache {
 public:
@@ -31,10 +49,10 @@ public:
     void wait_transfers();
     void wait_transfers_coalesced();
     void stage(const std::vector<SlotLease> & host_leases);
-    void begin_stage(const std::vector<BlockIdentity> & identities);
+    void begin_stage(const std::vector<BlockIdentity> & identities,std::optional<CurrentBlock> current = {});
     void stage_ready(const SlotLease & host_lease,const std::shared_ptr<BlockStage> & stage = {});
     std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
-                              bool deferred_upload = false);
+                              bool deferred_upload = false,const CurrentDeviceKv * current = nullptr);
     // Called only after the backend confirms attention completion.
     bool attention_complete(std::uint64_t epoch);
     std::uint64_t attention_epoch() const { return epoch_; }
@@ -58,6 +76,9 @@ private:
     void poll_transfers(bool wait);
     void retain(const std::vector<BlockIdentity> & identities);
     SlotLease upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage = {});
-    void event(const char * name, const SlotLease & lease);
+    SlotLease upload_current(const SlotLease & host,const CurrentDeviceKv & current,const std::optional<SlotLease> & prefix);
+    std::optional<SlotLease> prefix(const BlockIdentity & identity) const;
+    void event(const char * name, const SlotLease & lease,const CurrentDeviceKv * current=nullptr,
+               std::uint32_t retained=0,std::uint64_t source_generation=0);
 };
 } // namespace solid

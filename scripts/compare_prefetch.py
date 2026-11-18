@@ -15,6 +15,9 @@ def audit_residency(path, block_tokens, slots_per_head):
     states = {}
     pins = 0
     uploads = 0
+    current = dict(current_device_rows=0,current_device_bytes=0,current_host_bytes=0,
+                   refreshed_device_tails=0,retained_device_prefix_bytes=0)
+    row_size = None
     with Path(path).open(encoding="utf-8") as stream:
         for line_number, line in enumerate(stream, 1):
             item = json.loads(line)
@@ -29,6 +32,27 @@ def audit_residency(path, block_tokens, slots_per_head):
             if event == "upload":
                 if previous and (previous["state"] != "free" or generation <= previous["generation"]):
                     raise ValueError(f"device overwrite before release at line {line_number}")
+                fields=("current_position","retained_prefix_tokens","prefix_generation","row_bytes","host_copy_bytes","device_copy_bytes")
+                if "copy_kind" in item or any(key in item for key in fields):
+                    if item.get("copy_kind")!="current_device" or any(type(item.get(key)) is not int or item[key]<0 for key in fields):
+                        raise ValueError(f"invalid current-device copy metadata at line {line_number}")
+                    prefix, row_bytes = item["retained_prefix_tokens"],item["row_bytes"]
+                    position=item["current_position"]
+                    if (position//block_tokens!=item["block"] or position%block_tokens+1!=item["version"] or
+                            prefix>=item["version"] or row_bytes<4 or row_bytes%4 or
+                            item["host_copy_bytes"]!=(item["version"]-1-prefix)*row_bytes or item["device_copy_bytes"]!=row_bytes or
+                            (row_size is not None and row_size!=row_bytes)):
+                        raise ValueError(f"current-device row or byte coverage differs at line {line_number}")
+                    if prefix:
+                        if (not previous or previous["identity"][:3]!=identity[:3] or previous["identity"][3]!=prefix or
+                                item["prefix_generation"]!=previous["generation"] or generation!=previous["generation"]+1):
+                            raise ValueError(f"retained prefix lacks its previous generation at line {line_number}")
+                        current["refreshed_device_tails"]+=1
+                    elif item["prefix_generation"]:
+                        raise ValueError(f"cold current row claims an earlier generation at line {line_number}")
+                    row_size=row_bytes
+                    current["current_device_rows"]+=1; current["current_device_bytes"]+=row_bytes
+                    current["current_host_bytes"]+=item["host_copy_bytes"]; current["retained_device_prefix_bytes"]+=prefix*row_bytes
                 states[slot] = {"state": "loading", "generation": generation, "identity": identity, "epoch": None}
                 uploads += 1
                 continue
@@ -51,7 +75,9 @@ def audit_residency(path, block_tokens, slots_per_head):
             previous["state"] = target
     if any(item["state"] in ("pinned", "loading", "loading_pinned") for item in states.values()):
         raise ValueError("device trace ends with active transfers or attention readers")
-    return {"uploads": uploads, "attention_pins": pins, "slots_used": len(states), "balanced": True}
+    result = {"uploads": uploads, "attention_pins": pins, "slots_used": len(states), "balanced": True}
+    if current["current_device_rows"]: result.update(current)
+    return result
 
 
 def compare_prefetch(reference_path, candidate_path, atol=1e-3, rtol=1e-4):
@@ -88,6 +114,9 @@ def compare_prefetch(reference_path, candidate_path, atol=1e-3, rtol=1e-4):
         if digest(path) != candidate["residency_trace_sha256"]:
             raise ValueError("residency checksum differs")
         audit = audit_residency(path, b["block_tokens"], counters["slots_per_head"])
+        for key in ("current_device_rows","current_device_bytes","current_host_bytes","refreshed_device_tails","retained_device_prefix_bytes"):
+            if key in counters and (type(counters[key]) is not int or counters[key]<0 or counters[key]!=audit.get(key,0)):
+                raise ValueError(f"current-device counter differs from residency trace: {key}")
     if candidate["timing"]["decode_steps"] and (not audit or not audit["attention_pins"]):
         raise ValueError("decode run has no audited attention slot leases")
     numerical = compare(reference_path, candidate_path, atol, rtol)

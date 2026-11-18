@@ -116,5 +116,36 @@ class PrefetchToolsTests(unittest.TestCase):
             path.write_text("".join(json.dumps(row) + "\n" for row in residency()))
             self.assertTrue(compare_prefetch.audit_residency(path, 2, 2)["balanced"])
 
+    def test_current_device_prefix_requires_generation_and_complete_coverage(self):
+        previous=residency()
+        source=previous[0]
+        upload=dict(source,generation=2,version=4,epoch=2,event="upload",copy_kind="current_device",current_position=3,
+                    retained_prefix_tokens=2,prefix_generation=1,row_bytes=16,host_copy_bytes=16,device_copy_bytes=16)
+        def rows(value):
+            following={key:value[key] for key in source if key!="event"}
+            return previous+[dict(source,event="overwrite_available"),value]+[dict(following,event=name) for name in
+                ("upload_complete","attention_pin","attention_complete")]
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"residency.jsonl"
+            def audit(value):
+                path.write_text("".join(json.dumps(row)+"\n" for row in rows(value)))
+                return compare_prefetch.audit_residency(path,4,2)
+            self.assertEqual(audit(upload)["retained_device_prefix_bytes"],32)
+            self.assertEqual(audit(upload)["current_host_bytes"],16)
+            cold=dict(upload,retained_prefix_tokens=0,prefix_generation=0,host_copy_bytes=48)
+            self.assertEqual(audit(cold)["refreshed_device_tails"],0)
+            for change in (dict(prefix_generation=0),dict(generation=3),dict(current_position=4),dict(device_copy_bytes=32),
+                           dict(retained_prefix_tokens=1,host_copy_bytes=32),dict(host_copy_bytes=0),dict(row_bytes=True),dict(copy_kind="host")):
+                with self.assertRaises(ValueError): audit(dict(upload,**change))
+            missing=dict(upload); missing.pop("copy_kind")
+            with self.assertRaises(ValueError): audit(missing)
+
+    def test_current_device_result_counters_match_trace(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            source,target=self.fixture(Path(temporary))
+            candidate=json.loads((target/"result.json").read_text()); candidate["prefetch"]["current_device_rows"]=1
+            write(target/"result.json",candidate); self.manifest(target)
+            with self.assertRaises(ValueError): compare_prefetch.compare_prefetch(source/"result.json",target/"result.json")
+
 
 if __name__ == "__main__": unittest.main()

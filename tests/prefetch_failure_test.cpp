@@ -29,8 +29,9 @@ struct Fault {
         std::memcpy(dst->data,dst->src[0]->data,ggml_nbytes(dst));
     }
 };
-void failed_graph(solid::ScheduleMode mode,bool direct) {
+void failed_graph(solid::ScheduleMode mode,bool direct,bool copy_failure=false) {
     DeferredCopies copies;
+    copies.fail_device_copy=copy_failure;
     std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
     backend->device = &copies.device;
     ggml_backend_cpu_set_n_threads(backend.get(),1);
@@ -45,7 +46,8 @@ void failed_graph(solid::ScheduleMode mode,bool direct) {
     auto * key = ggml_dup_tensor(context.get(),query), * value = ggml_dup_tensor(context.get(),query);
     auto frame = std::make_shared<solid::AttentionFrame>(); frame->positions = {4};
     Fault fault{copies,frame};
-    auto * late_key = ggml_custom_4d(context.get(),GGML_TYPE_F32,128,1,1,1,&key,1,Fault::change_position,1,&fault);
+    auto * late_key = copy_failure?ggml_scale(context.get(),key,1):
+        ggml_custom_4d(context.get(),GGML_TYPE_F32,128,1,1,1,&key,1,Fault::change_position,1,&fault);
     solid::AttentionNode node(session,frame,0,0.125f,nullptr,true,&cache);
     auto * result = node.build(context.get(),query,late_key,value);
     auto * mask = node.host_node();
@@ -64,7 +66,8 @@ void failed_graph(solid::ScheduleMode mode,bool direct) {
     cache.begin_prefetch(0,4);
     require(ggml_backend_graph_compute(backend.get(),graph) == GGML_STATUS_SUCCESS,"failure graph could not finish its cleanup nodes");
     bool preserved = false;
-    try { node.check(); } catch (const std::exception & error) { preserved = std::string(error.what()).find("KV arrived without its early query") != std::string::npos; }
+    try { node.check(); } catch (const std::exception & error) { preserved = std::string(error.what()).find(copy_failure?
+        "injected current device copy failure":"KV arrived without its early query") != std::string::npos; }
     cache.quiesce(); session.finish();
     require(preserved,"cleanup replaced the original graph error");
     require(copies.submitted > 0 && copies.completed == copies.submitted,"test did not retain and drain delayed uploads");
@@ -77,6 +80,8 @@ int main() {
             failed_graph(solid::ScheduleMode::overlap,direct);
             failed_graph(solid::ScheduleMode::sync_reuse,direct);
         }
+        failed_graph(solid::ScheduleMode::overlap,true,true);
+        failed_graph(solid::ScheduleMode::sync_reuse,true,true);
         std::cout << "failed attention drains independent uploads and preserves its first error\n"; return 0;
     }
     catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }

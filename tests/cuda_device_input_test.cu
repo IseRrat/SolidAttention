@@ -175,6 +175,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
     }
     cache.quiesce(); session.finish();
     const auto after=session.stats();
+    require(cache.stats().current_device_rows==32 && cache.stats().current_device_bytes==32ull*g.dimension*2*sizeof(solid::Half),
+        "CUDA decode did not copy current KV rows on device");
     require(after.direct_decode_queries==16 && after.ranking.device_builder_queries==16 && after.ranking.device_builder_appends==16 &&
         after.ranking.device_rank_queries>0 && after.ranking.query_upload_bytes==before.ranking.query_upload_bytes &&
         after.ranking.builder_key_upload_bytes==before.ranking.builder_key_upload_bytes,"direct decode re-uploaded Q/K or skipped device inputs");

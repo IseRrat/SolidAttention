@@ -82,6 +82,8 @@ prefill 使用上游投影和有界 microbatch，通过固定 Q/KV tile 在 CUDA
 
 decode 当前 token 的 KV 先进入 attention 工作集，再进入每层写缓冲区。写缓冲区按 32 KiB 聚合，满载或会话结束时写出；部分尾块按版本更新。读取通过块表定位最新版本：已提交版本从 SSD 读取，待提交版本从写缓冲区转发。缓冲区持有至写入完成；写失败使会话进入错误状态。
 
+设备输入 decode 将当前 FP16 KV 行直接 D2D 到既有 bank；主机 FP16 快照用于追加与回写。同层/head/block 的设备前缀在 producer/readers 结束后保留原槽，以新 generation 接收缺失历史行 H2D 和当前行 D2D。复制票据持有源/目标张量描述符至完成，图引用保留输入分配。版本、字节和错误排空的核查见 [当前设备 KV](implementation/CURRENT_DEVICE_KV.md)。
+
 ## 6. KV consolidator
 
 `KvBlock` 保持独立或交错排列，CPU attention 通过行指针读取，decode 工作集通过 stride/view 提供 K/V。模型加载后按 `[head,K/V,D]` 行顺序合并投影权重，用一次矩阵乘法生成交错输出；K 沿用原生 RoPE 并写回对应行。

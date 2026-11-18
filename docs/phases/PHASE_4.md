@@ -171,3 +171,5 @@ python3 scripts/schedule_ablation.py compare results/schedule-configs/schedule-a
 2026-11-18 接入逐块历史 H2D。overlap 的历史上传依赖选择，与纠错读取重叠；追加等待 KV 下载、纠错读取和历史上传共同完成。当前仍记录 12 项聚合任务，完成记录见 [块读取流水](../implementation/BLOCK_READ_PIPELINE.md)。
 
 2026-11-18 接入 [Decode 设备 Q/K](../implementation/DEVICE_INPUTS.md)。三种调度共用设备 Q、FP16 KV 转换与设备 K 追加；重叠模式通过标量建立 CPU 选择前沿，串行模式在 KV 到达后选择。图引用明确覆盖借用生命周期；设备输入和主机输入的层图、块图、错误排空及数值均纳入核查。
+
+2026-11-18 接入 [当前 KV 设备复制](../implementation/CURRENT_DEVICE_KV.md)。当前行 D2D 与缺失历史前缀 H2D 共用 `current_h2d` 聚合任务及复制完成事件；保留原槽前缀时更新 generation。图引用、逐票据张量描述符和错误排空共同覆盖源生命周期；结果字节与驻留轨迹独立重算。
