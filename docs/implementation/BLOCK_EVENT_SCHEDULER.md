@@ -55,4 +55,4 @@ CUDA 编译与链接、38 项 CTest、61 项 Linux Python 检查及源码指纹�
 
 [io_worker_test.cpp](../../tests/io_worker_test.cpp) 在内核容量 1 下核对关键任务、LST、类别和同级 FIFO。[audit_schedule_graph.py](../../tests/audit_schedule_graph.py) 对三组实际 CPU GGML 图的内存与线程化 liburing 路径重算两级轨迹及指标。[test_schedule_tools.py](../../tests/test_schedule_tools.py) 覆盖错误依赖、资源、身份、完成依据和父层帧缺失。
 
-[CUDA attention 完成事件](NATIVE_COMPLETION.md) 已接入后继上传。后续把预测期读取、当前 KV 的 D2H/回写和跨层槽位释放接入统一资源图。范围见 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md)。模型、GPU 执行与性能评测在实验环境进行。
+[CUDA attention 完成事件](NATIVE_COMPLETION.md) 已接入后继上传。[预测期块调度](PREDICTION_DISPATCH.md) 将预测 READ 和 H2D 的计划成本传入实际队列。后续把当前 KV 的 D2H/回写和跨层槽位释放接入统一资源图。范围见 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md)。模型、GPU 执行与性能评测在实验环境进行。

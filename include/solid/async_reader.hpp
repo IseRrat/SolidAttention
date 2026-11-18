@@ -11,6 +11,10 @@ struct ReadDispatch {
     bool critical=false;
     std::uint64_t latest_start=UINT64_MAX;
     bool before(const ReadDispatch & other) const {
+        const bool correction = priority <= ReadPriority::correction_deterministic;
+        const bool other_correction = other.priority <= ReadPriority::correction_deterministic;
+        if (correction != other_correction) return correction;
+        if (!correction && priority != other.priority) return priority < other.priority;
         if (critical!=other.critical) return critical;
         if (latest_start!=other.latest_start) return latest_start<other.latest_start;
         return priority<other.priority;

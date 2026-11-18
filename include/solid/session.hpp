@@ -61,7 +61,7 @@ public:
     void release_prefill_graph_output(std::uint64_t bytes) noexcept;
     bool prefetch_enabled() const { return prefetch_ != nullptr; }
     Prefetcher & prefetcher();
-    void begin_prefetch(std::uint32_t layer, std::uint64_t position);
+    void begin_prefetch(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
     std::vector<HeadSelection> select_decode(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                             const std::vector<float> & keys, const std::vector<float> & values,
                                             bool interleaved_inputs = false);

@@ -52,6 +52,10 @@ struct PrefetchStats {
     std::uint32_t slots_per_head = 0;
     AsyncIoStats io;
 };
+struct PredictionCosts {
+    std::uint64_t full_read_ns = 1;
+    std::uint64_t full_upload_ns = 1;
+};
 class Prefetcher {
 public:
     using ReadyBlock = std::function<void(const SlotLease &)>;
@@ -60,7 +64,7 @@ public:
     Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t slots_per_head,
                std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace = {});
     ~Prefetcher();
-    void begin(std::uint32_t layer, std::uint64_t position);
+    void begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
                                          const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {});
@@ -84,6 +88,7 @@ private:
     std::vector<KvBlock> blocks_;
     std::vector<std::size_t> pending_;
     std::vector<ReadStage> stages_;
+    std::vector<ReadDispatch> upload_order_;
     std::vector<std::vector<std::vector<std::uint64_t>>> history_;
     std::map<std::uint64_t, Job> requests_;
     std::vector<Job> queued_;
@@ -98,6 +103,7 @@ private:
     void issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch);
     SlotLease load(const BlockIdentity & identity, ReadDispatch dispatch,const std::shared_ptr<BlockStage> & stage = {});
     void promote(const SlotLease & lease, ReadDispatch dispatch);
+    std::optional<SlotLease> prefix(const BlockIdentity & identity) const;
     void read_complete(const SlotLease & lease,const char * proof);
     bool selected(std::uint64_t block) const;
     void retire(const SlotLease & lease);

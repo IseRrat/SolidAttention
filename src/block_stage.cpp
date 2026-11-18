@@ -49,6 +49,11 @@ ReadDispatch BlockStage::dispatch(const BlockIdentity & id) const {
     const auto i=index(id); const auto task=dag_->task(2*i);
     return {blocks_[i].priority,task.critical,task.latest_start};
 }
+ReadDispatch BlockStage::copy_dispatch(const BlockIdentity & id) const {
+    const auto i = index(id);
+    const auto task = dag_->task(2*i+1);
+    return {blocks_[i].priority,task.critical,task.latest_start};
+}
 void BlockStage::read_started(const BlockIdentity & id,const std::string & proof) {
     const auto i=index(id);
     if (aborted_) return;

@@ -94,6 +94,7 @@ void SlotTable::unpin(const SlotLease & lease) {
 Prefetcher::Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t per_head,
                        std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace) :
     store_(store), budget_(budget), slots_(store.geometry().heads, per_head), blocks_(slots_.size()), pending_(slots_.size()),stages_(slots_.size()),
+    upload_order_(slots_.size()),
     history_(store.geometry().layers, std::vector<std::vector<std::uint64_t>>(store.geometry().heads)), reader_(std::move(reader)) {
     budget.validate(store.geometry());
     if (!reader_) throw std::invalid_argument("prefetch reader is required");
@@ -153,6 +154,7 @@ SlotLease Prefetcher::load(const BlockIdentity & id, ReadDispatch dispatch,const
         lease = slots_.acquire(id);
     }
     stages_[lease->slot]={*lease,stage};
+    upload_order_[lease->slot] = dispatch;
     issue(*lease,0,dispatch);
     return *lease;
 }
@@ -161,6 +163,18 @@ void Prefetcher::promote(const SlotLease & lease, ReadDispatch dispatch) {
     for (auto & item:requests_) if (item.second.lease==lease && dispatch.before(item.second.dispatch)) {
         reader_->schedule(item.first,dispatch); item.second.dispatch=dispatch;
     }
+}
+std::optional<SlotLease> Prefetcher::prefix(const BlockIdentity & id) const {
+    std::optional<SlotLease> result;
+    const auto end = (id.head+1) * slots_.slots_per_head();
+    for (auto i = id.head * slots_.slots_per_head(); i < end; ++i) {
+        const auto & entry = slots_.entry(i);
+        const auto & old = entry.identity;
+        if (entry.state != SlotState::free && entry.state != SlotState::retiring &&
+            old.layer == id.layer && old.block == id.block && old.version < id.version &&
+            (!result || old.version > result->identity.version)) result = slots_.lease(i);
+    }
+    return result;
 }
 void Prefetcher::read_complete(const SlotLease & lease,const char * proof) {
     auto & observer=stages_[lease.slot];
@@ -221,7 +235,7 @@ void Prefetcher::poll(bool wait) {
     }
     if (wait) stats_.wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
 }
-void Prefetcher::begin(std::uint32_t layer, std::uint64_t position) {
+void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs) {
     check();
     const auto & g = store_.geometry();
     if (layer >= g.layers || position >= g.capacity_tokens || store_.length(layer) != position) throw std::invalid_argument("prefetch begin position mismatch");
@@ -253,11 +267,31 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position) {
         const auto & history=history_[layer][id.head];
         return selected(id.block) && std::find(history.begin(),history.end(),id.block)!=history.end() ? ReadPriority::selected : ReadPriority::deterministic;
     };
-    // Membership is bounded above using deterministic blocks first. Dispatch
-    // selected blocks across all heads before init/local without changing it.
-    std::stable_sort(predicted.begin(),predicted.end(),[&](const BlockIdentity & a,const BlockIdentity & b) { return priority(a)<priority(b); });
-    for (const auto & id : predicted) {
-        if (!slots_.find(id)) { const auto lease = load(id,{priority(id)}); event("predict", lease); }
+    const auto read_cost = [&](const BlockIdentity & id) {
+        const auto lease = slots_.find(id);
+        if (lease && slots_.entry(lease->slot).state == SlotState::ready) return std::uint64_t{1};
+        const auto full = costs.full_read_ns;
+        return std::max<std::uint64_t>(1, full / g.block_tokens * id.version +
+            full % g.block_tokens * id.version / g.block_tokens);
+    };
+    std::vector<BlockWork> tasks;
+    tasks.reserve(predicted.size());
+    for (const auto & id : predicted) tasks.push_back({id, priority(id), read_cost(id), costs.full_upload_ns});
+    const BlockStage plan(std::move(tasks), nullptr, 0, layer, position);
+    struct PlannedRead { BlockIdentity identity; ReadDispatch read; ReadDispatch copy; };
+    std::vector<PlannedRead> ordered;
+    ordered.reserve(predicted.size());
+    for (const auto & id : predicted) ordered.push_back({id, plan.dispatch(id), plan.copy_dispatch(id)});
+    std::stable_sort(ordered.begin(), ordered.end(), [](const PlannedRead & a, const PlannedRead & b) {
+        return a.read.before(b.read);
+    });
+    for (const auto & job : ordered) {
+        auto lease = slots_.find(job.identity);
+        if (!lease) {
+            lease = load(job.identity, job.read);
+            event("predict", *lease);
+        }
+        upload_order_[lease->slot] = job.copy;
         ++stats_.predicted_blocks;
     }
     pump();
@@ -314,16 +348,22 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
         needed=ordered;
     }
     const auto dispatch=[&](const BlockIdentity & id) { return stage?stage->dispatch(id):ReadDispatch{priority(id)}; };
-    if (plan) plan(needed);
     // Promote all existing required jobs before waiting for any old producer.
-    for (const auto & id:needed) if (const auto lease=slots_.find(id)) {
+    for (const auto & id:needed) {
+        const auto lease=slots_.find(id);
+        if (!lease) {
+            if (const auto old=prefix(id)) promote(*old,dispatch(id));
+            continue;
+        }
         stages_[lease->slot]={*lease,stage};
+        upload_order_[lease->slot] = stage ? stage->copy_dispatch(id) : dispatch(id);
         if (stage) {
             if (slots_.entry(lease->slot).state!=SlotState::loading) read_complete(*lease,"host_resident");
             else if (std::any_of(requests_.begin(),requests_.end(),[&](const auto & item) { return item.second.lease==*lease; })) stage->read_started(id,"inflight_at_plan");
         }
         promote(*lease,dispatch(id));
     }
+    if (plan) plan(needed);
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
         const auto lease = slots_.lease(i);
         const auto matching_block = [&](const BlockIdentity & id) { return id.layer == lease.identity.layer && id.head == lease.identity.head && id.block == lease.identity.block; };
@@ -337,18 +377,12 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
             if (slots_.entry(lease->slot).state == SlotState::loading) { ++stats_.inflight_hits; event("inflight_hit", *lease); }
             else { ++stats_.ready_hits; event("hit", *lease); }
         } else {
-            std::optional<SlotLease> prefix;
-            for (std::uint32_t i = 0; i < slots_.size(); ++i) {
-                const auto old = slots_.lease(i);
-                const auto state = slots_.entry(i).state;
-                if (state != SlotState::free && state != SlotState::retiring && old.identity.layer == layer && old.identity.head == id.head &&
-                    old.identity.block == id.block && old.identity.version < id.version) { prefix = old; break; }
-            }
-            if (prefix) {
-                while (slots_.entry(prefix->slot).state == SlotState::loading) poll(true);
-                const auto count = blocks_[prefix->slot].valid_tokens;
-                lease = slots_.refresh(*prefix, id);
+            if (const auto old = prefix(id)) {
+                while (slots_.entry(old->slot).state == SlotState::loading) poll(true);
+                const auto count = blocks_[old->slot].valid_tokens;
+                lease = slots_.refresh(*old, id);
                 stages_[lease->slot]={*lease,stage};
+                upload_order_[lease->slot] = dispatch(id);
                 issue(*lease, count,dispatch(id));
                 ++stats_.refreshed_blocks;
                 event("refresh", *lease);
@@ -406,6 +440,9 @@ const KvBlock & Prefetcher::block(const SlotLease & lease) const {
 std::vector<SlotLease> Prefetcher::ready() const {
     std::vector<SlotLease> result;
     for (std::uint32_t i = 0; i < slots_.size(); ++i) if (slots_.entry(i).state == SlotState::ready) result.push_back(slots_.lease(i));
+    std::stable_sort(result.begin(), result.end(), [&](const SlotLease & a, const SlotLease & b) {
+        return upload_order_[a.slot].before(upload_order_[b.slot]);
+    });
     return result;
 }
 void Prefetcher::finish() {

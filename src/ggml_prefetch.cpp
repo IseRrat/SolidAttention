@@ -338,8 +338,11 @@ struct GgmlPrefetch::Impl {
         const auto next = current->layer + 1 < session.geometry().layers ? current->layer + 1 : 0;
         const auto position = next ? current->position : current->position + 1;
         current->dag.start(next_prefetch, trace.now());
-        session.begin_prefetch(next, position);
+        begin_prediction(next, position);
         current->dag.complete(next_prefetch, trace.now());
+    }
+    void begin_prediction(std::uint32_t layer, std::uint64_t position) {
+        session.begin_prefetch(layer, position, {block_read_estimate, block_copy_estimate});
     }
     void release_attention(const char * proof,std::optional<std::uint64_t> device_ns={}) {
         if (!device.attention_pending()) return;
@@ -406,7 +409,7 @@ bool GgmlPrefetch::completion_host_marker() const { return impl_->events && impl
 void GgmlPrefetch::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->session.begin_prefetch(layer, position);
+    impl_->begin_prediction(layer, position);
 }
 void GgmlPrefetch::select_early(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, bool covers) {
     select_impl(layer, position, query, nullptr, covers);
@@ -442,7 +445,7 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
             ++impl_->totals.fallback_fences; impl_->release_attention("explicit_fallback");
         }
     }
-    impl_->session.begin_prefetch(layer, position);
+    impl_->begin_prediction(layer, position);
     const auto work = impl_->new_work(layer, position,device!=nullptr);
     work->query = query;
     work->direct = device != nullptr;
@@ -503,7 +506,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
     impl_->quiesced = false;
     auto work = current;
     if (!early_enabled()) {
-        impl_->device.wait_transfers(); impl_->session.begin_prefetch(layer, position);
+        impl_->device.wait_transfers(); impl_->begin_prediction(layer, position);
         work = impl_->new_work(layer, position,half!=nullptr);
         work->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), half?"serial_kv_fp16_download_complete":"serial_kv_download_complete");
         work->dag.start(append, impl_->trace.now());

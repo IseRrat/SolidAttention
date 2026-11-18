@@ -166,7 +166,8 @@ void priority_progress() {
     std::array<unsigned char,5> bytes{};
     require(io->submit(1,0,&bytes[0],1,0),"priority gate submit");
     require(control->wait([&] { return control->submissions.size()==1; }),"priority gate did not enter kernel");
-    require(io->submit(2,0,&bytes[1],1,0) && io->submit(3,0,&bytes[2],1,0) &&
+    require(io->submit_scheduled(2,0,&bytes[1],1,0,{solid::ReadPriority::deterministic,true,0}) &&
+            io->submit_scheduled(3,0,&bytes[2],1,0,{solid::ReadPriority::selected,true,0}) &&
             io->submit_prioritized(4,0,&bytes[3],1,0,solid::ReadPriority::selected) &&
             io->submit_prioritized(5,0,&bytes[4],1,0,solid::ReadPriority::selected),"priority admission");
     io->prioritize(3,solid::ReadPriority::correction_selected);
@@ -174,7 +175,7 @@ void priority_progress() {
     solid::ReadCompletion result{};
     for (int n=0;n<5;++n) require(io->poll(result,true),"priority completion lost");
     { std::lock_guard<std::mutex> lock(control->mutex);
-      require(control->submissions==std::vector<std::uint64_t>{1,3,4,5,2},"pending promotion or equal-priority FIFO failed"); }
+      require(control->submissions==std::vector<std::uint64_t>{1,3,4,5,2},"correction, selected or equal-priority FIFO ordering failed"); }
     for (int n=0;n<5;++n) require(bytes[n]==n+1,"priority changed destination identity");
 }
 void scheduled_progress() {

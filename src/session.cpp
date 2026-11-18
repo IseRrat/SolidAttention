@@ -338,10 +338,10 @@ Prefetcher & AttentionSession::prefetcher() {
     if (!prefetch_) throw std::logic_error("prefetch is disabled");
     return *prefetch_;
 }
-void AttentionSession::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
+void AttentionSession::begin_prefetch(std::uint32_t layer, std::uint64_t position, PredictionCosts costs) {
     if (failed_) throw std::runtime_error("attention session failed");
     if (prefetch_ && position >= prefill_tokens_ && position < geometry().capacity_tokens) {
-        try { prefetch_->begin(layer, position); } catch (...) { failed_ = true; throw; }
+        try { prefetch_->begin(layer, position, costs); } catch (...) { failed_ = true; throw; }
     }
 }
 std::vector<HeadSelection> AttentionSession::select_decode(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,

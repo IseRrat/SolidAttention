@@ -22,6 +22,7 @@ public:
     std::vector<BlockIdentity> read_order() const;
     std::vector<BlockIdentity> copy_order() const;
     ReadDispatch dispatch(const BlockIdentity & identity) const;
+    ReadDispatch copy_dispatch(const BlockIdentity & identity) const;
     void read_started(const BlockIdentity & identity,const std::string & proof={});
     void read_complete(const BlockIdentity & identity,const std::string & proof={});
     void copy_started(const BlockIdentity & identity);

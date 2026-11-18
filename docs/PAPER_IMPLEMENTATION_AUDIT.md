@@ -50,9 +50,9 @@
 | --- | --- | --- |
 | GPU 算子覆盖，§3.1、§4、§7 | [Decode 设备输入](implementation/DEVICE_INPUTS.md) 供 CUDA 代表构造、评分和 K 追加使用；[Prefill 设备接入](implementation/PREFILL_DEVICE_INPUTS.md) 使用设备 Q/当前 KV、批量代表和设备结果；[当前设备 KV](implementation/CURRENT_DEVICE_KV.md) 将当前行直接复制到 bank 并保留可用前缀 | 逐算子补齐设备区间与完整资源图 |
 | 长输入 prefill | [CUDA 分块 prefill](implementation/GPU_PREFILL.md) 使用固定 tile 和 FP32 在线 softmax；[设备输入/输出](implementation/PREFILL_DEVICE_INPUTS.md) 覆盖批量代表、历史/当前分区、未对齐批次、图结果与 decode 交接 | 在实验环境核查模型级误差、资源峰值与性能 |
-| 算法 1 的调度范围，§6.1 | [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 在历史工作集建立逐块 READ→H2D→汇合；关键路径/LST 传入独立 I/O 队列并决定就绪复制次序；外层保留 12 项任务 | 继续将预测期读取、当前 KV 的 D2H/回写及跨层槽位释放连接统一资源图；CUDA attention 事件已解锁后继上传 |
-| selected 优先，§6.1 | [块读取流水](implementation/BLOCK_READ_PIPELINE.md) 先确定集合，再跨 head 按 selected 优先派发；正式所需请求提升，完成块逐个进入 H2D；受限队列核对实际次序及最终汇合 | 历史正式工作集已连接块级成本、关键路径/LST 和资源分派；继续把预测期成本与跨层依赖纳入图 |
-| I/O 与协调分工，§7 | [独立 I/O 所有者](implementation/IO_WORKERS.md) 执行 liburing 操作并自动续填内核队列，协调线程执行纠错、H2D、回写和后继预取；独立物理核与推理核分工 | 设备事件已解锁后继传输，受控完成通知验证正式选择及时接管；继续连接预测期任务图与回写 |
+| 算法 1 的调度范围，§6.1 | [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 在正式历史工作集建立逐块 READ→H2D→汇合；[预测期块调度](implementation/PREDICTION_DISPATCH.md) 将成本和 LST 用于提前读取与就绪 H2D | 将当前 KV 的 D2H/回写及跨层槽位释放连接到资源图 |
+| selected 优先，§6.1 | 预测期跨 head 先派发 selected，正式请求提升至预测请求之前；尾块更新先提升在途的旧前缀读取 | 将跨层资源依赖纳入图 |
+| I/O 与协调分工，§7 | [独立 I/O 所有者](implementation/IO_WORKERS.md) 执行 liburing 读取并自动续填内核队列，协调线程执行纠错、H2D、回写和后继预取；独立物理核与推理核分工 | 将聚合回写交给 I/O 线程，并连接回写完成与缓冲区复用 |
 | 同步与时间观测，§6.2 | [CUDA 原生完成事件](implementation/NATIVE_COMPLETION.md) 记录 Flash Attention 设备区间，图重放通知解锁槽位与后继上传；复制完成查询归还源；主机边界继续作为依赖依据 | 继续把 Q/KV 投影与其他传输的设备区间关联具体任务，核查完整执行路径的同步与成本 |
 | SYCL，§1、§8.1 | 主工程提供 CUDA 构建入口，GPU 路径依赖 GGML 通用接口 | 提供 SYCL 构建、具体算子与事件适配、统一内存路径和对应合成检查 |
 
@@ -60,7 +60,7 @@ prefill 的 GPU 分块方案属于长上下文工程补齐；论文 §7 对实�
 
 ## 4. 后续开发顺序与交付
 
-1. 在历史 READ/H2D 块图基础上纳入预测期读取、D2H/回写与跨层槽位事件。
+1. 在预测与正式 READ/H2D 块图基础上接入异步回写、D2H 及跨层槽位事件。
 2. 在 CUDA attention 事件基础上完善 Q/KV 投影及其他传输的设备观测。
 3. 复核 CUDA 全路径，补齐 SYCL 与统一内存接入。
 4. 每项完成代码与检查后更新所属阶段记录，再进入模型及设备评测。
