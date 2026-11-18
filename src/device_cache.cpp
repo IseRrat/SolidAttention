@@ -91,7 +91,9 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
         ticket = transport_.upload(device->slot, block);
         transfers_.push_back({ticket, host, *device,stage});
         ++stats_.uploads;
-        stats_.upload_bytes += block.data.size() * sizeof(Half);
+        const auto bytes = block.data.size() * sizeof(Half);
+        if (transport_.shared_memory()) stats_.shared_host_copy_bytes += bytes;
+        else stats_.upload_bytes += bytes;
         event("upload", *device);
     } catch (...) {
         // Even allocation/trace errors after upload must retain the host lease
@@ -292,5 +294,10 @@ void DeviceCache::finish() {
     transport_.drain();
     if (trace_.is_open()) { trace_.flush(); if (!trace_) throw std::runtime_error("device trace flush failed"); }
 }
-DeviceCacheStats DeviceCache::stats() const { auto result = stats_; result.resident_bytes = transport_.resident_bytes(); return result; }
+DeviceCacheStats DeviceCache::stats() const {
+    auto result = stats_;
+    result.resident_bytes = transport_.resident_bytes();
+    if (transport_.shared_memory()) result.shared_resident_bytes = result.resident_bytes;
+    return result;
+}
 } // namespace solid

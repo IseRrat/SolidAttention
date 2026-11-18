@@ -101,8 +101,53 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
             if (solid_completion) CUDA_CHECK(solid::cuda_attention_end(solid_completion, ctx.stream()));
             break;
         }''')
+    sycl = (source.parent / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text(encoding="utf-8")
+    sycl = '#include "solid/sycl_backend.hpp"\n#include "solid/sycl_flash_decode.hpp"\n#include <memory>\n#include <stdexcept>\n' + sycl
+    sycl = replace_once(sycl, '    bool is_usm_system;\n', '    bool is_usm_system;\n    bool solid_shared = false;\n')
+    anchor = '''            if (is_usm_system)
+                free_aligned_mem_host(dev_ptr);'''
+    sycl = replace_once(sycl, anchor, '''            if (solid_shared)
+                SYCL_CHECK(CHECK_TRY_ERROR(sycl::free(dev_ptr, *stream)));
+            else if (is_usm_system)
+                free_aligned_mem_host(dev_ptr);''')
+    anchor = 'static bool is_bmg_g31_arch(int device) {\n'
+    sycl = replace_once(sycl, anchor, '''extern "C" ggml_backend_buffer_t solid_sycl_alloc_shared_kv(ggml_backend_t backend, size_t bytes) {
+    if (!ggml_backend_is_sycl(backend) || !bytes) throw std::invalid_argument("invalid SYCL KV buffer request");
+    auto * buft = ggml_backend_get_default_buffer_type(backend);
+    auto * type = static_cast<ggml_backend_sycl_buffer_type_context *>(buft->context);
+    auto & queue = *type->stream;
+    const auto device = queue.get_device();
+    if (!device.get_info<sycl::info::device::host_unified_memory>() || !device.has(sycl::aspect::usm_shared_allocations)) return nullptr;
+    auto * ptr = sycl::aligned_alloc_shared(SYCL_BUFFER_ALIGNMENT, bytes, queue);
+    if (!ptr) throw std::bad_alloc();
+    std::unique_ptr<ggml_backend_sycl_buffer_context> context;
+    try { context = std::make_unique<ggml_backend_sycl_buffer_context>(type->device, ptr, type->stream, false); }
+    catch (...) { sycl::free(ptr, queue); throw; }
+    context->solid_shared = true;
+    auto * buffer = ggml_backend_buffer_init(buft, ggml_backend_sycl_buffer_interface, context.get(), bytes);
+    if (!buffer) throw std::bad_alloc();
+    context.release();
+    return buffer;
+}
+
+''' + anchor)
+    anchor = '''    // Reserve the additional scratch so it's visible to the graph allocator
+'''
+    sycl = replace_once(sycl, anchor, '''    if (solid::sycl_masked_decode_supported(tensor)) return solid::sycl_masked_decode_alloc(tensor);
+''' + anchor)
+    anchor = '''        case GGML_OP_FLASH_ATTN_EXT:
+            ggml_sycl_flash_attn_ext(ctx, dst);
+            break;'''
+    sycl = replace_once(sycl, anchor, '''        case GGML_OP_FLASH_ATTN_EXT:
+            if (solid::sycl_masked_decode_supported(dst)) solid::sycl_masked_decode(*ctx.stream(), dst);
+            else ggml_sycl_flash_attn_ext(ctx, dst);
+            break;''')
+    anchor = '''            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);'''
+    sycl = replace_once(sycl, anchor, '''            return solid::sycl_masked_decode_supported(op) ||
+                   (op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op));''')
     destination.mkdir(parents=True, exist_ok=True)
-    for name, text in (("llama-graph.cpp", graph), ("llama-context.cpp", context), ("ggml-backend.cpp", backend), ("ggml-cuda.cu", cuda)):
+    for name, text in (("llama-graph.cpp", graph), ("llama-context.cpp", context), ("ggml-backend.cpp", backend),
+                       ("ggml-cuda.cu", cuda), ("ggml-sycl.cpp", sycl)):
         target = destination / name
         if not target.exists() or target.read_text(encoding="utf-8") != text:
             target.write_text(text, encoding="utf-8", newline="\n")

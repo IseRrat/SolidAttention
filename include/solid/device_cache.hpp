@@ -30,6 +30,7 @@ public:
     virtual void drain() = 0;
     virtual void wait_batch() { drain(); }
     virtual std::uint64_t resident_bytes() const = 0;
+    virtual bool shared_memory() const { return false; }
 };
 struct DeviceCacheStats {
     std::uint64_t uploads = 0;
@@ -38,6 +39,7 @@ struct DeviceCacheStats {
     std::uint64_t overwritten_blocks = 0;
     std::uint64_t stale_events = 0;
     std::uint64_t resident_bytes = 0;
+    std::uint64_t shared_resident_bytes = 0, shared_host_copy_bytes = 0;
     std::uint64_t current_device_rows=0,current_device_bytes=0,current_host_bytes=0;
     std::uint64_t refreshed_tails=0,retained_prefix_bytes=0;
 };

@@ -5,6 +5,10 @@
 #ifdef SOLID_HAVE_CUDA_SELECTION
 #include "ggml-cuda.h"
 #endif
+#ifdef SOLID_HAVE_SYCL
+#include "ggml-sycl.h"
+#include "solid/sycl_backend.hpp"
+#endif
 #include <limits>
 #include <map>
 #include <array>
@@ -55,6 +59,23 @@ public:
         if (!context_) throw std::runtime_error("device cache metadata allocation");
         tensor_ = ggml_new_tensor_3d(context_.get(), GGML_TYPE_F16, geometry.dimension * 2, tokens, geometry.heads);
         ggml_set_name(tensor_, "solid_prefetch_device_slots");
+#ifdef SOLID_HAVE_SYCL
+        if (ggml_backend_is_sycl(backend)) {
+            const auto bytes=ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(backend), tensor_);
+            buffer_.reset(solid_sycl_alloc_shared_kv(backend, bytes));
+            if (buffer_) {
+                auto * memory=ggml_backend_buffer_get_base(buffer_.get());
+                ggml_backend_buffer_set_usage(buffer_.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+                if (ggml_backend_tensor_alloc(buffer_.get(),tensor_,memory)!=GGML_STATUS_SUCCESS) {
+                    throw std::runtime_error("SYCL shared KV tensor initialization failed");
+                }
+                std::memset(memory,0,bytes);
+                shared_=true;
+                copy_backend_=backend_;
+                return;
+            }
+        }
+#endif
         buffer_.reset(ggml_backend_alloc_ctx_tensors(context_.get(), backend));
         if (!buffer_) throw std::runtime_error("device cache allocation");
         ggml_backend_buffer_set_usage(buffer_.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
@@ -90,13 +111,18 @@ public:
         }
         if (next_ == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("copy ticket exhausted");
         const auto id = next_++;
+        const auto head = slot / per_head_, local = slot % per_head_;
+        const auto offset = head * tensor_->nb[2] + local * geometry_.block_tokens * tensor_->nb[1];
+        const auto bytes = block.data.size() * sizeof(Half);
+        if (shared_) {
+            events_.emplace(id, CopyRecord{});
+            std::memcpy(static_cast<unsigned char *>(tensor_->data)+offset,block.data.data(),bytes);
+            return id;
+        }
         auto * device = ggml_backend_get_device(copy_backend_);
         auto * event = device ? ggml_backend_event_new(device) : nullptr;
         try {
             events_.emplace(id, CopyRecord{event,{}});
-            const auto head = slot / per_head_, local = slot % per_head_;
-            const auto offset = head * tensor_->nb[2] + local * geometry_.block_tokens * tensor_->nb[1];
-            const auto bytes = block.data.size() * sizeof(Half);
             const void * source = block.data.data();
             if (staging_) {
                 auto * destination = static_cast<unsigned char *>(ggml_backend_buffer_get_base(staging_.get())) + static_cast<std::size_t>(slot) * bytes;
@@ -254,6 +280,7 @@ public:
     void synchronize_compute() { ggml_backend_synchronize(backend_); ++stats_.backend_compute_waits; }
     ScheduleStats stats() const { return stats_; }
     std::uint64_t resident_bytes() const override { return ggml_backend_buffer_get_size(buffer_.get()); }
+    bool shared_memory() const override { return shared_; }
     ggml_tensor * tensor() const { return tensor_; }
 private:
     ggml_tensor row_tensor(const ggml_tensor & source,void * data) const {
@@ -279,6 +306,7 @@ private:
     std::unique_ptr<ggml_context, decltype(&ggml_free)> context_{nullptr, ggml_free};
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer_{nullptr, ggml_backend_buffer_free};
     ggml_tensor * tensor_ = nullptr;
+    bool shared_ = false;
     std::map<std::uint64_t, CopyRecord> events_;
     ggml_tensor * current_source_=nullptr;
     std::uint64_t next_ = 1;

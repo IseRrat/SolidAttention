@@ -115,6 +115,7 @@ Json counters(const solid::SessionStats & s, const solid::DeviceCacheStats & d) 
         {"streaming_attention_inclusive_ms", s.streaming_attention_ns / 1e6},
         {"prefetch_wait_ms", s.prefetch.wait_ns / 1e6}, {"prefetch_resolve_ms", s.prefetch.resolve_ns / 1e6},
         {"device_uploads", d.uploads}, {"device_upload_bytes", d.upload_bytes},
+        {"device_shared_host_copy_bytes", d.shared_host_copy_bytes},
         {"current_device_rows",d.current_device_rows},{"current_device_bytes",d.current_device_bytes},
         {"current_host_bytes",d.current_host_bytes},{"refreshed_device_tails",d.refreshed_tails},{"retained_device_prefix_bytes",d.retained_prefix_bytes}};
 }
@@ -438,6 +439,7 @@ int main(int argc, char ** argv) {
                     {"cancel_successes", stats.prefetch.io.cancel_successes}, {"cancel_not_found", stats.prefetch.io.cancel_not_found},
                     {"cancel_busy", stats.prefetch.io.cancel_busy}, {"cancel_errors", stats.prefetch.io.cancel_errors},
                     {"device_uploads", device.uploads}, {"device_upload_bytes", device.upload_bytes},
+                    {"device_shared_host_copy_bytes", device.shared_host_copy_bytes}, {"device_shared_buffer_bytes", device.shared_resident_bytes},
                     {"current_device_rows",device.current_device_rows},{"current_device_bytes",device.current_device_bytes},
                     {"current_host_bytes",device.current_host_bytes},{"refreshed_device_tails",device.refreshed_tails},
                     {"retained_device_prefix_bytes",device.retained_prefix_bytes},

@@ -28,6 +28,8 @@ bash scripts/check.sh --cuda
 
 构建依赖 Linux、CMake 3.22+、Ninja、C++17、Git 和 Python 3。CUDA 构建使用目标环境的 Toolkit，可通过 `CUDACXX` 指定编译器。
 
+SYCL 构建使用 `cmake --preset sycl` 和 `cmake --build --preset sycl --target solid-baseline`。编译器、共享 bank、逐 head mask 内核和来源核查命令见 [SYCL 共享 KV](implementation/SYCL_SHARED_KV.md)。
+
 Linux 默认启用 `SOLID_URING`，准备 `liburing-dev` 开发包。纯可移植核心构建可设置 `-DSOLID_URING=OFF`；预取入口检查对应构建特性。`bash scripts/check.sh --sanitize` 对核心库与配置运行地址、泄漏和未定义行为检查。
 
 `bash scripts/check.sh --sanitize-adapter` 在独立 CPU 构建目录检查当前 KV 复制、三种设备输入图、融合输入、复制失败排空与原生完成协议。7 项检查启用地址、泄漏和未定义行为检查，覆盖 GGML 适配器及异步张量描述符。

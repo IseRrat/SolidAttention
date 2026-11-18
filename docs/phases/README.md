@@ -32,3 +32,4 @@
 | 预测期块调度 | [预测期派发](../implementation/PREDICTION_DISPATCH.md) | 阶段 3 的预测与纠错接管，阶段 4 的 SSD READ 与就绪 H2D 排序 |
 | 聚合 KV 异步回写 | [异步回写](../implementation/ASYNC_WRITEBACK.md) | 阶段 3 的脏行转发与版本提交，阶段 4 的独立 I/O 完成和跨层推进 |
 | Decode 当前 KV 异步归档 | [当前 KV 归档](../implementation/KV_ARCHIVE.md) | 阶段 4 的安装与回写分支、下一层读取与设备槽位完成依赖 |
+| SYCL 共享 KV 与逐 head decode | [SYCL 共享 KV](../implementation/SYCL_SHARED_KV.md) | 阶段 2 的交错设备视图，阶段 4 的统一内存及槽位释放 |

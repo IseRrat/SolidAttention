@@ -20,11 +20,26 @@
         "SOLID_CUDA": "ON",
         "SOLID_BUILD_TESTS": "ON"
       }
+    },
+    {
+      "name": "sycl",
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/sycl",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "CMAKE_C_COMPILER": "icx",
+        "CMAKE_CXX_COMPILER": "icpx",
+        "SOLID_SYCL": "ON",
+        "GGML_SYCL_DNN": "OFF",
+        "GGML_SYCL_GRAPH": "OFF",
+        "MKL_THREADING": "tbb_thread"
+      }
     }
   ],
   "buildPresets": [
     {"name": "checks", "configurePreset": "checks", "jobs": 4},
-    {"name": "cuda", "configurePreset": "cuda", "jobs": 4}
+    {"name": "cuda", "configurePreset": "cuda", "jobs": 4},
+    {"name": "sycl", "configurePreset": "sycl", "jobs": 4}
   ],
   "testPresets": [
     {"name": "checks", "configurePreset": "checks", "output": {"outputOnFailure": true}},
