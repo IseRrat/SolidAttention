@@ -37,7 +37,7 @@ __global__ void initialize(float * weights,float * maximum,float * sum,std::uint
 template<int Width>
 __global__ void accumulate(const float * query,const __half * kv,float * weights,float * maximum,float * sum,int * error,
     std::uint64_t first_query,std::uint64_t first_key,std::uint32_t valid,std::uint64_t rows,
-    std::uint32_t query_heads,std::uint32_t group,std::uint32_t width,std::uint32_t tile_capacity,float scale) {
+    std::uint32_t query_heads,std::uint32_t group,std::uint32_t width,std::size_t token_stride,std::size_t head_stride,float scale) {
     constexpr int fragments=(Width+31)/32;
     const auto lane=threadIdx.x%32;
     const auto warp=(static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x)/32;
@@ -55,7 +55,7 @@ __global__ void accumulate(const float * query,const __half * kv,float * weights
         auto m=maximum[row], denominator=sum[row];
         const auto count=static_cast<std::uint32_t>(min(static_cast<std::uint64_t>(valid),position-first_key+1));
         for (std::uint32_t token=0;token<count;++token) {
-            const auto base=(head*tile_capacity+token)*2*width;
+            const auto base=head*head_stride+token*token_stride;
             float score=0;
             for (int r=0;r<fragments;++r) {
                 const auto d=lane+32*r;
@@ -119,38 +119,63 @@ public:
     std::uint32_t query_capacity() const override { return queries_; }
     std::uint32_t tile_capacity() const override { return tile_; }
     const char * name() const override { return "cuda_online_tiled"; }
+    std::optional<DeviceMemory> direct_memory() const override { return DeviceMemory::cuda; }
     PrefillStats stats() const override { return stats_; }
     void begin(std::uint64_t first,std::uint32_t queries,float scale,const std::vector<float> & query) override {
+        if (query.size()!=product(product(queries,qh_),g_.dimension)) throw std::invalid_argument("prefill query shape");
+        for (const auto value:query) if (!std::isfinite(value)) throw std::invalid_argument("non-finite prefill query");
+        begin_impl(first,queries,scale,query.data(),false);
+    }
+    void begin_device(std::uint64_t first,std::uint32_t queries,float scale,DeviceQuery query) override {
+        validate_device_query(query,DeviceMemory::cuda,qh_,g_.dimension,queries); validate_pointer(query.data);
+        begin_impl(first,queries,scale,query.data,true); stats_.device_query_tokens+=queries;
+    }
+    void begin_impl(std::uint64_t first,std::uint32_t queries,float scale,const float * query,bool device) {
         check();
         if (open_ || !queries || queries>queries_ || first>g_.capacity_tokens-queries ||
-            query.size()!=product(product(queries,qh_),g_.dimension) || !std::isfinite(scale) || scale<=0) throw std::invalid_argument("prefill frame shape, position or scale");
-        for (const auto value:query) if (!std::isfinite(value)) throw std::invalid_argument("non-finite prefill query");
+            !std::isfinite(scale) || scale<=0) throw std::invalid_argument("prefill frame shape, position or scale");
         DeviceScope scope(device_);
         try {
-            checked(cudaMemcpyAsync(query_,query.data(),product(query.size(),sizeof(float)),cudaMemcpyHostToDevice,stream_),"upload prefill Q");
-            checked(cudaEventRecord(copied_,stream_),"record prefill Q completion");
+            if (!device) {
+                const auto bytes=product(product(product(queries,qh_),g_.dimension),sizeof(float));
+                checked(cudaMemcpyAsync(query_,query,bytes,cudaMemcpyHostToDevice,stream_),"upload prefill Q");
+                checked(cudaEventRecord(copied_,stream_),"record prefill Q completion"); stats_.query_upload_bytes+=bytes;
+            }
             checked(cudaMemsetAsync(error_device_,0,sizeof(int),stream_),"clear prefill status");
             const auto rows=static_cast<std::uint64_t>(queries)*qh_;
             initialize<<<grid(rows*g_.dimension),256,0,stream_>>>(weights_,maximum_,sum_,rows,g_.dimension);
             checked(cudaGetLastError(),"initialize online prefill state");
-            checked(cudaEventSynchronize(copied_),"complete prefill Q upload");
+            if (!device) checked(cudaEventSynchronize(copied_),"complete prefill Q upload");
+            current_query_=device?query:query_;
             first_=first; count_=queries; scale_=scale; next_key_=0; open_=true;
         } catch (...) { fail(); throw; }
     }
     void consume(std::uint64_t first,std::uint32_t valid,const std::vector<Half> & kv) override {
+        if (kv.size()!=tile_elements_) throw std::invalid_argument("prefill host tile shape");
+        consume_impl(first,valid,kv.data(),false);
+    }
+    void consume_device(std::uint64_t first,std::uint32_t valid,DeviceKvBatch kv) override {
+        validate_device_kv(kv,DeviceMemory::cuda,g_.heads,g_.dimension,valid); validate_pointer(kv.data);
+        consume_impl(first,valid,kv.data,true);
+    }
+    void consume_impl(std::uint64_t first,std::uint32_t valid,const Half * kv,bool device) {
         check();
         const auto end=first_+count_;
-        if (!open_ || first!=next_key_ || first>=end || !valid || valid!=std::min<std::uint64_t>(tile_,end-first) || kv.size()!=tile_elements_) {
+        if (!open_ || first!=next_key_ || first>=end || !valid || valid>std::min<std::uint64_t>(tile_,end-first)) {
             throw std::invalid_argument("prefill tile order, shape or valid rows");
         }
         DeviceScope scope(device_);
         try {
-            const auto bytes=product(kv.size(),sizeof(Half));
-            checked(cudaMemcpyAsync(kv_,kv.data(),bytes,cudaMemcpyHostToDevice,stream_),"upload prefill KV tile");
-            checked(cudaEventRecord(copied_,stream_),"record prefill tile upload");
+            const auto bytes=product(tile_elements_,sizeof(Half));
+            if (!device) {
+                checked(cudaMemcpyAsync(kv_,kv,bytes,cudaMemcpyHostToDevice,stream_),"upload prefill KV tile");
+                checked(cudaEventRecord(copied_,stream_),"record prefill tile upload");
+            }
             const auto rows=static_cast<std::uint64_t>(count_)*qh_;
             const auto blocks=static_cast<unsigned>(std::min<std::uint64_t>((rows+3)/4,65535));
-#define SOLID_PREFILL_LAUNCH(W) accumulate<W><<<blocks,128,0,stream_>>>(query_,reinterpret_cast<const __half *>(kv_),weights_,maximum_,sum_,error_device_,first_,first,valid,rows,qh_,qh_/g_.heads,g_.dimension,tile_,scale_)
+            const auto token_stride=product(2,g_.dimension)*(device?g_.heads:1);
+            const auto head_stride=product(2,g_.dimension)*(device?1:tile_);
+#define SOLID_PREFILL_LAUNCH(W) accumulate<W><<<blocks,128,0,stream_>>>(current_query_,reinterpret_cast<const __half *>(device?kv:kv_),weights_,maximum_,sum_,error_device_,first_,first,valid,rows,qh_,qh_/g_.heads,g_.dimension,token_stride,head_stride,scale_)
             if (g_.dimension<=32) { SOLID_PREFILL_LAUNCH(32); }
             else if (g_.dimension<=64) { SOLID_PREFILL_LAUNCH(64); }
             else if (g_.dimension<=128) { SOLID_PREFILL_LAUNCH(128); }
@@ -161,39 +186,58 @@ public:
             checked(cudaGetLastError(),"launch causal tiled prefill");
             // The source lease ends after H2D. The kernel may overlap the next
             // host read; the same stream orders the next overwrite of kv_.
-            checked(cudaEventSynchronize(copied_),"complete prefill tile upload");
-            next_key_+=valid; ++stats_.tiles; stats_.kv_tokens+=valid; stats_.upload_bytes+=bytes;
+            if (!device) { checked(cudaEventSynchronize(copied_),"complete prefill tile upload"); stats_.upload_bytes+=bytes; }
+            else stats_.device_kv_tokens+=valid;
+            next_key_+=valid; ++stats_.tiles; stats_.kv_tokens+=valid;
         } catch (...) { fail(); throw; }
     }
     std::vector<float> finish() override {
+        std::vector<float> output(product(product(count_,qh_),g_.dimension));
+        finish_impl(output.data(),output.size(),false);
+        return output;
+    }
+    void finish_to(DeviceOutput output) override {
+        validate_device_output(output,DeviceMemory::cuda,qh_,g_.dimension,count_); validate_pointer(output.data);
+        finish_impl(output.data,output.elements,true);
+    }
+    void finish_impl(float * output,std::size_t elements,bool device) {
         check();
         if (!open_ || next_key_!=first_+count_) throw std::logic_error("prefill finish requires the complete causal prefix");
-        std::vector<float> output(product(product(count_,qh_),g_.dimension));
         DeviceScope scope(device_);
         try {
-            normalize<<<grid(output.size()),256,0,stream_>>>(weights_,sum_,error_device_,output.size(),g_.dimension);
+            normalize<<<grid(elements),256,0,stream_>>>(weights_,sum_,error_device_,elements,g_.dimension);
             checked(cudaGetLastError(),"normalize tiled prefill");
-            checked(cudaMemcpyAsync(output.data(),weights_,product(output.size(),sizeof(float)),cudaMemcpyDeviceToHost,stream_),"download prefill output");
+            const auto bytes=product(elements,sizeof(float));
+            checked(cudaMemcpyAsync(output,weights_,bytes,device?cudaMemcpyDeviceToDevice:cudaMemcpyDeviceToHost,stream_),"copy prefill output");
             checked(cudaMemcpyAsync(&error_,error_device_,sizeof(int),cudaMemcpyDeviceToHost,stream_),"download prefill status");
             checked(cudaStreamSynchronize(stream_),"complete tiled prefill frame");
             if (error_) throw std::runtime_error("non-finite or empty tiled attention");
             open_=false; ++stats_.batches; stats_.query_tokens+=count_;
+            current_query_=nullptr;
+            if (device) stats_.output_device_copy_bytes+=bytes; else stats_.output_download_bytes+=bytes;
         } catch (...) { fail(); throw; }
-        return output;
     }
     void abort() override {
         DeviceScope scope(device_);
         const auto status=cudaStreamSynchronize(stream_);
         open_=false; failed_=true;
+        current_query_=nullptr;
         checked(status,"abort tiled prefill");
     }
 private:
+    void validate_pointer(const void * pointer) const {
+        check(); DeviceScope scope(device_); cudaPointerAttributes attributes{};
+        checked(cudaPointerGetAttributes(&attributes,pointer),"inspect borrowed prefill input");
+        if ((attributes.type!=cudaMemoryTypeDevice && attributes.type!=cudaMemoryTypeManaged) || attributes.device!=device_) {
+            throw std::invalid_argument("prefill input belongs to another memory space or device");
+        }
+    }
     static unsigned grid(std::uint64_t elements) { return static_cast<unsigned>(std::min<std::uint64_t>((elements+255)/256,65535)); }
     template<class T> void allocate(T *& target,std::size_t bytes,std::uint64_t & category) {
         checked(cudaMalloc(reinterpret_cast<void **>(&target),bytes),"allocate tiled prefill"); category+=bytes;
     }
     void check() const { if (failed_) throw std::runtime_error("tiled prefill backend failed"); }
-    void fail() noexcept { failed_=true; open_=false; if (stream_) (void) cudaStreamSynchronize(stream_); }
+    void fail() noexcept { failed_=true; open_=false; if (stream_) (void) cudaStreamSynchronize(stream_); current_query_=nullptr; }
     void release() noexcept {
         int previous=0; const bool restore=cudaGetDevice(&previous)==cudaSuccess;
         if (cudaSetDevice(device_)!=cudaSuccess) return;
@@ -218,6 +262,7 @@ private:
     cudaStream_t stream_=nullptr;
     cudaEvent_t copied_=nullptr;
     float * query_=nullptr,* weights_=nullptr,* maximum_=nullptr,* sum_=nullptr;
+    const float * current_query_=nullptr;
     Half * kv_=nullptr;
     int * error_device_=nullptr;
     PrefillStats stats_;

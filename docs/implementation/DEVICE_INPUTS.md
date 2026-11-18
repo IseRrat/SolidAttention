@@ -32,7 +32,7 @@ overlap / overlap+sync_reuse:
 
 Q 布局为连续 FP32 `[Hq,D]`；交错 KV 为 FP16 `[Hkv,2,D]`。K 借用视图指向每个 head 的第一段，`head_stride=2*D`，CUDA 追加内核只读 K。consolidator 接受独立 K/V 或融合投影产生的 strided K/V，使用 round-to-nearest-even 转换，与 SSD 的 half 位模式一致。
 
-每层每个 decode token 交给主机追加的 KV 为 `Hkv*2*D*sizeof(Half)` 字节。代表构造和评分直接读取设备 Q，代表环直接读取设备 K；prefill 继续使用已有主机输入接口。
+每层每个 decode token 交给主机追加的 KV 为 `Hkv*2*D*sizeof(Half)` 字节。代表构造和评分直接读取设备 Q，代表环直接读取设备 K。[Prefill 设备接入](PREFILL_DEVICE_INPUTS.md) 覆盖批量 Q/K、历史 tile 分区和设备输出；主机接口继续用于参考。
 
 ## 3. 生命周期与图重放
 

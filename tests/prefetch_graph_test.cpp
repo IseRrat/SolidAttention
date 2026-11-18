@@ -1,5 +1,6 @@
 #include "prefetch_fakes.hpp"
 #include "representative_builder_cases.hpp"
+#include "tiled_prefill_cases.hpp"
 #include "solid/ggml_prefetch.hpp"
 #include "solid/llama_adapter.hpp"
 #include "solid/device_ops.hpp"
@@ -92,9 +93,26 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
             value[h * dimension + d] = (p + layer + h + d) * 0.125f;
         }
     };
-    for (int p = 0; p < 6; ++p) for (int layer = 0; layer < 2; ++layer) {
-        inputs(layer, p);
-        (void) session.process(layer, p, 1, query, key, value, scale);
+    if (direct) {
+        session.set_prefill(std::make_unique<test_tiled::Emulator>(geometry,query_heads,3,4,true));
+        for (int layer=0;layer<2;++layer) {
+            std::vector<float> q,k,v;
+            for (int p=0;p<6;++p) {
+                inputs(layer,p); q.insert(q.end(),query.begin(),query.end()); k.insert(k.end(),key.begin(),key.end()); v.insert(v.end(),value.begin(),value.end());
+            }
+            std::vector<solid::Half> kv(k.size()*2);
+            for (int p=0;p<6;++p) for (int h=0;h<kv_heads;++h) for (int d=0;d<dimension;++d) {
+                const auto source=(p*kv_heads+h)*dimension+d,target=(p*kv_heads+h)*2*dimension+d;
+                kv[target]=solid::to_half(k[source]); kv[target+dimension]=solid::to_half(v[source]);
+            }
+            std::vector<float> output(q.size(),NAN);
+            session.process_prefill_device(layer,0,6,{q.data(),q.size(),solid::DeviceMemory::host_emulator},
+                {kv.data(),kv.size(),solid::DeviceMemory::host_emulator},kv,scale,{output.data(),output.size(),solid::DeviceMemory::host_emulator});
+            test_tiled::close(output,reference.process(layer,0,6,q,k,v,scale));
+            session.release_prefill_if_complete();
+        }
+    } else for (int p = 0; p < 6; ++p) for (int layer = 0; layer < 2; ++layer) {
+        inputs(layer, p); (void) session.process(layer, p, 1, query, key, value, scale);
         (void) reference.process(layer, p, 1, query, key, value, scale);
     }
     session.flush();
@@ -204,8 +222,9 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     if (disk) require(session.stats().prefetch.io.completed_reads > 0, "GGML path did not complete liburing reads");
     if (builder || direct) require(session.stats().ranking.builder_queries == 24 && session.stats().ranking.builder_appends == 24 &&
         session.stats().ranking.built_blocks == 10, "graph did not execute representative builder across prefill and decode");
-    if (direct) require(session.stats().direct_decode_queries==12 && session.stats().ranking.device_builder_queries==12 &&
-        session.stats().ranking.device_builder_appends==12 && session.stats().ranking.device_rank_queries>0 &&
+    if (direct) require(session.stats().direct_prefill_queries==12 && session.stats().ranking.device_builder_batches==4 &&
+        session.stats().direct_decode_queries==12 && session.stats().ranking.device_builder_queries==24 &&
+        session.stats().ranking.device_builder_appends==24 && session.stats().ranking.device_rank_queries>0 &&
         session.stats().decode_kv_download_bytes==12ull*kv_heads*dimension*2*sizeof(solid::Half),"device decode counters or FP16 transfer size");
     device.quiesce(); session.finish();
     if (!directory.empty()) {

@@ -104,6 +104,10 @@ Json counters(const solid::SessionStats & s, const solid::DeviceCacheStats & d) 
         {"device_builder_appends",s.ranking.device_builder_appends},{"query_upload_bytes",s.ranking.query_upload_bytes},
         {"builder_key_upload_bytes",s.ranking.builder_key_upload_bytes},{"direct_decode_queries",s.direct_decode_queries},
         {"decode_kv_download_bytes",s.decode_kv_download_bytes},
+        {"device_builder_batches",s.ranking.device_builder_batches},{"direct_prefill_queries",s.direct_prefill_queries},
+        {"prefill_kv_download_bytes",s.prefill_kv_download_bytes},{"prefill_query_upload_bytes",s.prefill.query_upload_bytes},
+        {"prefill_device_query_tokens",s.prefill.device_query_tokens},{"prefill_device_kv_tokens",s.prefill.device_kv_tokens},
+        {"prefill_output_download_bytes",s.prefill.output_download_bytes},{"prefill_output_device_copy_bytes",s.prefill.output_device_copy_bytes},
         {"prefill_tiled_batches", s.prefill.batches}, {"prefill_tiled_queries", s.prefill.query_tokens},
         {"prefill_tiles", s.prefill.tiles}, {"prefill_kv_tokens", s.prefill.kv_tokens},
         {"prefill_upload_bytes", s.prefill.upload_bytes}, {"tiled_prefill_inclusive_ms", s.tiled_prefill_ns/1e6},
@@ -364,7 +368,8 @@ int main(int argc, char ** argv) {
                 {"ranking_and_bank_bytes", stats.ranking.device_bytes-stats.ranking.builder_device_bytes}};
             result["memory"]["prefill_workspace"]={{"device_bytes",stats.prefill.workspace_device_bytes},
                 {"device_peak_bytes",stats.prefill.workspace_device_peak_bytes},{"kv_device_peak_bytes",stats.prefill.kv_device_peak_bytes},
-                {"kv_host_peak_bytes",stats.prefill_host_peak_bytes}};
+                {"kv_host_peak_bytes",stats.prefill_host_peak_bytes},{"graph_output_device_bytes",stats.prefill_graph_device_bytes},
+                {"graph_output_device_peak_bytes",stats.prefill_graph_device_peak_bytes}};
             result["attention_phases"] = {{"prefill", prefill_counters}, {"decode", difference(decode_counters, prefill_counters)},
                 {"final_flush", difference(counters(stats, device), decode_counters)}};
             result["attention"] = {
@@ -387,6 +392,10 @@ int main(int argc, char ** argv) {
                 {"device_builder_appends",stats.ranking.device_builder_appends},{"query_upload_bytes",stats.ranking.query_upload_bytes},
                 {"builder_key_upload_bytes",stats.ranking.builder_key_upload_bytes},{"direct_decode_queries",stats.direct_decode_queries},
                 {"decode_kv_download_bytes",stats.decode_kv_download_bytes},
+                {"device_builder_batches",stats.ranking.device_builder_batches},{"direct_prefill_queries",stats.direct_prefill_queries},
+                {"prefill_kv_download_bytes",stats.prefill_kv_download_bytes},{"prefill_query_upload_bytes",stats.prefill.query_upload_bytes},
+                {"prefill_device_query_tokens",stats.prefill.device_query_tokens},{"prefill_device_kv_tokens",stats.prefill.device_kv_tokens},
+                {"prefill_output_download_bytes",stats.prefill.output_download_bytes},{"prefill_output_device_copy_bytes",stats.prefill.output_device_copy_bytes},
                 {"block_tokens", config.attention.block_tokens}, {"context_budget_tokens", budget.total},
                 {"init_tokens", budget.initial}, {"local_tokens", budget.local}, {"representative_count", budget.representatives},
                 {"head_aggregation", "mean"}, {"position_policy", "absolute_native_rope"},

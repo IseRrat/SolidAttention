@@ -39,7 +39,7 @@ CPU 参考/ CUDA 窗口构造 → 完整块定稿 → 提交该块全部 head �
 
 CUDA 后端使用独立 non-blocking stream。代表上传完成后归还主机 payload；一次 rank 在输入上传、两个内核和 ID 下载完成后返回。每个入口保存并恢复调用线程原有 CUDA device。CUDA 失败会完成流清理，再沿既有 attention 错误路径传播。
 
-CUDA 动态选块的预取 decode 直接消费设备 Q，三种调度与保活依赖见 [设备输入](DEVICE_INPUTS.md)。主机接口继续支持串行算子核查与 prefill 代表更新。[GPU 分块 prefill](GPU_PREFILL.md) 的设备输入后续按 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md) 接入。
+CUDA 动态选块的预取 decode 直接消费设备 Q，三种调度与保活依赖见 [设备输入](DEVICE_INPUTS.md)。[Prefill 设备接入](PREFILL_DEVICE_INPUTS.md) 使用批量 Q/K 更新代表及设备结果；主机接口继续支持参考和独立算子核查。完整执行范围见 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md)。
 
 ## 4. 配置与结果
 

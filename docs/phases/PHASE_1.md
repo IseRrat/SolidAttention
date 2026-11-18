@@ -37,3 +37,5 @@ CUDA 后续窗口构造、半完成状态接管、完整块提交和三种调度
 ## 实验环境核查
 
 按 [SSD_PATH 的固定 token 对照步骤](../SSD_PATH.md#固定-token-数值对照)，依次核查原版与内存 dense、内存 dense 与 SSD dense、内存 sparse 与 SSD sparse。保存 logits 容差、选择集合、内存分项与设备资源峰值。
+
+2026-11-18 接入 [Prefill 设备输入、批量代表与设备输出](../implementation/PREFILL_DEVICE_INPUTS.md)。历史读取与当前设备 KV 按起点分区，原有因果参考用于核对结果；多层代表状态和写入版本继续交给预取 decode。

@@ -28,6 +28,26 @@ AttentionAdapter * lookup(const llama_model * model) {
     const auto it = registry.find(model);
     return it == registry.end() ? nullptr : it->second;
 }
+struct PrefillOutput {
+    AttentionSession & session;
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> context{nullptr,ggml_free};
+    std::unique_ptr<ggml_backend_buffer,decltype(&ggml_backend_buffer_free)> buffer{nullptr,ggml_backend_buffer_free};
+    ggml_tensor * tensor=nullptr;
+    std::uint64_t bytes=0;
+    PrefillOutput(AttentionSession & session,ggml_backend_t backend,std::int64_t width,std::int64_t tokens):session(session) {
+        context.reset(ggml_init({ggml_tensor_overhead()+1024,nullptr,true}));
+        if (!context) throw std::runtime_error("prefill result metadata allocation");
+        tensor=ggml_new_tensor_2d(context.get(),GGML_TYPE_F32,width,tokens);
+        ggml_set_name(tensor,"solid_prefill_device_result_source");
+        buffer.reset(ggml_backend_alloc_ctx_tensors(context.get(),backend));
+        if (!buffer) throw std::runtime_error("prefill result device allocation");
+        ggml_backend_buffer_set_usage(buffer.get(),GGML_BACKEND_BUFFER_USAGE_COMPUTE);
+        ggml_backend_buffer_clear(buffer.get(),0);
+        const auto allocated=ggml_backend_buffer_get_size(buffer.get());
+        session.retain_prefill_graph_output(allocated); bytes=allocated;
+    }
+    ~PrefillOutput() { session.release_prefill_graph_output(bytes); }
+};
 }
 void AttentionFailure::capture(std::exception_ptr error, std::uint32_t layer, std::uint64_t position) {
     std::lock_guard<std::mutex> lock(mutex_);
@@ -54,6 +74,7 @@ struct AttentionNode::Impl {
     std::optional<DeviceMemory> direct = {};
     ggml_tensor * device_query = nullptr;
     ggml_tensor * device_kv = nullptr;
+    std::unique_ptr<PrefillOutput> prefill_output = {};
     ggml_tensor * host = nullptr;
     ggml_tensor * early = nullptr;
     ggml_tensor * flash = nullptr;
@@ -90,7 +111,7 @@ struct AttentionNode::Impl {
         auto & self = *static_cast<Impl *>(userdata);
         try {
             self.failure->check();
-            const auto count = static_cast<std::size_t>(destination->ne[1]);
+            const auto count = static_cast<std::size_t>(self.prefill_output?self.device_query->ne[2]:destination->ne[1]);
             if (self.frame->positions.size() != count || count == 0) throw std::invalid_argument("attention graph positions are not initialized");
             for (std::size_t i = 1; i < count; ++i) {
                 if (self.frame->positions[i] != self.frame->positions[0] + i) throw std::invalid_argument("attention requires consecutive positions");
@@ -103,7 +124,17 @@ struct AttentionNode::Impl {
                 inputs[source].resize(static_cast<std::size_t>(ggml_nelements(tensor)));
                 std::memcpy(inputs[source].data(), tensor->data, inputs[source].size() * sizeof(float));
             }
-            if (self.prefetch) {
+            if (self.prefill_output) {
+                const auto * source=destination->src[0];
+                if (source->type!=GGML_TYPE_F16 || !ggml_is_contiguous(source)) throw std::logic_error("prefill offload requires contiguous FP16 KV");
+                std::vector<Half> kv(static_cast<std::size_t>(ggml_nelements(source)));
+                std::memcpy(kv.data(),source->data,kv.size()*sizeof(Half));
+                self.session.process_prefill_device(self.layer,self.frame->positions.front(),static_cast<std::uint32_t>(count),
+                    {static_cast<const float *>(self.device_query->data),static_cast<std::size_t>(ggml_nelements(self.device_query)),*self.direct},
+                    {static_cast<const Half *>(self.device_kv->data),kv.size(),*self.direct},kv,self.scale,
+                    {static_cast<float *>(self.prefill_output->tensor->data),static_cast<std::size_t>(ggml_nelements(self.prefill_output->tensor)),*self.direct});
+                *static_cast<float *>(destination->data)=0;
+            } else if (self.prefetch) {
                 std::vector<Half> result;
                 if (self.direct) {
                     const auto * source = destination->src[0];
@@ -147,7 +178,10 @@ struct AttentionNode::Impl {
                 const auto mask = static_cast<std::size_t>(slots) * 2 * self.session.geometry().heads * self.session.geometry().dimension;
                 std::fill(data + mask, data + ggml_nelements(destination), Half{0xfc00});
                 for (std::uint32_t head = 0; head < self.session.query_heads(); ++head) data[mask + head * slots] = 0;
-            } else std::fill_n(static_cast<float *>(destination->data), ggml_nelements(destination), 0.0f);
+            } else {
+                if (self.prefill_output) ggml_backend_buffer_clear(self.prefill_output->buffer.get(),0);
+                std::fill_n(static_cast<float *>(destination->data), ggml_nelements(destination), 0.0f);
+            }
         }
     }
 };
@@ -175,8 +209,14 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         throw std::invalid_argument("packed KV graph input shape");
     }
     impl_->packed_inputs = packed_kv != nullptr;
-    impl_->direct = impl_->prefetch ? impl_->prefetch->direct_memory() : std::optional<DeviceMemory>{};
+    impl_->direct = impl_->prefetch ? impl_->prefetch->direct_memory() : (!impl_->gathered?impl_->session.prefill_direct_memory():std::optional<DeviceMemory>{});
     if (impl_->direct && *impl_->direct == DeviceMemory::cuda && (!scheduler || !decode_backend)) throw std::invalid_argument("device Q/K graph requires scheduler and decode backend");
+    if (impl_->direct && !impl_->prefetch) {
+        if (!decode_backend) throw std::invalid_argument("device prefill requires a result backend");
+        const auto type=ggml_backend_dev_type(ggml_backend_get_device(decode_backend));
+        if ((*impl_->direct==DeviceMemory::host_emulator) != (type==GGML_BACKEND_DEVICE_TYPE_CPU)) throw std::invalid_argument("prefill result memory/backend mismatch");
+        impl_->prefill_output=std::make_unique<PrefillOutput>(impl_->session,decode_backend,query->ne[0]*query->ne[1],query->ne[2]);
+    }
     const auto on_device = [&](ggml_tensor * tensor) {
         if (scheduler && decode_backend) ggml_backend_sched_set_tensor_backend(scheduler,tensor,decode_backend);
         return tensor;
@@ -191,12 +231,17 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
     if (impl_->direct) {
         impl_->device_query = on_device(inputs[0]);
         auto * token = on_device(device_query_token(context,impl_->device_query));
-        if (impl_->prefetch->early_enabled()) {
+        if (impl_->prefetch && impl_->prefetch->early_enabled()) {
             impl_->early = ggml_custom_4d(context,GGML_TYPE_F32,1,1,1,1,&token,1,Impl::select_query,1,impl_.get());
             ggml_set_name(impl_->early,"solid_early_selection_device");
         }
-        if (key->type != GGML_TYPE_F32) key = ggml_cast(context,key,GGML_TYPE_F32);
-        if (value->type != GGML_TYPE_F32) value = ggml_cast(context,value,GGML_TYPE_F32);
+        const auto vectors=[&](ggml_tensor * source) {
+            if (source->type!=GGML_TYPE_F32) source=ggml_cast(context,source,GGML_TYPE_F32);
+            if (source->nb[0]!=sizeof(float) || source->nb[1]<static_cast<std::size_t>(source->ne[0])*sizeof(float) ||
+                source->nb[2]<static_cast<std::size_t>(source->ne[1])*source->nb[1]) source=ggml_cont(context,source);
+            return source;
+        };
+        key=vectors(key); value=vectors(value);
         // The query and early frontier extend Q's allocation through selection.
         impl_->device_kv = on_device(device_consolidate_kv(context,key,value,impl_->device_query,impl_->early?impl_->early:token));
         inputs[0] = impl_->device_kv; input_count = 1;
@@ -211,12 +256,14 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
     const auto elements = impl_->prefetch ? static_cast<std::uint64_t>(impl_->prefetch->tokens_per_head()) * impl_->session.query_heads() :
                                           impl_->session.gather_elements();
     auto * result = ggml_custom_4d(context, impl_->gathered ? GGML_TYPE_F16 : GGML_TYPE_F32,
-                                   impl_->gathered ? static_cast<int64_t>(elements) : query->ne[0] * query->ne[1],
-                                   impl_->gathered ? 1 : query->ne[2], 1, 1,
+                                   impl_->prefill_output?1:(impl_->gathered ? static_cast<int64_t>(elements) : query->ne[0] * query->ne[1]),
+                                   impl_->prefill_output || impl_->gathered ? 1 : query->ne[2], 1, 1,
                                    inputs, input_count, Impl::compute, 1, impl_.get());
     ggml_set_name(result, "solid_sync_attention");
     impl_->host = result;
-    if (impl_->prefetch) {
+    if (impl_->prefill_output) {
+        result=on_device(device_prefill_result(context,impl_->prefill_output->tensor,result,impl_->device_query,impl_->device_kv));
+    } else if (impl_->prefetch) {
         // The future GPU consumer retains KV until the host append has used K.
         if (impl_->direct) result = on_device(device_release_mask(context,result,impl_->device_kv,impl_->device_query));
         const auto slots = impl_->prefetch->tokens_per_head();

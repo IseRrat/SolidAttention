@@ -75,3 +75,7 @@ build/release/bin/solid-cuda-prefill-test --run-device-check 0
 ```
 
 本机数学执行使用 CPU 合成数据。模型 logits、设备执行与性能对照在实验环境执行。
+
+## 6. 设备输入与输出接入
+
+2026-11-18 接入 [Prefill 设备输入、批量代表与设备输出](PREFILL_DEVICE_INPUTS.md)。设备 Q 与当前 KV 保留至私有 frame 完成，历史 tile 继续使用上传事件归还主机源。接口允许按历史/当前边界分区，覆盖非块对齐起点；结果写入独立图 buffer，以带控制依赖的 GGML 视图交给后续计算。新增结果内存单独计数，原有主机接口继续用于参考与算子核查。

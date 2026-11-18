@@ -61,3 +61,11 @@ RSS 记录增加 `rss_samples`。有效采样数为零时，`sampled_peak_rss_by
 | 文档 | 本地链接、标题锚点、代码块、文风与配置 JSON 检查 |
 
 本机检查使用 CPU 合成张量、延迟复制后端、临时文件及合成子进程。模型与设备实验继续使用阶段 5 的实验环境入口。
+
+## 6. 2026-11-18：模拟读取门与稳定通知
+
+Prefill 设备接入回归中，`native-completion-progress` 出现一次等待超时。调试器重现时，主线程在 `query_handoff` 的 quiesce 等待，协调 worker 等待读取完成，I/O 所有者阻塞在 poll。
+
+[native_completion_test.cpp](../tests/native_completion_test.cpp) 的模拟门在开关时返回不同通知描述符：旧通道已进入等待，新通道的通知可能已被消费。修复为复制原 READ eventfd 的描述符，门变化与内核完成始终写入同一通知对象；I/O 所有者沿既有顺序消费通知并检查完成队列。
+
+修复后连续 30 轮 CPU 合成检查通过，覆盖通知、FFN/H2D 进展、Q 交接、取消、错误与源租约回收。完整 50 项 CTest、62 项 Python 和源码指纹通过。重复入口为 `solid-native-completion-test --repeat 30`。Prefill 数据流与生命周期见 [设备接入记录](implementation/PREFILL_DEVICE_INPUTS.md)。

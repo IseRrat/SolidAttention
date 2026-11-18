@@ -26,6 +26,7 @@ struct RankerStats {
     std::uint64_t built_blocks = 0;
     std::uint64_t device_rank_queries = 0, device_builder_queries = 0, device_builder_appends = 0;
     std::uint64_t query_upload_bytes = 0, builder_key_upload_bytes = 0;
+    std::uint64_t device_builder_batches = 0;
 };
 struct RepresentativeSeed {
     std::uint64_t length = 0;
@@ -70,6 +71,9 @@ public:
     }
     virtual void build_append_device(std::uint32_t, std::uint64_t, DeviceKeys) {
         throw std::logic_error("direct device representative append is disabled");
+    }
+    virtual std::vector<BuiltRepresentatives> build_batch_device(std::uint32_t,std::uint64_t,std::uint32_t,DeviceQuery,DeviceKvBatch) {
+        throw std::logic_error("device representative batch is disabled");
     }
     virtual void seed_builder(std::uint32_t, const RepresentativeSeed &) { throw std::logic_error("representative builder is disabled"); }
     // A complete block is committed to the ranker's bank before it is returned.

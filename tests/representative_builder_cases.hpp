@@ -55,6 +55,22 @@ public:
     std::vector<std::vector<std::uint64_t>> rank_device(std::uint32_t layer,solid::DeviceQuery query,const solid::BlockCandidates & candidates) override {
         auto result=rank(layer,device_query(query),candidates); ++stats_.device_rank_queries; return result;
     }
+    std::vector<solid::BuiltRepresentatives> build_batch_device(std::uint32_t layer,std::uint64_t first,std::uint32_t count,
+                                                               solid::DeviceQuery query,solid::DeviceKvBatch kv) override {
+        solid::validate_device_query(query,solid::DeviceMemory::host_emulator,qh,g.dimension,count);
+        solid::validate_device_kv(kv,solid::DeviceMemory::host_emulator,g.heads,g.dimension,count);
+        std::vector<solid::BuiltRepresentatives> result;
+        const auto qw=static_cast<std::size_t>(qh)*g.dimension,kw=static_cast<std::size_t>(g.heads)*2*g.dimension;
+        for (std::uint32_t i=0;i<count;++i) {
+            auto built=build_query_device(layer,first+i,{query.data+i*qw,qw,query.memory});
+            if (built) result.push_back(std::move(*built));
+            build_append_device(layer,first+i,{kv.data+i*kw,kw,2*g.dimension,kv.memory});
+        }
+        ++stats_.device_builder_batches;
+        if (corrupt==13) result.emplace_back();
+        if (corrupt==14 && !result.empty()) result.pop_back();
+        return result;
+    }
     void publish(std::uint32_t layer, std::uint64_t first, std::uint64_t count, const std::vector<solid::Half> & keys) override {
         const auto size = static_cast<std::size_t>(g.heads)*b.representatives*g.dimension;
         require(first == prefixes.at(layer) && keys.size() == count*size, "emulator publication prefix");

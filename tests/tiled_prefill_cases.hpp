@@ -11,7 +11,7 @@ inline void require(bool value,const char * message) { if (!value) throw std::ru
 template<class F> void rejects(F work) { bool failed=false; try { work(); } catch (const std::exception &) { failed=true; } require(failed,"invalid tiled prefill operation accepted"); }
 class Emulator final:public solid::TiledPrefill {
 public:
-    Emulator(solid::KvGeometry g,std::uint32_t qh,std::uint32_t queries,std::uint32_t tile):g(g),qh(qh),queries(queries) {
+    Emulator(solid::KvGeometry g,std::uint32_t qh,std::uint32_t queries,std::uint32_t tile,bool direct=false):g(g),qh(qh),queries(queries),direct_(direct) {
         capacity=static_cast<std::uint32_t>((std::min<std::uint64_t>(tile,g.capacity_tokens)+g.block_tokens-1)/g.block_tokens*g.block_tokens);
         stats_.kv_device_bytes=static_cast<std::uint64_t>(g.heads)*capacity*2*g.dimension*sizeof(solid::Half);
         stats_.workspace_device_bytes=static_cast<std::uint64_t>(queries)*qh*(2*g.dimension+2)*sizeof(float)+sizeof(int);
@@ -22,6 +22,33 @@ public:
     std::uint32_t tile_capacity() const override { return capacity; }
     const char * name() const override { return "host_tiled_emulator"; }
     solid::PrefillStats stats() const override { return stats_; }
+    std::optional<solid::DeviceMemory> direct_memory() const override {
+        return direct_?std::optional<solid::DeviceMemory>{solid::DeviceMemory::host_emulator}:std::optional<solid::DeviceMemory>{};
+    }
+    void begin_device(std::uint64_t first,std::uint32_t count,float scale,solid::DeviceQuery query) override {
+        require(direct_,"direct tiled emulator is disabled");
+        solid::validate_device_query(query,solid::DeviceMemory::host_emulator,qh,g.dimension,count);
+        begin(first,count,scale,{query.data,query.data+query.elements}); stats_.device_query_tokens+=count;
+        stats_.query_upload_bytes-=query.elements*sizeof(float);
+    }
+    void consume_device(std::uint64_t first_key,std::uint32_t valid,solid::DeviceKvBatch kv) override {
+        require(direct_,"direct tiled emulator is disabled");
+        solid::validate_device_kv(kv,solid::DeviceMemory::host_emulator,g.heads,g.dimension,valid);
+        std::vector<solid::Half> tile(static_cast<std::size_t>(g.heads)*capacity*2*g.dimension,0x7e00);
+        for (std::uint32_t p=0;p<valid;++p) for (std::uint32_t h=0;h<g.heads;++h) {
+            std::copy_n(kv.data+(static_cast<std::size_t>(p)*g.heads+h)*2*g.dimension,2*g.dimension,
+                tile.data()+(static_cast<std::size_t>(h)*capacity+p)*2*g.dimension);
+        }
+        consume(first_key,valid,tile); stats_.upload_bytes-=tile.size()*sizeof(solid::Half); stats_.device_kv_tokens+=valid;
+    }
+    void finish_to(solid::DeviceOutput output) override {
+        require(direct_,"direct tiled emulator is disabled");
+        solid::validate_device_output(output,solid::DeviceMemory::host_emulator,qh,g.dimension,count);
+        const auto result=finish(); require(result.size()==output.elements,"direct emulator output shape");
+        for (auto value:result) require(std::isfinite(value),"non-finite direct emulator output");
+        std::copy(result.begin(),result.end(),output.data); stats_.output_download_bytes-=result.size()*sizeof(float);
+        stats_.output_device_copy_bytes+=result.size()*sizeof(float);
+    }
     void begin(std::uint64_t first,std::uint32_t count,float scale,const std::vector<float> & query) override {
         if (failure==1) throw std::runtime_error("injected begin failure");
         require(!open && count && count<=queries,"emulator frame state");
@@ -31,10 +58,11 @@ public:
         this->first=first; this->count=count; this->scale=scale; q=query;
         maximum.assign(static_cast<std::size_t>(count)*qh,-INFINITY); sums.assign(maximum.size(),0);
         output.assign(query.size(),0); next=0; open=true;
+        stats_.query_upload_bytes+=query.size()*sizeof(float);
     }
     void consume(std::uint64_t first_key,std::uint32_t valid,const std::vector<solid::Half> & kv) override {
         if (failure==2) throw std::runtime_error("injected consume failure");
-        require(open && first_key==next && valid==std::min<std::uint64_t>(capacity,first+count-next),"emulator tile order");
+        require(open && first_key==next && valid && valid<=std::min<std::uint64_t>(capacity,first+count-next),"emulator tile order");
         require(kv.size()==static_cast<std::size_t>(g.heads)*capacity*2*g.dimension,"emulator KV shape");
         for (std::size_t row=0;row<maximum.size();++row) {
             const auto position=first+row/qh;
@@ -60,11 +88,12 @@ public:
         for (std::size_t i=0;i<output.size();++i) output[i]/=sums[i/g.dimension];
         open=false; ++stats_.batches; stats_.query_tokens+=count;
         auto result=output;
+        stats_.output_download_bytes+=result.size()*sizeof(float);
         if (failure==4) result.pop_back();
         if (failure==5) result[0]=NAN;
         return result;
     }
-    void abort() override { open=false; if (abort_count) ++*abort_count; }
+    void abort() override { open=false; if (abort_count) ++*abort_count; if (failure==6) throw std::runtime_error("injected abort failure"); }
     solid::KvGeometry g;
     std::uint32_t qh,queries,capacity,count=0;
     std::uint64_t first=0,next=0;
@@ -74,6 +103,7 @@ public:
     int * abort_count=nullptr;
     std::vector<float> q,maximum,sums,output;
     solid::PrefillStats stats_;
+    bool direct_=false;
 };
 inline void close(const std::vector<float> & actual,const std::vector<float> & expected) {
     require(actual.size()==expected.size(),"tiled output shape");

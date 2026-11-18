@@ -27,3 +27,4 @@
 | 历史块事件 DAG 与资源分派 | [块事件调度](../implementation/BLOCK_EVENT_SCHEDULER.md) | 阶段 3 的原 READ；阶段 4 的块级关键路径/LST、复制票据及两级核查 |
 | CUDA attention 原生完成事件 | [原生完成事件](../implementation/NATIVE_COMPLETION.md) | 阶段 4 的槽位释放、后继上传、Q 边界交接和设备计时 |
 | Decode 设备 Q/K 与 FP16 KV | [设备输入](../implementation/DEVICE_INPUTS.md) | 阶段 1 的代表/选择，阶段 2 的 KV 转换，阶段 4 的借用生命周期及三种调度 |
+| Prefill 设备输入、批量代表与设备输出 | [Prefill 设备接入](../implementation/PREFILL_DEVICE_INPUTS.md) | 阶段 1 的长输入计算与代表，阶段 2 的批量 KV 转换，阶段 4 的图依赖与 decode 交接 |

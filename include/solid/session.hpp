@@ -27,6 +27,8 @@ struct SessionStats {
     std::uint64_t streaming_attention_ns = 0;
     std::uint64_t tiled_prefill_ns = 0;
     std::uint64_t direct_decode_queries = 0, decode_kv_download_bytes = 0;
+    std::uint64_t direct_prefill_queries = 0, prefill_kv_download_bytes = 0;
+    std::uint64_t prefill_graph_device_bytes = 0, prefill_graph_device_peak_bytes = 0;
     PrefetchStats prefetch;
 };
 
@@ -52,6 +54,11 @@ public:
     void set_ranker(std::unique_ptr<BlockRanker> ranker);
     void set_prefill(std::unique_ptr<TiledPrefill> prefill);
     void release_prefill_if_complete();
+    std::optional<DeviceMemory> prefill_direct_memory() const;
+    void process_prefill_device(std::uint32_t layer,std::uint64_t first,std::uint32_t tokens,DeviceQuery queries,
+                                DeviceKvBatch device_kv,const std::vector<Half> & host_kv,float scale,DeviceOutput output);
+    void retain_prefill_graph_output(std::uint64_t bytes);
+    void release_prefill_graph_output(std::uint64_t bytes) noexcept;
     bool prefetch_enabled() const { return prefetch_ != nullptr; }
     Prefetcher & prefetcher();
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);

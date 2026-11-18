@@ -4,9 +4,9 @@
 
 每个阶段完成代码与检查后，在 [阶段完成记录](phases/README.md) 新增该阶段的实现与核查说明。
 
-当前阶段记录描述首版代码及其检查结果。论文核心路径的后续开发见 [论文实现核查](PAPER_IMPLEMENTATION_AUDIT.md)：prefill 设备输入、完整资源图、投影/传输设备观测及 SYCL。先完成这些代码，再推进正式评测与阶段 6。
+当前阶段记录描述首版代码及其检查结果。论文核心路径的后续开发见 [论文实现核查](PAPER_IMPLEMENTATION_AUDIT.md)：当前 KV 设备 bank、完整资源图、投影/传输设备观测及 SYCL。先完成这些代码，再推进正式评测与阶段 6。
 
-已完成的核心补齐：[CUDA 块评分与动态选块](implementation/GPU_SELECTION.md)、[CUDA 窗口代表构造](implementation/GPU_REPRESENTATIVES.md)、[有界 GPU 分块 prefill](implementation/GPU_PREFILL.md)。[独立 I/O 与协调线程](implementation/IO_WORKERS.md) 也已完成。[历史块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 已接入正式工作集。[CUDA attention 完成事件](implementation/NATIVE_COMPLETION.md) 已驱动后继上传。[Decode 设备 Q/K](implementation/DEVICE_INPUTS.md) 已接入三种调度和 FP16 KV 追加。后续推进 prefill 设备输入、预测期任务图及其他算子/传输事件。
+已完成的核心补齐：[CUDA 块评分与动态选块](implementation/GPU_SELECTION.md)、[CUDA 窗口代表构造](implementation/GPU_REPRESENTATIVES.md)、[有界 GPU 分块 prefill](implementation/GPU_PREFILL.md)。[独立 I/O 与协调线程](implementation/IO_WORKERS.md) 也已完成。[历史块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 已接入正式工作集。[CUDA attention 完成事件](implementation/NATIVE_COMPLETION.md) 已驱动后继上传。[Decode 设备 Q/K](implementation/DEVICE_INPUTS.md) 已接入三种调度和 FP16 KV 追加。[Prefill 设备输入与输出](implementation/PREFILL_DEVICE_INPUTS.md) 已接入批量代表、历史分区和图结果。后续推进当前 KV 设备 bank、预测期任务图及其他算子/传输事件。
 
 ## 阶段 0：上游与原版基线
 

@@ -74,6 +74,6 @@ CUDA 编译与链接、35 项 CTest、56 项 Linux Python 检查和源码指纹�
 
 设备数值检查已加入 [cuda_ranker_test.cpp](../../tests/cuda_ranker_test.cpp) 并完成编译，实验环境通过 `solid-cuda-ranker-test --run-device-check 0` 执行。本机数学检查使用 CPU 合成数据。
 
-## 6. 后续核心路径
+## 6. 批量与设备接入
 
-有界 attention 已接入 [GPU 分块 prefill](GPU_PREFILL.md)。窗口构造按 token 调用，后续继续接入设备 Q/K 和批处理更新。
+有界 attention 已接入 [GPU 分块 prefill](GPU_PREFILL.md)。[Decode 设备输入](DEVICE_INPUTS.md) 直接使用 Q 和 K；[Prefill 设备接入](PREFILL_DEVICE_INPUTS.md) 按批排入逐位置窗口更新、定稿和追加，在批次末完成私有流并核查完整块镜像。主机输入接口继续提供参考和算子检查。

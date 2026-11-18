@@ -179,6 +179,92 @@ void AttentionSession::append_token(std::uint32_t layer, std::uint64_t position,
     }
     stats_.append_ns += elapsed(start);
 }
+std::optional<DeviceMemory> AttentionSession::prefill_direct_memory() const {
+    if (!prefill_) return {};
+    const auto memory=prefill_->direct_memory();
+    if (representatives_ && representatives_->direct_memory()!=memory) return {};
+    return memory;
+}
+void AttentionSession::retain_prefill_graph_output(std::uint64_t bytes) {
+    if (bytes>UINT64_MAX-stats_.prefill_graph_device_bytes) throw std::overflow_error("prefill graph output accounting");
+    stats_.prefill_graph_device_bytes+=bytes;
+    stats_.prefill_graph_device_peak_bytes=std::max(stats_.prefill_graph_device_peak_bytes,stats_.prefill_graph_device_bytes);
+}
+void AttentionSession::release_prefill_graph_output(std::uint64_t bytes) noexcept {
+    if (bytes>stats_.prefill_graph_device_bytes) std::terminate();
+    stats_.prefill_graph_device_bytes-=bytes;
+}
+void AttentionSession::process_prefill_device(std::uint32_t layer,std::uint64_t first,std::uint32_t tokens,DeviceQuery queries,
+    DeviceKvBatch device_kv,const std::vector<Half> & host_kv,float scale,DeviceOutput output) {
+    const auto memory=prefill_direct_memory();
+    if (failed_ || early_ || !memory || !tokens || tokens>prefill_tokens_ || first>prefill_tokens_-tokens ||
+        store_->length(layer)!=first || !std::isfinite(scale) || scale<=0) throw std::invalid_argument("device prefill frame state or position");
+    const auto & g=geometry();
+    validate_device_query(queries,*memory,query_heads_,g.dimension,tokens);
+    validate_device_kv(device_kv,*memory,g.heads,g.dimension,tokens);
+    validate_device_output(output,*memory,query_heads_,g.dimension,tokens);
+    if (host_kv.size()!=device_kv.elements) throw std::invalid_argument("device prefill offload shape");
+    if (device_ranges_overlap(output.data,output.elements,sizeof(float),queries.data,queries.elements,sizeof(float)) ||
+        device_ranges_overlap(output.data,output.elements,sizeof(float),device_kv.data,device_kv.elements,sizeof(Half))) {
+        throw std::invalid_argument("device prefill output overlaps borrowed inputs");
+    }
+    const auto qwidth=device_elements(1,query_heads_,g.dimension),kwidth=device_elements(1,g.heads,g.dimension,2);
+    std::vector<Half> row(kwidth);
+    try {
+        for (auto value:host_kv) if (!std::isfinite(from_half(value))) throw std::invalid_argument("non-finite prefill KV offload");
+        for (std::uint32_t start=0;start<tokens;) {
+            const auto count=std::min(prefill_->query_capacity(),tokens-start);
+            const DeviceQuery query{queries.data+start*qwidth,count*qwidth,*memory};
+            const DeviceKvBatch kv{device_kv.data+start*kwidth,count*kwidth,*memory};
+            const auto append_start=Clock::now();
+            if (representatives_) representatives_->observe_batch_device(layer,first+start,count,query,kv);
+            for (std::uint32_t i=0;i<count;++i) {
+                std::copy_n(host_kv.data()+(start+i)*kwidth,kwidth,row.data());
+                store_->append_interleaved(layer,first+start+i,row);
+            }
+            stats_.append_ns+=elapsed(append_start);
+            const auto attention_start=Clock::now();
+            prefill_->begin_device(first+start,count,scale,query);
+            const auto end=first+start+count;
+            KvBlock block;
+            for (std::uint64_t key=0;key<end;) {
+                const auto valid=static_cast<std::uint32_t>(std::min<std::uint64_t>(prefill_->tile_capacity(),
+                    key<first?first-key:end-key));
+                if (key>=first) {
+                    prefill_->consume_device(key,valid,{device_kv.data+(key-first)*kwidth,valid*kwidth,*memory});
+                } else {
+                    for (std::uint32_t h=0;h<g.heads;++h) {
+                        for (std::uint32_t offset=0;offset<valid;) {
+                            const auto position=key+offset;
+                            store_->read(layer,h,position/g.block_tokens,block);
+                            const auto within=static_cast<std::uint32_t>(position%g.block_tokens);
+                            const auto rows=std::min(g.block_tokens-within,valid-offset);
+                            if (block.valid_tokens<within+rows) throw std::runtime_error("device prefill history is incomplete");
+                            for (std::uint32_t i=0;i<rows;++i) {
+                                auto * target=prefill_tile_.data()+(static_cast<std::size_t>(h)*prefill_->tile_capacity()+offset+i)*2*g.dimension;
+                                std::copy_n(block.key(within+i),g.dimension,target);
+                                std::copy_n(block.value(within+i),g.dimension,target+g.dimension);
+                            }
+                            offset+=rows;
+                        }
+                    }
+                    prefill_->consume(key,valid,prefill_tile_);
+                }
+                key+=valid;
+            }
+            prefill_->finish_to({output.data+start*qwidth,count*qwidth,*memory});
+            stats_.attention_queries+=count; stats_.direct_prefill_queries+=count;
+            stats_.prefill_kv_download_bytes+=count*kwidth*sizeof(Half);
+            stats_.workspace_peak_bytes=std::max(stats_.workspace_peak_bytes,static_cast<std::uint64_t>((host_kv.capacity()+row.capacity()+block.data.capacity())*sizeof(Half)));
+            stats_.tiled_prefill_ns+=elapsed(attention_start);
+            start+=count;
+        }
+    } catch (...) {
+        failed_=true; const auto error=std::current_exception();
+        try { prefill_->abort(); } catch (...) {}
+        std::rethrow_exception(error);
+    }
+}
 std::uint32_t AttentionSession::gather_slots() const {
     const auto tokens = sparse_ ? budget_.total : geometry().capacity_tokens;
     const auto padded = (static_cast<std::uint64_t>(tokens) + 31) / 32 * 32;

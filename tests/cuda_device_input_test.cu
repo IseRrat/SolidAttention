@@ -48,12 +48,12 @@ struct Observer {
 // Pure kernels replay with fresh inputs. Odd D, padded head strides, half-way
 // rounding, subnormals, signed zero and overflow are checked bit for bit.
 void operations() {
-    constexpr int width=257,heads=2;
+    constexpr int width=257,heads=2,tokens=3;
     std::unique_ptr<ggml_context,decltype(&ggml_free)> context(ggml_init({1024*1024,nullptr,true}),ggml_free);
-    auto * packed=ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,width*2+3,heads,1);
-    auto * k=ggml_view_3d(context.get(),packed,width,heads,1,packed->nb[1],packed->nb[2],0);
-    auto * v=ggml_view_3d(context.get(),packed,width,heads,1,packed->nb[1],packed->nb[2],width*sizeof(float));
-    auto * q=ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,width,heads*3,1);
+    auto * packed=ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,width*2+3,heads,tokens);
+    auto * k=ggml_view_3d(context.get(),packed,width,heads,tokens,packed->nb[1],packed->nb[2],0);
+    auto * v=ggml_view_3d(context.get(),packed,width,heads,tokens,packed->nb[1],packed->nb[2],width*sizeof(float));
+    auto * q=ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,width,heads*3,tokens);
     auto * early=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,1);
     auto * token=solid::device_query_token(context.get(),q);
     auto * kv=solid::device_consolidate_kv(context.get(),k,v,q,early);
@@ -78,8 +78,8 @@ void operations() {
     checked(cudaGraphInstantiate(&capture.executable,capture.graph,nullptr,nullptr,0),"instantiate input graph");
     const float edge[]{0.0f,-0.0f,0x1p-25f,0x1.8p-24f,0x1.ffcp-15f,1.00048828125f,1.00146484375f,65504.0f,65520.0f,-65520.0f};
     for (int epoch=0;epoch<3;++epoch) {
-        for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)
-            values[h*(2*width+3)+plane*width+d]=edge[(d+h+plane+epoch)%10];
+        for (int p=0;p<tokens;++p) for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)
+            values[(p*heads+h)*(2*width+3)+plane*width+d]=edge[(p+d+h+plane+epoch)%10];
         checked(cudaMemcpy(input.data,values.data(),ggml_nbytes(packed),cudaMemcpyHostToDevice),"replace captured input");
         checked(cudaGraphLaunch(capture.executable,capture.stream),"replay input operations");
         checked(cudaStreamSynchronize(capture.stream),"complete input operations");
@@ -87,8 +87,8 @@ void operations() {
         checked(cudaMemcpy(actual_mask.data(),released.data,ggml_nbytes(release),cudaMemcpyDeviceToHost),"read released mask bits");
         float zero=1; checked(cudaMemcpy(&zero,marker.data,4,cudaMemcpyDeviceToHost),"read scalar token");
         require(zero==0 && actual_mask==expected_mask,"captured token or mask changed");
-        for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)
-            require(actual[(h*2+plane)*width+d]==solid::to_half(values[h*(2*width+3)+plane*width+d]),"CUDA FP16 conversion differs from SSD reference bits");
+        for (int p=0;p<tokens;++p) for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)
+            require(actual[((p*heads+h)*2+plane)*width+d]==solid::to_half(values[(p*heads+h)*(2*width+3)+plane*width+d]),"CUDA FP16 conversion differs from SSD reference bits");
     }
 }
 // Model-free integration on the experiment machine: two actual CUDA/CPU split

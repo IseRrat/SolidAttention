@@ -76,6 +76,8 @@ prefill 使用上游投影和有界 microbatch，通过固定 Q/KV tile 在 CUDA
 
 `prefill_backend=auto/cpu/cuda` 与 `prefill_tile_tokens` 控制路径和 KV 容量；query 容量来自 microbatch。H2D 完成事件归还主机源，同流顺序保护设备 tile。全部层完成 prompt 后释放池并保留峰值。代码、分配公式与检查见 [GPU prefill](implementation/GPU_PREFILL.md)。
 
+[Prefill 设备接入](implementation/PREFILL_DEVICE_INPUTS.md) 直接借用设备 Q 和当前批次 FP16 KV，历史前缀继续使用固定 tile。代表按批依次更新，私有 attention 流写入独立图结果 buffer；CPU 标量建立完成依赖，GGML 视图把设备结果交给后续计算。Q/KV 保留到私有读者结束，图结果 buffer 在节点释放时回收并单独记录峰值。
+
 每个 microbatch 保留历史位置和 causal mask。代表构造器消费所需 Q/K，满足窗口条件后提交块元数据。decode 在 prefill 写入、元数据和尾块版本全部完成后开始。首次 decode 使用 init/local 预取及正式 selected 选择。
 
 decode 当前 token 的 KV 先进入 attention 工作集，再进入每层写缓冲区。写缓冲区按 32 KiB 聚合，满载或会话结束时写出；部分尾块按版本更新。读取通过块表定位最新版本：已提交版本从 SSD 读取，待提交版本从写缓冲区转发。缓冲区持有至写入完成；写失败使会话进入错误状态。

@@ -368,6 +368,66 @@ public:
             ++state.length; state.query_pending = false; ++stats_.builder_appends; ++stats_.device_builder_appends;
         } catch (...) { fail(); throw; }
     }
+    std::vector<BuiltRepresentatives> build_batch_device(std::uint32_t layer,std::uint64_t first,std::uint32_t tokens,
+                                                         DeviceQuery query,DeviceKvBatch kv) override {
+        check();
+        validate_device_query(query,DeviceMemory::cuda,query_heads_,geometry_.dimension,tokens);
+        validate_device_kv(kv,DeviceMemory::cuda,geometry_.heads,geometry_.dimension,tokens);
+        if (!local_ || layer>=geometry_.layers || !builders_[layer].initialized || builders_[layer].query_pending ||
+            tokens>geometry_.capacity_tokens || first>geometry_.capacity_tokens-tokens || builders_[layer].length!=first) {
+            throw std::invalid_argument("CUDA builder batch state or position");
+        }
+        validate_pointer(query.data); validate_pointer(kv.data);
+        auto & state=builders_[layer];
+        std::vector<BuiltRepresentatives> result;
+        result.reserve((static_cast<std::uint64_t>(tokens)+geometry_.block_tokens-1)/geometry_.block_tokens);
+        const auto qwidth=product(query_heads_,geometry_.dimension),kwidth=product(geometry_.heads,geometry_.dimension);
+        const auto mean_grid=static_cast<unsigned>(std::min<std::size_t>((kwidth+255)/256,65535));
+        DeviceScope scope(device_);
+        try {
+            checked(cudaMemsetAsync(error_device_,0,sizeof(int),stream_),"clear representative batch status");
+            for (std::uint32_t i=0;i<tokens;++i) {
+                const auto position=first+i,pending=std::min<std::uint64_t>(position,local_);
+                builder_mean_query<<<mean_grid,256,0,stream_>>>(query.data+i*qwidth,mean_query_,error_device_,
+                    geometry_.heads,geometry_.dimension,query_heads_/geometry_.heads);
+                checked(cudaGetLastError(),"launch batch GQA mean");
+                if (pending) {
+                    const auto grid=static_cast<unsigned>(std::min<std::uint64_t>((pending*geometry_.heads+255)/256,65535));
+                    builder_update_scores<<<grid,256,0,stream_>>>(state.keys,state.scores,mean_query_,error_device_,
+                        position-pending,pending,local_,geometry_.heads,geometry_.dimension);
+                    checked(cudaGetLastError(),"launch batch representative score update");
+                }
+                if (position>=local_) {
+                    builder_finalize<<<(geometry_.heads+127)/128,128,0,stream_>>>(state.keys,state.scores,state.top_keys,state.top_positions,
+                        state.top_scores,static_cast<Half *>(banks_[layer]),built_positions_,built_scores_,position,local_,geometry_.heads,
+                        geometry_.dimension,representatives_,geometry_.block_tokens);
+                    checked(cudaGetLastError(),"launch batch representative finalize");
+                }
+                if (position>=local_ && (position-local_+1)%geometry_.block_tokens==0) {
+                    result.emplace_back(); auto & built=result.back(); built.block=(position-local_)/geometry_.block_tokens;
+                    built.keys.resize(block_elements_); built.positions.resize(product(geometry_.heads,representatives_)); built.scores.resize(built.positions.size());
+                    checked(cudaMemcpyAsync(built.keys.data(),static_cast<Half *>(banks_[layer])+product(built.block,block_elements_),
+                        product(block_elements_,sizeof(Half)),cudaMemcpyDeviceToHost,stream_),"download batch representative keys");
+                    checked(cudaMemcpyAsync(built.positions.data(),built_positions_,product(built.positions.size(),sizeof(std::uint64_t)),
+                        cudaMemcpyDeviceToHost,stream_),"download batch representative positions");
+                    checked(cudaMemcpyAsync(built.scores.data(),built_scores_,product(built.scores.size(),sizeof(double)),
+                        cudaMemcpyDeviceToHost,stream_),"download batch representative scores");
+                }
+                builder_append_keys<<<mean_grid,256,0,stream_>>>(kv.data+i*2*kwidth,state.keys+(position%local_)*kwidth,error_device_,
+                    2*geometry_.dimension,geometry_.heads,geometry_.dimension);
+                checked(cudaGetLastError(),"launch batch representative append");
+                checked(cudaMemsetAsync(state.scores+(position%local_)*geometry_.heads,0,product(geometry_.heads,sizeof(double)),stream_),"reset batch representative score");
+            }
+            checked(cudaMemcpyAsync(&error_,error_device_,sizeof(int),cudaMemcpyDeviceToHost,stream_),"download representative batch status");
+            checked(cudaStreamSynchronize(stream_),"complete device representative batch");
+            if (error_) throw std::runtime_error("non-finite device representative batch");
+            state.length+=tokens; published_[layer]+=result.size();
+            stats_.published_blocks+=result.size(); stats_.built_blocks+=result.size();
+            stats_.builder_queries+=tokens; stats_.builder_appends+=tokens;
+            stats_.device_builder_queries+=tokens; stats_.device_builder_appends+=tokens; ++stats_.device_builder_batches;
+        } catch (...) { fail(); throw; }
+        return result;
+    }
     std::vector<std::vector<std::uint64_t>> rank(std::uint32_t layer, const std::vector<float> & query,
                                                 const BlockCandidates & candidates) override {
         if (query.size() != product(query_heads_, geometry_.dimension)) throw std::invalid_argument("CUDA ranking query shape");

@@ -40,12 +40,14 @@
 
 - Decode 设备 Q/K、FP16 consolidator、图保活依赖和三种调度共用输入，完成记录见 [设备输入](implementation/DEVICE_INPUTS.md)。
 
+- Prefill 设备 Q/当前 KV、批量代表、历史分区和设备结果视图，完成记录见 [Prefill 设备接入](implementation/PREFILL_DEVICE_INPUTS.md)。
+
 ## 3. 论文路径与后续核心代码
 
 | 核查项 | 当前执行路径 | 后续代码与核查要求 |
 | --- | --- | --- |
-| GPU 算子覆盖，§3.1、§4、§7 | [Decode 设备输入](implementation/DEVICE_INPUTS.md) 直接供 CUDA 代表构造、评分和 K 追加使用；GPU 转换 FP16 交错 KV 后交给主机存储；图引用覆盖私有流消费；CPU 维护候选与核查镜像 | 继续扩展 prefill 设备输入；逐算子补齐设备区间与完整资源图 |
-| 长输入 prefill | [CUDA 分块 prefill](implementation/GPU_PREFILL.md) 在固定 Q/KV 池上累计因果 attention；代表使用 GPU 窗口构造；CPU 流式路径用于参考 | 继续接入设备 Q/K，核查模型级误差、峰值与性能 |
+| GPU 算子覆盖，§3.1、§4、§7 | [Decode 设备输入](implementation/DEVICE_INPUTS.md) 直接供 CUDA 代表构造、评分和 K 追加使用；[Prefill 设备接入](implementation/PREFILL_DEVICE_INPUTS.md) 使用设备 Q/当前 KV、批量代表和设备结果；CPU 维护候选与核查镜像 | 继续接入当前 decode KV 到设备 bank；逐算子补齐设备区间与完整资源图 |
+| 长输入 prefill | [CUDA 分块 prefill](implementation/GPU_PREFILL.md) 使用固定 tile 和 FP32 在线 softmax；[设备输入/输出](implementation/PREFILL_DEVICE_INPUTS.md) 覆盖批量代表、历史/当前分区、未对齐批次、图结果与 decode 交接 | 在实验环境核查模型级误差、资源峰值与性能 |
 | 算法 1 的调度范围，§6.1 | [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 在历史工作集建立逐块 READ→H2D→汇合；关键路径/LST 传入独立 I/O 队列并决定就绪复制次序；外层保留 12 项任务 | 继续将预测期读取、当前 KV 的 D2H/回写及跨层槽位释放连接统一资源图；CUDA attention 事件已解锁后继上传 |
 | selected 优先，§6.1 | [块读取流水](implementation/BLOCK_READ_PIPELINE.md) 先确定集合，再跨 head 按 selected 优先派发；正式所需请求提升，完成块逐个进入 H2D；受限队列核对实际次序及最终汇合 | 历史正式工作集已连接块级成本、关键路径/LST 和资源分派；继续把预测期成本与跨层依赖纳入图 |
 | I/O 与协调分工，§7 | [独立 I/O 所有者](implementation/IO_WORKERS.md) 执行 liburing 操作并自动续填内核队列，协调线程执行纠错、H2D、回写和后继预取；独立物理核与推理核分工 | 设备事件已解锁后继传输，受控完成通知验证正式选择及时接管；继续连接预测期任务图与回写 |
@@ -56,7 +58,7 @@ prefill 的 GPU 分块方案属于长上下文工程补齐；论文 §7 对实�
 
 ## 4. 后续开发顺序与交付
 
-1. 在 decode 设备 Q/K 接入基础上扩展 prefill 设备输入与批量代表更新。
+1. 在 prefill/decode 设备输入基础上接入当前 decode KV 到设备 bank，核对版本、槽位与源租约。
 2. 在历史 READ/H2D 块图基础上纳入预测期读取、D2H/回写与跨层槽位事件。
 3. 在 CUDA attention 事件基础上完善 Q/KV 投影及其他传输的设备观测。
 4. 复核 CUDA 全路径，补齐 SYCL 与统一内存接入。

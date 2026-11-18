@@ -40,6 +40,7 @@
 | D34 | 正式历史工作集使用每块 READ→H2D 和全部就绪汇合图；关键路径/LST 调度键传入 I/O 所有者，复制票据确认完成；块轨迹与父层帧独立核对 | [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md)，block-event-scheduler、schedule-trace-audit |
 | D35 | CUDA 同步复用模式在 Flash Attention 前后记录设备事件，以可捕获的轻量通知唤醒协调线程；完成绑定含稳定注册身份；后继 Q 到达后交回正式选择前沿，设备区间逐帧保存 | [原生完成事件](implementation/NATIVE_COMPLETION.md)，attention-event-protocol、native-completion-progress、schedule-trace-audit |
 | D36 | CUDA decode 三种调度共用设备 Q/K 接口和 FP16 consolidator；图引用保留借用输入，CPU 前沿使用标量，追加接收交错 half；私有流完成后归还源 | [设备输入](implementation/DEVICE_INPUTS.md)，device-input-contract、device-graph-operations、device-input-serial-graph、device-input-native-packed-graph |
+| D37 | Prefill 直接借用设备 Q/当前 KV，历史使用固定 tile；代表按批提交并保留逐位置顺序；私有流写入独立结果 buffer，带控制依赖的 GGML 视图交给后续计算 | [Prefill 设备接入](implementation/PREFILL_DEVICE_INPUTS.md)，device-prefill-contract、device-prefill-graph、device-input-native-packed-graph |
 
 ## 参数锁定任务
 

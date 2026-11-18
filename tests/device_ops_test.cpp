@@ -13,11 +13,11 @@ void require(bool value,const char * message) { if (!value) throw std::runtime_e
 void run() {
     std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
     std::unique_ptr<ggml_context,decltype(&ggml_free)> context(ggml_init({1024*1024,nullptr,true}),ggml_free);
-    constexpr int width=17,heads=3;
-    auto * packed=ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,width*2+5,heads,1);
-    auto * k=ggml_view_3d(context.get(),packed,width,heads,1,packed->nb[1],packed->nb[2],0);
-    auto * v=ggml_view_3d(context.get(),packed,width,heads,1,packed->nb[1],packed->nb[2],width*sizeof(float));
-    auto * q=ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,width,heads*2,1);
+    constexpr int width=17,heads=3,tokens=3;
+    auto * packed=ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,width*2+5,heads,tokens);
+    auto * k=ggml_view_3d(context.get(),packed,width,heads,tokens,packed->nb[1],packed->nb[2],0);
+    auto * v=ggml_view_3d(context.get(),packed,width,heads,tokens,packed->nb[1],packed->nb[2],width*sizeof(float));
+    auto * q=ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,width,heads*2,tokens);
     auto * early=ggml_new_tensor_1d(context.get(),GGML_TYPE_F32,1);
     auto * token=solid::device_query_token(context.get(),q);
     auto * kv=solid::device_consolidate_kv(context.get(),k,v,q,early);
@@ -43,16 +43,16 @@ void run() {
     ggml_backend_tensor_set(mask,expected.data(),0,expected.size()*sizeof(solid::Half));
     const float zero=0; ggml_backend_tensor_set(early,&zero,0,sizeof(zero));
     for (int epoch=0;epoch<3;++epoch) {
-        for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)
-            values[h*(2*width+5)+plane*width+d]=edges[(h+plane+d+epoch)%10];
+        for (int p=0;p<tokens;++p) for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)
+            values[(p*heads+h)*(2*width+5)+plane*width+d]=edges[(p+h+plane+d+epoch)%10];
         ggml_backend_tensor_set(packed,values.data(),0,values.size()*sizeof(float));
         require(ggml_backend_graph_compute(backend.get(),graph)==GGML_STATUS_SUCCESS,"pure CPU operation graph");
         ggml_backend_tensor_get(kv,actual.data(),0,actual.size()*sizeof(solid::Half));
         ggml_backend_tensor_get(release,actual_mask.data(),0,actual_mask.size()*sizeof(solid::Half));
         float marker=1; ggml_backend_tensor_get(token,&marker,0,sizeof(marker));
         require(marker==0 && actual_mask==expected,"token or mask bits changed");
-        for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)
-            require(actual[(h*2+plane)*width+d]==solid::to_half(values[h*(2*width+5)+plane*width+d]),"strided FP16 consolidator layout or bits");
+        for (int p=0;p<tokens;++p) for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)
+            require(actual[((p*heads+h)*2+plane)*width+d]==solid::to_half(values[(p*heads+h)*(2*width+5)+plane*width+d]),"strided FP16 consolidator layout or bits");
     }
 }
 }

@@ -7,7 +7,6 @@
 #include <future>
 #include <atomic>
 #ifdef __linux__
-#include <sys/eventfd.h>
 #include <unistd.h>
 #include <cerrno>
 #endif
@@ -124,9 +123,8 @@ void interrupted(bool timing_error) {
 #ifdef __linux__
 struct ReadGate {
     std::atomic<bool> opened{true};
-    int fd=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
-    ReadGate() { require(fd>=0,"read gate notification"); }
-    ~ReadGate() { close(fd); }
+    int fd=-1;
+    ~ReadGate() { if (fd>=0) close(fd); }
     void open(bool value) noexcept {
         opened.store(value,std::memory_order_release); const std::uint64_t count=1;
         while (write(fd,&count,sizeof(count))<0 && errno==EINTR) {}
@@ -134,7 +132,12 @@ struct ReadGate {
 };
 class GatedReads final:public solid::AsyncReader {
 public:
-    explicit GatedReads(std::shared_ptr<ReadGate> gate):gate(std::move(gate)),reader(solid::make_uring_reader(2)) {}
+    explicit GatedReads(std::shared_ptr<ReadGate> gate):gate(std::move(gate)),reader(solid::make_uring_reader(2)) {
+        // Kernel completions and gate transitions wake the same stable eventfd.
+        // Switching descriptors after draining CQEs can strand a waiter on the
+        // old channel even though the gate has already reopened.
+        this->gate->fd=dup(reader->completion_handle()); require(this->gate->fd>=0,"read gate notification");
+    }
     bool submit(std::uint64_t id,int fd,void * destination,std::size_t bytes,std::uint64_t offset) override { return reader->submit(id,fd,destination,bytes,offset); }
     void cancel(std::uint64_t id) override { reader->cancel(id); }
     void flush() override { reader->flush(); }
@@ -144,12 +147,8 @@ public:
     }
     void drain() override { reader->drain(); }
     solid::AsyncIoStats stats() const override { return reader->stats(); }
-    int completion_handle() const override { return gate->opened.load(std::memory_order_acquire)?reader->completion_handle():gate->fd; }
-    void acknowledge_notifications() override {
-        std::uint64_t count;
-        while (read(gate->fd,&count,sizeof(count))==sizeof(count)) {}
-        reader->acknowledge_notifications();
-    }
+    int completion_handle() const override { return reader->completion_handle(); }
+    void acknowledge_notifications() override { reader->acknowledge_notifications(); }
 private:
     std::shared_ptr<ReadGate> gate;
     std::unique_ptr<solid::AsyncReader> reader;
@@ -180,11 +179,15 @@ void query_handoff() {
 }
 #endif
 }
-int main() {
-    try { ffn_overlap(); interrupted(false); interrupted(true);
+int main(int argc,char ** argv) {
+    try {
+        const int repeats=argc==3 && std::string(argv[1])=="--repeat"?std::stoi(argv[2]):1;
+        require((argc==1 || (argc==3 && std::string(argv[1])=="--repeat")) && repeats>0 && repeats<=1000,"native check repeat arguments");
+        for (int i=0;i<repeats;++i) { ffn_overlap(); interrupted(false); interrupted(true);
 #ifdef __linux__
         query_handoff();
 #endif
+        }
         std::cout<<"native attention notification, FFN/H2D overlap, query handoff, cancellation and worker errors passed\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

@@ -112,6 +112,25 @@ void RepresentativeIndex::append_keys_device(std::uint32_t layer, std::uint64_t 
     query_pending_[layer] = false;
     ++lengths_[layer];
 }
+void RepresentativeIndex::observe_batch_device(std::uint32_t layer,std::uint64_t first,std::uint32_t tokens,DeviceQuery query,DeviceKvBatch kv) {
+    const auto memory=direct_memory();
+    if (!memory || !tokens || tokens>geometry_.capacity_tokens || first>geometry_.capacity_tokens-tokens ||
+        lengths_.at(layer)!=first || query_pending_.at(layer)) throw std::invalid_argument("device representative batch state");
+    validate_device_query(query,*memory,query_heads_,geometry_.dimension,tokens);
+    validate_device_kv(kv,*memory,geometry_.heads,geometry_.dimension,tokens);
+    auto built=ranker_->build_batch_device(layer,first,tokens,query,kv);
+    std::size_t index=0;
+    for (std::uint32_t i=0;i<tokens;++i) {
+        const auto p=first+i;
+        const bool complete=p>=budget_.local && (p-budget_.local+1)%geometry_.block_tokens==0;
+        if (complete) {
+            if (index==built.size()) throw std::runtime_error("device representative batch omitted a complete block");
+            accept_built(layer,p,std::optional<BuiltRepresentatives>{std::move(built[index++])});
+        }
+    }
+    if (index!=built.size()) throw std::runtime_error("device representative batch returned excess blocks");
+    lengths_[layer]+=tokens;
+}
 bool RepresentativeIndex::ready(std::uint32_t layer, std::uint64_t block) const {
     return blocks_.at(index(layer, 0)).at(block).finalized == geometry_.block_tokens;
 }
