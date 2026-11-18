@@ -87,6 +87,7 @@ def audit_schedule(path, mode, *, blocks=False):
     proofs = {"query_dependency_reuse": "query_reused_fences", "process_synchronize_reuse": "process_reused_fences",
               "attention_backend_complete": "attention_fences", "explicit_fallback": "fallback_fences", "attention_device_event":"device_event_completions"}
     identities = set()
+    single_layer = len({frame["identity"][0] for frame in frames.values() if frame["identity"] is not None}) == 1
     for frame in frames.values():
         tasks = frame["tasks"]
         names = {task["name"]: task for task in tasks.values()}
@@ -108,6 +109,14 @@ def audit_schedule(path, mode, *, blocks=False):
                  "current_h2d": [append, "history_h2d"] if serial else [append],
                  "attention_until_boundary": ["current_h2d"], "buffered_ssd_store": [append],
                  "next_layer_prefetch": ["current_h2d"]}
+        if names["kv_d2h_ready"]["fence"] == "kv_archive_copy_complete":
+            if serial or names["kv_projection_to_host"]["fence"] != "kv_device_ready":
+                raise ValueError("device archive lacks its KV production proof")
+            edges["kv_d2h_ready"] = ["current_h2d"]
+            edges[append] = ["kv_d2h_ready"]
+            edges["current_h2d"] = ["kv_projection_to_host", "miss_read_and_reconcile", "history_h2d"]
+            if single_layer:
+                edges["next_layer_prefetch"].append(append)
         for name, task in names.items():
             if {tasks[dep]["name"] for dep in task["deps"]} != set(edges[name]):
                 raise ValueError("recorded schedule dependencies differ from the execution pipeline")

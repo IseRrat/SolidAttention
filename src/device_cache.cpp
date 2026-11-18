@@ -49,7 +49,7 @@ void DeviceCache::poll_transfers(bool wait) {
     std::exception_ptr error;
     for (auto it = transfers_.begin(); it != transfers_.end();) {
         if (!transport_.complete(it->ticket, wait)) { ++it; continue; }
-        host_.unpin(it->host);
+        if (it->host) host_.unpin(*it->host);
         const auto lease = it->device;
         const auto stage=it->stage;
         const bool current = slots_.complete(lease);
@@ -118,20 +118,18 @@ std::optional<SlotLease> DeviceCache::prefix(const BlockIdentity & identity) con
     }
     return best;
 }
-SlotLease DeviceCache::upload_current(const SlotLease & host,const CurrentDeviceKv & current,const std::optional<SlotLease> & previous) {
+SlotLease DeviceCache::upload_current(const BlockIdentity & identity,const std::optional<SlotLease> & host,const CurrentDeviceKv & current) {
     const auto row=static_cast<std::uint32_t>(current.position%geometry_.block_tokens);
-    if (host.identity.layer!=current.layer || host.identity.block!=current.position/geometry_.block_tokens || host.identity.version!=row+1) {
-        throw std::invalid_argument("current device KV identity differs from host snapshot");
-    }
+    const auto previous=prefix(identity);
     const auto retained=previous?static_cast<std::uint32_t>(previous->identity.version):0;
     if (retained>row) throw std::logic_error("current device prefix extends beyond the historical rows");
-    const auto device=previous?std::optional<SlotLease>{slots_.refresh(*previous,host.identity)}:slots_.acquire(host.identity);
+    const auto device=previous?std::optional<SlotLease>{slots_.refresh(*previous,identity)}:slots_.acquire(identity);
     if (!device) throw std::runtime_error("current device slot capacity exceeded");
     std::uint64_t ticket=0;
     bool pinned=false;
     try {
-        host_.pin(host); pinned=true;
-        const auto & block=host_.block(host);
+        const KvBlock * block=nullptr;
+        if (host) { host_.pin(*host); pinned=true; block=&host_.block(*host); }
         if (previous) event("overwrite_available",*previous);
         ticket=transport_.upload_current(device->slot,block,current,retained);
         transfers_.push_back({ticket,host,*device,{}});
@@ -145,7 +143,7 @@ SlotLease DeviceCache::upload_current(const SlotLease & host,const CurrentDevice
         transport_.drain();
         if (!transfers_.empty() && transfers_.back().device==*device) transfers_.pop_back();
         if (ticket) (void) transport_.complete(ticket,true);
-        if (pinned) host_.unpin(host);
+        if (pinned) host_.unpin(*host);
         slots_.retire(*device); slots_.complete(*device);
         throw;
     }
@@ -188,10 +186,15 @@ void DeviceCache::stage_ready(const SlotLease & lease,const std::shared_ptr<Bloc
 std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection, bool deferred_upload,const CurrentDeviceKv * current) {
     if (!attention_.empty()) throw std::logic_error("previous device attention has not completed");
     if (selection.size() != geometry_.heads) throw std::invalid_argument("device selection head count");
+    std::vector<std::optional<SlotLease>> current_hosts;
+    std::vector<BlockIdentity> actual;
     if (current) {
         const auto memory=transport_.current_memory();
         if (!memory || current->layer>=geometry_.layers || current->position>=geometry_.capacity_tokens) throw std::invalid_argument("current device KV backend or position");
         validate_device_kv(current->kv,*memory,geometry_.heads,geometry_.dimension,1);
+        current_hosts.resize(geometry_.heads);
+        const auto block=current->position/geometry_.block_tokens;
+        const auto version=current->position%geometry_.block_tokens+(current->unarchived?0:1);
         std::set<std::pair<std::uint32_t,std::uint64_t>> unique;
         for (const auto & lease:host_leases) {
             const auto & id=lease.identity;
@@ -199,36 +202,38 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
                 id.block>current->position/geometry_.block_tokens || !unique.emplace(id.head,id.block).second) {
                 throw std::invalid_argument("current device working set identities");
             }
+            if (id.block==block) {
+                if (id.version!=version) throw std::invalid_argument("current device working set has an invalid host prefix");
+                current_hosts[id.head]=lease;
+            } else actual.push_back(id);
         }
         for (std::uint32_t head=0;head<geometry_.heads;++head) {
-            const BlockIdentity expected{current->layer,head,current->position/geometry_.block_tokens,current->position%geometry_.block_tokens+1};
             if (selection[head].positions.empty() || selection[head].positions.back()!=current->position ||
-                std::none_of(host_leases.begin(),host_leases.end(),[&](const SlotLease & lease) { return lease.identity==expected; })) {
+                (version && !current_hosts[head])) {
                 throw std::invalid_argument("current device KV is absent from the formal working set");
             }
         }
-    }
+    } else for (const auto & lease:host_leases) actual.push_back(lease.identity);
     wait_transfers();
-    std::vector<BlockIdentity> actual;
-    for (const auto & lease : host_leases) actual.push_back(lease.identity);
-    std::vector<std::optional<SlotLease>> prefixes(host_leases.size());
-    if (current) for (std::size_t i=0;i<host_leases.size();++i) {
-        const auto & id=host_leases[i].identity;
-        if (id.layer==current->layer && id.block==current->position/geometry_.block_tokens && !slots_.find(id)) {
-            prefixes[i]=prefix(id); if (prefixes[i]) actual.push_back(prefixes[i]->identity);
-        }
+    std::vector<BlockIdentity> current_ids;
+    if (current) for (std::uint32_t h=0;h<geometry_.heads;++h) {
+        const BlockIdentity id{current->layer,h,current->position/geometry_.block_tokens,current->position%geometry_.block_tokens+1};
+        current_ids.push_back(id);
+        if (slots_.find(id)) actual.push_back(id);
+        else if (const auto old=prefix(id)) actual.push_back(old->identity);
     }
     retain(actual);
     std::vector<SlotLease> used;
-    for (std::size_t i=0;i<host_leases.size();++i) {
-        const auto & host=host_leases[i];
+    for (const auto & host:host_leases) {
+        if (current && host.identity.block==current_ids.front().block) continue;
         auto device = slots_.find(host.identity);
         if (device) ++stats_.reused_blocks;
-        else if (current && host.identity.layer==current->layer && host.identity.block==current->position/geometry_.block_tokens) {
-            device=upload_current(host,*current,prefixes[i]);
-        }
         else device = upload(host);
         used.push_back(*device);
+    }
+    for (const auto & id:current_ids) {
+        if (const auto ready=slots_.find(id)) { ++stats_.reused_blocks; used.push_back(*ready); }
+        else used.push_back(upload_current(id,current_hosts[id.head],*current));
     }
     if (!deferred_upload) wait_transfers();
     const auto tokens = tokens_per_head();
@@ -257,6 +262,16 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
         attention_ = std::move(used);
     } catch (...) { for (std::size_t i = 0; i < pinned; ++i) slots_.unpin(used[i]); throw; }
     return mask;
+}
+std::vector<std::uint32_t> DeviceCache::current_slots(CurrentBlock current) const {
+    std::vector<std::uint32_t> result;
+    for (std::uint32_t head=0;head<geometry_.heads;++head) {
+        const BlockIdentity id{current.layer, head, current.position/geometry_.block_tokens, current.position%geometry_.block_tokens+1};
+        const auto found=std::find_if(attention_.begin(),attention_.end(),[&](const auto & lease) { return lease.identity==id; });
+        if (found==attention_.end()) throw std::logic_error("KV archive requested without an attention lease");
+        result.push_back(found->slot);
+    }
+    return result;
 }
 bool DeviceCache::attention_complete(std::uint64_t epoch) {
     if (epoch != epoch_ || attention_.empty()) { ++stats_.stale_events; return false; }

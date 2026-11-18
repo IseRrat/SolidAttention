@@ -31,3 +31,4 @@
 | 当前 KV 设备复制与尾块前缀复用 | [当前设备 KV](../implementation/CURRENT_DEVICE_KV.md) | 阶段 3 的版本与原槽复用，阶段 4 的 H2D/D2D 完成证明及源生命周期 |
 | 预测期块调度 | [预测期派发](../implementation/PREDICTION_DISPATCH.md) | 阶段 3 的预测与纠错接管，阶段 4 的 SSD READ 与就绪 H2D 排序 |
 | 聚合 KV 异步回写 | [异步回写](../implementation/ASYNC_WRITEBACK.md) | 阶段 3 的脏行转发与版本提交，阶段 4 的独立 I/O 完成和跨层推进 |
+| Decode 当前 KV 异步归档 | [当前 KV 归档](../implementation/KV_ARCHIVE.md) | 阶段 4 的安装与回写分支、下一层读取与设备槽位完成依赖 |

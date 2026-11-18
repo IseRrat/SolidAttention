@@ -71,7 +71,8 @@ public:
     void begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
-                                         const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {});
+                                         const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {}, bool keep_tail = false);
+    void remember_selection(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     void poll(bool wait = false);
     const KvBlock & block(const SlotLease & lease) const;
     void pin(const SlotLease & lease) { slots_.pin(lease); }

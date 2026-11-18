@@ -5,7 +5,7 @@
 #include <cstring>
 
 namespace solid {
-enum class DeviceOp : std::uint32_t { none = 0, query_token = 1, consolidate_kv = 2, release_mask = 3, prefill_result = 4 };
+enum class DeviceOp : std::uint32_t { none = 0, query_token = 1, consolidate_kv = 2, release_mask = 3, prefill_result = 4, kv_token = 5 };
 struct DeviceOpBinding {
     std::uint64_t magic = 0x534f4c49444f5031ull;
     std::uint32_t version = 1;
@@ -31,6 +31,8 @@ inline bool device_op_supported(const ggml_tensor * tensor) {
     switch (device_op(tensor)) {
         case DeviceOp::query_token:
             return vector(a) && ggml_is_contiguous(a) && tensor->type == GGML_TYPE_F32 && ggml_nelements(tensor) == 1;
+        case DeviceOp::kv_token:
+            return device_op(a)==DeviceOp::consolidate_kv && ggml_is_contiguous(a) && tensor->type==GGML_TYPE_F32 && ggml_nelements(tensor)==1;
         case DeviceOp::consolidate_kv: {
             const auto * b = tensor->src[1];
             const auto * q = tensor->src[2];
@@ -57,6 +59,7 @@ inline bool device_op_supported(const ggml_tensor * tensor) {
 }
 // Pure graph operations: no CPU coordination side effects in captured kernels.
 ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query);
+ggml_tensor * device_kv_token(ggml_context * context, ggml_tensor * kv);
 ggml_tensor * device_consolidate_kv(ggml_context * context, ggml_tensor * key, ggml_tensor * value,
                                    ggml_tensor * query, ggml_tensor * early_selection);
 ggml_tensor * device_release_mask(ggml_context * context, ggml_tensor * mask, ggml_tensor * kv, ggml_tensor * query = nullptr);

@@ -29,6 +29,7 @@ public:
     void select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool query_covers_attention);
     std::vector<Half> decode_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys,
                                   std::optional<DeviceQuery> serial_query = {},ggml_tensor * device_source = nullptr);
+    std::vector<Half> decode_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys, ggml_tensor * source);
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);
     ScheduleStats schedule_stats() const;
     // The caller keeps the context/backend alive until this has returned.

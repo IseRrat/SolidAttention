@@ -8,7 +8,8 @@ void forward(ggml_tensor * output, int ith, int, void *) {
     if (ith) return;
     GGML_ASSERT(device_op_supported(output));
     switch (device_op(output)) {
-        case DeviceOp::query_token: *static_cast<float *>(output->data) = 0; break;
+        case DeviceOp::query_token:
+        case DeviceOp::kv_token: *static_cast<float *>(output->data) = 0; break;
         case DeviceOp::release_mask:
         case DeviceOp::prefill_result:
             if (output->data!=output->src[0]->data) std::memcpy(output->data, output->src[0]->data, ggml_nbytes(output));
@@ -43,6 +44,10 @@ ggml_tensor * make(ggml_context * context, ggml_type type, const std::int64_t * 
 ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query) {
     const std::int64_t shape[]{1,1,1,1};
     return make(context,GGML_TYPE_F32,shape,&query,1,DeviceOp::query_token,"solid_device_query_token");
+}
+ggml_tensor * device_kv_token(ggml_context * context, ggml_tensor * kv) {
+    const std::int64_t shape[]{1,1,1,1};
+    return make(context,GGML_TYPE_F32,shape,&kv,1,DeviceOp::kv_token,"solid_device_kv_ready");
 }
 ggml_tensor * device_consolidate_kv(ggml_context * context, ggml_tensor * key, ggml_tensor * value,
                                    ggml_tensor * query, ggml_tensor * early) {

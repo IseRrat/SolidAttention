@@ -6,6 +6,7 @@ struct CurrentDeviceKv {
     std::uint32_t layer=0;
     std::uint64_t position=0;
     DeviceKvBatch kv;
+    bool unarchived = false;
 };
 struct CurrentBlock {
     std::uint32_t layer=0;
@@ -21,7 +22,7 @@ public:
     // Retain prefix rows [0,prefix), upload the missing historical rows, and
     // copy the current device row. The borrowed device source stays live until
     // the ticket completes; exceptions drain any started writers/readers.
-    virtual std::uint64_t upload_current(std::uint32_t,const KvBlock &,const CurrentDeviceKv &,std::uint32_t) {
+    virtual std::uint64_t upload_current(std::uint32_t,const KvBlock *,const CurrentDeviceKv &,std::uint32_t) {
         throw std::logic_error("current device KV transfer is disabled");
     }
     virtual bool complete(std::uint64_t ticket, bool wait) = 0;
@@ -56,13 +57,14 @@ public:
     // Called only after the backend confirms attention completion.
     bool attention_complete(std::uint64_t epoch);
     std::uint64_t attention_epoch() const { return epoch_; }
+    std::vector<std::uint32_t> current_slots(CurrentBlock current) const;
     bool attention_pending() const { return !attention_.empty(); }
     std::uint32_t tokens_per_head() const;
     void finish();
     DeviceCacheStats stats() const;
     std::optional<SlotLease> find(const BlockIdentity & id) const { return slots_.find(id); }
 private:
-    struct Transfer { std::uint64_t ticket; SlotLease host; SlotLease device; std::shared_ptr<BlockStage> stage; };
+    struct Transfer { std::uint64_t ticket; std::optional<SlotLease> host; SlotLease device; std::shared_ptr<BlockStage> stage; };
     Prefetcher & host_;
     KvGeometry geometry_;
     std::uint32_t query_heads_;
@@ -76,7 +78,7 @@ private:
     void poll_transfers(bool wait);
     void retain(const std::vector<BlockIdentity> & identities);
     SlotLease upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage = {});
-    SlotLease upload_current(const SlotLease & host,const CurrentDeviceKv & current,const std::optional<SlotLease> & prefix);
+    SlotLease upload_current(const BlockIdentity & identity,const std::optional<SlotLease> & host,const CurrentDeviceKv & current);
     std::optional<SlotLease> prefix(const BlockIdentity & identity) const;
     void event(const char * name, const SlotLease & lease,const CurrentDeviceKv * current=nullptr,
                std::uint32_t retained=0,std::uint64_t source_generation=0);

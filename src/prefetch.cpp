@@ -368,10 +368,13 @@ std::vector<SlotLease> Prefetcher::resolve(std::uint32_t layer, std::uint64_t po
     return resolve_impl(layer, position, actual, false);
 }
 std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
-                                                const StagePlan & plan, const ReadyBlock & ready, const StageFactory & factory) {
+                                                const StagePlan & plan, const ReadyBlock & ready, const StageFactory & factory, bool keep_tail) {
     auto past = actual;
     for (auto & head : past) {
         if (!head.positions.empty() && head.positions.back() == position) head.positions.pop_back();
+        if (keep_tail && position%store_.geometry().block_tokens && (head.positions.empty() || head.positions.back()<position-1)) {
+            head.positions.push_back(position-1);
+        }
     }
     return resolve_impl(layer, position, past, true,plan,ready,factory);
 }
@@ -485,19 +488,24 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
         }
         if (remaining) poll(true);
     }
-    if (!historical) for (std::uint32_t head = 0; head < g.heads; ++head) {
-        auto & history = history_[layer][head];
-        history.clear();
-        const auto local_first = position + 1 - std::min<std::uint64_t>(budget_.local, position + 1);
-        for (const auto p : actual[head].positions) if (p >= budget_.initial && p < local_first) {
-            const auto id = p / g.block_tokens;
-            if (history.empty() || history.back() != id) history.push_back(id);
-        }
-    }
+    if (!historical) remember_selection(layer,position,actual);
     for (const auto & lease : result) slots_.pin(lease);
-    if (historical) ++stats_.history_resolutions; else ++stats_.formal_resolutions;
+    if (historical) ++stats_.history_resolutions;
     stats_.resolve_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
     return result;
+}
+void Prefetcher::remember_selection(std::uint32_t layer,std::uint64_t position,const std::vector<HeadSelection> & actual) {
+    if (layer_!=layer || position_!=position || actual.size()!=store_.geometry().heads) throw std::invalid_argument("selection history frame mismatch");
+    const auto local_first=position+1-std::min<std::uint64_t>(budget_.local,position+1);
+    for (std::size_t head=0;head<actual.size();++head) {
+        auto & history=history_[layer][head];
+        history.clear();
+        for (const auto p:actual[head].positions) if (p>=budget_.initial && p<local_first) {
+            const auto id=p/store_.geometry().block_tokens;
+            if (history.empty() || history.back()!=id) history.push_back(id);
+        }
+    }
+    ++stats_.formal_resolutions;
 }
 const KvBlock & Prefetcher::block(const SlotLease & lease) const {
     if (!slots_.matches(lease) || (slots_.entry(lease.slot).state != SlotState::ready && slots_.entry(lease.slot).state != SlotState::pinned)) {

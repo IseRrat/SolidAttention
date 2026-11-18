@@ -21,14 +21,14 @@
 overlap / overlap+sync_reuse:
 设备 Q → GPU 标量令牌 → 4 字节主机前沿 → 设备代表更新/选块 → 历史读盘/H2D
                          ↓ CPU 选择完成标量
-设备 K/V + 设备 Q ──────→ GPU FP16 [Hkv,2,D] → 主机追加/设备 K 更新 → mask
-                                    │                              │
-                                    └──────── 释放 mask 算子 ←──────┘
-                                                    ↓
-                                             Flash Attention
+设备 K/V + 设备 Q ──────→ GPU FP16 [Hkv,2,D] → KV 令牌 → 设备 K 更新
+                                    └──────→ 显存槽位 → mask → Flash Attention
+                                               └──────→ D2H → 主机追加
 ```
 
 串行模式先在 GPU 完成 Q 令牌和 KV consolidator，主机收到 FP16 KV 后依次执行设备代表更新、选择、追加、历史读取和 H2D。两种重叠模式在 Q 标量到达时开始选块和历史读取，随后继续 KV 投影与转换。
+
+重叠模式的当前行先在设备安装，再下载归档副本。主机归档与 attention 各有完成依据，见 [当前 KV 归档](KV_ARCHIVE.md)。
 
 Q 布局为连续 FP32 `[Hq,D]`；交错 KV 为 FP16 `[Hkv,2,D]`。K 借用视图指向每个 head 的第一段，`head_stride=2*D`，CUDA 追加内核只读 K。consolidator 接受独立 K/V 或融合投影产生的 strided K/V，使用 round-to-nearest-even 转换，与 SSD 的 half 位模式一致。
 
@@ -43,10 +43,10 @@ Q 布局为连续 FP32 `[Hq,D]`；交错 KV 为 FP16 `[Hkv,2,D]`。K 借用视�
 GGML 图明确保存以下依赖：
 
 1. KV consolidator 引用 Q 和选择完成标量，Q 的设备分配覆盖提前选择。
-2. 释放 mask 算子引用主机 mask、原始设备 KV 和设备 Q，Q/KV 分配覆盖主机追加及串行设备选择。
+2. 释放 mask 算子引用主机 mask、原始设备 KV 和设备 Q，Q/KV 分配覆盖当前行复制及串行设备选择。
 3. Flash Attention 消费释放后的 mask，再按既有事件与租约协议使用设备 bank。
 
-三个设备算子均执行纯 GPU 数学或复制；CPU 协调在现有主机节点执行。CUDA 图捕获与重放复用稳定算子参数。CUSTOM 标记放在 `op_params` 的 32 字节偏移后，保留 CPU 回调参数；设备分派核对标记和形状后执行。生成器保持固定上游源文件。
+设备算子执行纯 GPU 数学或复制，CPU 协调在主机节点执行。CUDA 图捕获与重放复用稳定算子参数。CUSTOM 标记放在 `op_params` 的 32 字节偏移后，保留 CPU 回调参数；设备分派核对标记和形状后执行。生成器保持固定上游源文件。
 
 输入形状、stride 或设备不符时拒绝调用。CUDA 错误排空自有 stream 并结束后端；主机追加或协调失败沿用首错保存、复制排空和收尾 mask 协议。
 

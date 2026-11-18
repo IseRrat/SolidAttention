@@ -17,9 +17,9 @@ public:
     std::uint64_t upload(std::uint32_t slot,const solid::KvBlock & block) override {
         const auto id=next++; copies.emplace(id,Copy{slot,&block}); return id;
     }
-    std::uint64_t upload_current(std::uint32_t slot,const solid::KvBlock & block,const solid::CurrentDeviceKv & source,std::uint32_t prefix) override {
+    std::uint64_t upload_current(std::uint32_t slot,const solid::KvBlock * block,const solid::CurrentDeviceKv & source,std::uint32_t prefix) override {
         const auto id=next++;
-        copies.emplace(id,Copy{slot,&block,source.kv.data,prefix,static_cast<std::uint32_t>(source.position%g.block_tokens),block_head(slot)});
+        copies.emplace(id,Copy{slot,block,source.kv.data,prefix,static_cast<std::uint32_t>(source.position%g.block_tokens),block_head(slot)});
         if (fail_on && ++current_calls==fail_on) { drain(); copies.erase(id); throw std::runtime_error("injected queued device row copy"); }
         return id;
     }

@@ -18,10 +18,14 @@ with tempfile.TemporaryDirectory(prefix="solid-schedule-audit-") as temporary:
         if name=="device-serial": flags=["--direct","--packed"]
         subprocess.run([sys.argv[1], mode,*flags,str(directory)], check=True, timeout=45)
         for folder in directory.iterdir():
-            observed = audit_schedule(folder / "schedule.jsonl", mode)
+            schedule=folder / "schedule.jsonl"
+            observed = audit_schedule(schedule, mode)
             expected = json.loads((folder / "stats.json").read_text())
             if observed != expected:
                 raise ValueError(f"schedule trace differs from C++ metrics: {name}/{folder.name}: {observed} != {expected}")
+            archives=sum(json.loads(line).get("fence")=="kv_archive_copy_complete" for line in schedule.read_text().splitlines())
+            if archives != (observed["frames"] if name=="device-input" else 0):
+                raise ValueError(f"unexpected deferred KV archives: {name}/{folder.name}")
             residency=audit_residency(folder / "residency.jsonl", 2, 6)
             for key,value in json.loads((folder/"device-stats.json").read_text()).items():
                 if residency.get(key,0)!=value: raise ValueError(f"device row transfer metrics differ: {name}/{folder.name}/{key}")

@@ -407,21 +407,35 @@ std::vector<HeadSelection> AttentionSession::select_before_kv_device(std::uint32
     } catch (...) { failed_ = true; throw; }
 }
 void AttentionSession::append_after_selection_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys) {
-    if (failed_ || !early_ || !direct_early_ || *early_ != std::make_pair(layer, position) ||
-        kv.size() != static_cast<std::size_t>(geometry().heads)*geometry().dimension*2) {
+    stage_device_keys(layer, position, keys);
+    archive_device_kv(layer, position, kv);
+}
+void AttentionSession::stage_device_keys(std::uint32_t layer, std::uint64_t position, DeviceKeys keys) {
+    if (failed_ || !early_ || !direct_early_ || device_keys_staged_ || *early_ != std::make_pair(layer, position)) {
         throw std::invalid_argument("device late KV does not match early selection");
+    }
+    try {
+        const auto start = Clock::now();
+        representatives_->append_keys_device(layer, position, keys);
+        stats_.append_ns += elapsed(start);
+        device_keys_staged_ = true;
+    } catch (...) { failed_ = true; throw; }
+}
+void AttentionSession::archive_device_kv(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv) {
+    if (failed_ || !early_ || !device_keys_staged_ || *early_ != std::make_pair(layer, position) || store_->length(layer)!=position ||
+        kv.size() != static_cast<std::size_t>(geometry().heads)*geometry().dimension*2) {
+        throw std::invalid_argument("device archive does not match the outstanding KV position");
     }
     try {
         for (const auto value : kv) if (!std::isfinite(from_half(value))) throw std::invalid_argument("non-finite device KV offload");
         const auto start = Clock::now();
         prefetch_->wait_store(layer);
-        representatives_->append_keys_device(layer, position, keys);
         store_->append_interleaved(layer, position, kv);
         stats_.append_ns += elapsed(start);
         stats_.decode_kv_download_bytes += kv.size()*sizeof(Half);
         ++stats_.direct_decode_queries;
         ++stats_.attention_queries;
-        early_.reset(); direct_early_ = false;
+        early_.reset(); direct_early_ = false; device_keys_staged_ = false;
     } catch (...) { failed_ = true; throw; }
 }
 void AttentionSession::record(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & selection) {

@@ -151,7 +151,13 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         outputs[layer] = operations[layer]->build(context.get(), query_tensor, projected_key, values[layer],packed_kv[layer]);
         ggml_set_output(outputs[layer]);
         if (direct) {
-            auto * kv=operations[layer]->host_node()->src[0];
+            auto * frontier=operations[layer]->host_node()->src[0];
+            auto * kv=frontier;
+            if (mode!=solid::ScheduleMode::naive) {
+                require(solid::device_op(frontier)==solid::DeviceOp::kv_token && ggml_nbytes(frontier)==sizeof(float),
+                    "overlap CPU frontier must receive only a device KV ready token");
+                kv=frontier->src[0];
+            }
             require(solid::device_op(kv)==solid::DeviceOp::consolidate_kv,"device KV consolidator missing");
             if (mode!=solid::ScheduleMode::naive) {
                 require(solid::graph_depends_on(kv,operations[layer]->selection_node()),"device KV must depend on early selection");
@@ -160,7 +166,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
                 "serial KV lacks its GPU query frontier");
             auto * mask=operations[layer]->attention_node()->src[3]->src[0];
             require(solid::device_op(mask)==solid::DeviceOp::release_mask && mask->src[1]==kv &&
-                mask->src[2]==kv->src[2] && solid::graph_depends_on(mask,operations[layer]->host_node()),"Q/KV release must follow host append");
+                mask->src[2]==kv->src[2] && solid::graph_depends_on(mask,operations[layer]->host_node()),"Q/KV release must follow the mask frontier");
         }
         if (operations[layer]->selection_node()) {
             if (layer) {
