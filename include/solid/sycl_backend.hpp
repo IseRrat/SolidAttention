@@ -5,3 +5,4 @@
 // Returns null for a device without shared DRAM. An allocation failure on a
 // supported device is reported as an exception.
 extern "C" ggml_backend_buffer_t solid_sycl_alloc_shared_kv(ggml_backend_t backend, size_t bytes);
+extern "C" void * solid_sycl_queue(ggml_backend_t backend);

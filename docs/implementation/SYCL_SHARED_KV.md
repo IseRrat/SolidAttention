@@ -8,7 +8,7 @@
 - [共享缓冲](../../include/solid/sycl_backend.hpp) 在 GGML SYCL 设备上下文分配和释放 USM。设备识别同时检查共享物理内存与共享分配能力。其他设备沿用现有复制后端和独立 KV bank。
 - [传输协调](../../src/ggml_prefetch.cpp) 在 CPU 端将就绪块写入 USM 槽位。SSD 读取保留独立的 DRAM 槽，可在当前层 attention 期间推进。attention 完成并释放读者后才允许改写共享 bank。共享写入不提交 H2D 或分配 pinned 上传暂存。
 - 固定上游的 SYCL Flash Attention 需要广播 mask。SolidAttention 每个 query head 使用自己的工作集 mask，[SYCL decode 内核](../../include/solid/sycl_flash_decode.hpp) 以各 head 的 mask 直接访问 K/V stride。每个工作组处理一个 head 的 64 行分片，FP32 在线 softmax 累计最大值、分母与带权 V。第二个内核按全局最大值合并，跳过全遮罩分片。GGML 为分片结果预留图工作区。
-- `prefetch.device_shared_buffer_bytes` 记录共享 bank 容量，`prefetch.device_shared_host_copy_bytes` 记录写入它的主机字节数。`device_upload_bytes` 记录显式上传。当前 SYCL 选择和 prefill 沿 CPU 路径运行。
+- `prefetch.device_shared_buffer_bytes` 记录共享 bank 容量，`prefetch.device_shared_host_copy_bytes` 记录写入它的主机字节数。`device_upload_bytes` 记录显式上传。后续的代表构造与选块见 [SYCL 动态选块](SYCL_SELECTION.md)。
 
 ## 构建入口
 

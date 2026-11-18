@@ -131,6 +131,13 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
 }
 
 ''' + anchor)
+    anchor = 'static bool is_bmg_g31_arch(int device) {\n'
+    sycl = replace_once(sycl, anchor, '''extern "C" void * solid_sycl_queue(ggml_backend_t backend) {
+    if (!ggml_backend_is_sycl(backend)) throw std::invalid_argument("expected a SYCL backend");
+    return static_cast<ggml_backend_sycl_context *>(backend->context)->stream();
+}
+
+''' + anchor)
     anchor = '''    // Reserve the additional scratch so it's visible to the graph allocator
 '''
     sycl = replace_once(sycl, anchor, '''    if (solid::sycl_masked_decode_supported(tensor)) return solid::sycl_masked_decode_alloc(tensor);

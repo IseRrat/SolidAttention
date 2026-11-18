@@ -2,7 +2,7 @@
 
 复现 FAST 2026 论文 **SolidAttention: Low-Latency SSD-based Serving on Memory-Constrained PCs**，在 llama.cpp 上实现 SSD KV cache、动态稀疏注意力、历史预取和计算/I/O 重叠。
 
-系统采用单请求 decode、INT4 模型权重与 FP16 KV cache。CUDA 路径覆盖 GPU 代表构造、动态选块、有界 prefill、历史预取及当前 KV 安装与异步归档。SYCL 路径已接入共享 KV 和逐 head 稀疏 decode。后续设备算子及跨层资源核查见 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md)。
+系统采用单请求 decode、INT4 模型权重与 FP16 KV cache。CUDA 路径覆盖 GPU 代表构造、动态选块、有界 prefill、历史预取及当前 KV 安装与异步归档。SYCL 路径已接入共享 KV、GPU 代表构造、动态选块和逐 head 稀疏 decode。后续设备算子及跨层资源核查见 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md)。
 
 ## 开发入口
 
@@ -41,6 +41,7 @@
 25. [当前 KV 归档](docs/implementation/KV_ARCHIVE.md)：attention 与主机归档分流、跨层读取与槽位释放。
 
 26. [SYCL 共享 KV](docs/implementation/SYCL_SHARED_KV.md)：集成 GPU 的共享 bank、逐 head mask decode 和构建入口。
+27. [SYCL 动态选块](docs/implementation/SYCL_SELECTION.md)：设备代表构造、逐 head 相关度和 token 预算归约。
 
 ## 系统机制
 

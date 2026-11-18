@@ -24,9 +24,10 @@ SOLID_REP_HD inline double update_representative_score(double value, const doubl
 }
 // Arrays refer to one KV head. Stable insertion preserves the CPU score/position
 // ordering; each slot owns a contiguous FP16 K row.
-SOLID_REP_HD inline void insert_representative(std::uint64_t position, double score, const Half * key,
+template<class Score>
+SOLID_REP_HD inline void insert_representative(std::uint64_t position, Score score, const Half * key,
                                                std::uint32_t count, std::uint32_t width,
-                                               std::uint64_t * positions, double * scores, Half * keys) {
+                                               std::uint64_t * positions, Score * scores, Half * keys) {
     std::uint32_t target = count;
     for (std::uint32_t r = 0; r < count; ++r) {
         if (positions[r] == UINT64_MAX || score > scores[r] || (score == scores[r] && position < positions[r])) { target = r; break; }

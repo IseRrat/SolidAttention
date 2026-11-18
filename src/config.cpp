@@ -172,11 +172,15 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         }
         if (a.contains("gpu_decode")) target.gpu_decode = a.at("gpu_decode").get<bool>();
         if (a.contains("selection_backend")) target.selection_backend = a.at("selection_backend").get<std::string>();
-        if (target.selection_backend != "auto" && target.selection_backend != "cpu" && target.selection_backend != "cuda") {
-            throw std::invalid_argument("selection_backend must be auto, cpu or cuda");
+        if (target.selection_backend != "auto" && target.selection_backend != "cpu" && target.selection_backend != "cuda" &&
+            target.selection_backend != "sycl") {
+            throw std::invalid_argument("selection_backend must be auto, cpu, cuda or sycl");
         }
         if (target.selection_backend == "cuda" && (!target.sparse || !target.gpu_decode || !target.selection_replay.empty())) {
             throw std::invalid_argument("CUDA selection requires dynamic sparse GGML decode");
+        }
+        if (target.selection_backend == "sycl" && (!target.sparse || !target.gpu_decode || !target.selection_replay.empty())) {
+            throw std::invalid_argument("SYCL selection requires dynamic sparse GGML decode");
         }
         if (a.contains("prefill_backend")) target.prefill_backend=a.at("prefill_backend").get<std::string>();
         if (target.prefill_backend!="auto" && target.prefill_backend!="cpu" && target.prefill_backend!="cuda") throw std::invalid_argument("prefill_backend must be auto, cpu or cuda");

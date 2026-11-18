@@ -90,4 +90,7 @@ public:
 std::unique_ptr<BlockRanker> make_cuda_block_ranker(const KvGeometry & geometry, std::uint32_t query_heads,
                                                    std::uint32_t representatives, std::uint32_t budget, int device,
                                                    std::uint32_t local = 0);
+std::unique_ptr<BlockRanker> make_sycl_block_ranker(const KvGeometry & geometry, std::uint32_t query_heads,
+                                                   std::uint32_t representatives, std::uint32_t budget, void * backend_queue,
+                                                   std::uint32_t local);
 } // namespace solid

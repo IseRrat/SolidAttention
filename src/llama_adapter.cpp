@@ -10,6 +10,10 @@
 #ifdef SOLID_HAVE_CUDA_SELECTION
 #include "ggml-cuda.h"
 #endif
+#ifdef SOLID_HAVE_SYCL
+#include "ggml-sycl.h"
+#include "solid/sycl_backend.hpp"
+#endif
 
 #include <algorithm>
 #include <cmath>
@@ -461,8 +465,9 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
     }
     if (impl_->configure_ranker) {
         bool configured = false;
+        const auto & selector = impl_->selection_backend;
 #ifdef SOLID_HAVE_CUDA_SELECTION
-        if (backend && ggml_backend_is_cuda(backend)) {
+        if ((selector == "auto" || selector == "cuda") && backend && ggml_backend_is_cuda(backend)) {
             auto * registry = ggml_backend_cuda_reg();
             for (std::size_t ordinal = 0; ordinal < ggml_backend_reg_dev_count(registry); ++ordinal) {
                 if (ggml_backend_reg_dev_get(registry, ordinal) != ggml_backend_get_device(backend)) continue;
@@ -473,7 +478,16 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
             }
         }
 #endif
-        if (!configured && impl_->selection_backend == "cuda") throw std::runtime_error("CUDA selection requires a CUDA build and CUDA attention backend");
+#ifdef SOLID_HAVE_SYCL
+        if ((selector == "auto" || selector == "sycl") && backend && ggml_backend_is_sycl(backend)) {
+            const auto budget = impl_->session->budget();
+            impl_->session->set_ranker(make_sycl_block_ranker(impl_->session->geometry(), impl_->session->query_heads(),
+                budget.representatives, budget.total, solid_sycl_queue(backend), budget.local));
+            configured = true;
+        }
+#endif
+        if (!configured && selector == "cuda") throw std::runtime_error("CUDA selection requires a CUDA build and CUDA attention backend");
+        if (!configured && selector == "sycl") throw std::runtime_error("SYCL selection requires a SYCL build and SYCL attention backend");
         impl_->configure_ranker = false;
     }
     if (gathered && prefetch_enabled()) {
