@@ -6,7 +6,7 @@
 #include <stdexcept>
 
 namespace solid {
-enum class DeviceMemory { cuda, host_emulator };
+enum class DeviceMemory { cuda, host_emulator, sycl };
 
 // Borrowed, producer-complete inputs. The owner retains the allocation until
 // the consuming call returns, including its private-stream synchronization.

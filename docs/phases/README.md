@@ -34,3 +34,4 @@
 | Decode 当前 KV 异步归档 | [当前 KV 归档](../implementation/KV_ARCHIVE.md) | 阶段 4 的安装与回写分支、下一层读取与设备槽位完成依赖 |
 | SYCL 共享 KV 与逐 head decode | [SYCL 共享 KV](../implementation/SYCL_SHARED_KV.md) | 阶段 2 的交错设备视图，阶段 4 的统一内存及槽位释放 |
 | SYCL 代表构造与动态选择 | [SYCL 动态选块](../implementation/SYCL_SELECTION.md) | 阶段 1 的后续窗口构造和逐 head token 预算 |
+| SYCL Decode 设备输入与复制队列 | [SYCL 设备输入](../implementation/SYCL_DEVICE_INPUTS.md) | 阶段 2 的设备交错、阶段 4 的 Q/KV 前沿和当前行归档 |

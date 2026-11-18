@@ -74,7 +74,7 @@ if(SOLID_SYCL)
         endif()
     endforeach()
     set_property(TARGET ggml-sycl PROPERTY SOURCES "${SOLID_ADAPTED_SYCL}")
-    target_sources(ggml-sycl PRIVATE "${PROJECT_SOURCE_DIR}/src/sycl/block_ranker.cpp")
+    target_sources(ggml-sycl PRIVATE "${PROJECT_SOURCE_DIR}/src/sycl/block_ranker.cpp" "${PROJECT_SOURCE_DIR}/src/sycl/copy_queue.cpp")
     set_source_files_properties("${PROJECT_SOURCE_DIR}/src/sycl/block_ranker.cpp" TARGET_DIRECTORY ggml-sycl
         PROPERTIES COMPILE_OPTIONS "-ffp-contract=off")
     target_include_directories(ggml-sycl PRIVATE "${PROJECT_SOURCE_DIR}/include" "${SOLID_SYCL_SOURCE_DIR}")

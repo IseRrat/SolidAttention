@@ -102,7 +102,8 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
             break;
         }''')
     sycl = (source.parent / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text(encoding="utf-8")
-    sycl = '#include "solid/sycl_backend.hpp"\n#include "solid/sycl_flash_decode.hpp"\n#include <memory>\n#include <stdexcept>\n' + sycl
+    sycl = ('#include "solid/sycl_backend.hpp"\n#include "solid/sycl_flash_decode.hpp"\n'
+            '#include "solid/sycl_device_ops.hpp"\n#include <memory>\n#include <stdexcept>\n') + sycl
     sycl = replace_once(sycl, '    bool is_usm_system;\n', '    bool is_usm_system;\n    bool solid_shared = false;\n')
     anchor = '''            if (is_usm_system)
                 free_aligned_mem_host(dev_ptr);'''
@@ -145,13 +146,21 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
     anchor = '''        case GGML_OP_FLASH_ATTN_EXT:
             ggml_sycl_flash_attn_ext(ctx, dst);
             break;'''
-    sycl = replace_once(sycl, anchor, '''        case GGML_OP_FLASH_ATTN_EXT:
+    sycl = replace_once(sycl, anchor, '''        case GGML_OP_CUSTOM:
+            if (!solid::sycl_device_op(*ctx.stream(), dst)) return false;
+            break;
+        case GGML_OP_FLASH_ATTN_EXT:
             if (solid::sycl_masked_decode_supported(dst)) solid::sycl_masked_decode(*ctx.stream(), dst);
             else ggml_sycl_flash_attn_ext(ctx, dst);
             break;''')
     anchor = '''            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);'''
     sycl = replace_once(sycl, anchor, '''            return solid::sycl_masked_decode_supported(op) ||
                    (op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op));''')
+    anchor = '''        case GGML_OP_FLASH_ATTN_EXT:
+            // K/V row lists (ggml_flash_attn_ext_rows) are not supported'''
+    sycl = replace_once(sycl, anchor, '''        case GGML_OP_CUSTOM:
+            return solid::device_op_supported(op);
+''' + anchor)
     destination.mkdir(parents=True, exist_ok=True)
     for name, text in (("llama-graph.cpp", graph), ("llama-context.cpp", context), ("ggml-backend.cpp", backend),
                        ("ggml-cuda.cu", cuda), ("ggml-sycl.cpp", sycl)):

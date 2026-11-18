@@ -46,7 +46,13 @@ std::unique_ptr<AttentionEvents> attention_events(AttentionSession & session,ggm
 }
 class GgmlTransport final : public DeviceTransport {
     struct RowCopy { ggml_tensor source{},target{}; };
-    struct CopyRecord { ggml_backend_event_t event=nullptr; std::unique_ptr<RowCopy> row; };
+    struct CopyRecord {
+        ggml_backend_event_t event=nullptr;
+        std::unique_ptr<RowCopy> row;
+#ifdef SOLID_HAVE_SYCL
+        std::unique_ptr<SyclCopyEvent> sycl;
+#endif
+    };
 public:
     GgmlTransport(ggml_backend_t backend, KvGeometry geometry, std::uint32_t per_head, ScheduleMode mode,AttentionEvents * native) :
         backend_(backend), geometry_(geometry), per_head_(per_head),native_(native) {
@@ -61,6 +67,7 @@ public:
         ggml_set_name(tensor_, "solid_prefetch_device_slots");
 #ifdef SOLID_HAVE_SYCL
         if (ggml_backend_is_sycl(backend)) {
+            sycl_copy_=make_sycl_copy_queue(backend);
             const auto bytes=ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(backend), tensor_);
             buffer_.reset(solid_sycl_alloc_shared_kv(backend, bytes));
             if (buffer_) {
@@ -84,9 +91,14 @@ public:
         if (mode != ScheduleMode::naive) {
             auto * device = ggml_backend_get_device(backend_);
             if (!device) throw std::runtime_error("copy backend requires a registered device");
-            copy_owner_.reset(ggml_backend_dev_init(device, nullptr));
-            if (!copy_owner_) throw std::runtime_error("independent copy backend initialization failed");
-            copy_backend_ = copy_owner_.get();
+#ifdef SOLID_HAVE_SYCL
+            if (!sycl_copy_)
+#endif
+            {
+                copy_owner_.reset(ggml_backend_dev_init(device, nullptr));
+                if (!copy_owner_) throw std::runtime_error("independent copy backend initialization failed");
+                copy_backend_ = copy_owner_.get();
+            }
             auto * host_type = ggml_backend_dev_host_buffer_type(device);
             if (!host_type) host_type = ggml_backend_get_default_buffer_type(copy_backend_);
             if (!ggml_backend_buft_is_host(host_type)) throw std::runtime_error("copy staging requires host memory");
@@ -119,15 +131,26 @@ public:
             std::memcpy(static_cast<unsigned char *>(tensor_->data)+offset,block.data.data(),bytes);
             return id;
         }
+#ifdef SOLID_HAVE_SYCL
+        if (sycl_copy_) {
+            auto & record=events_.try_emplace(id).first->second;
+            try {
+                const auto * source=stage_host(slot,0,block.data.data(),bytes);
+                sycl_copy_->copy(static_cast<unsigned char *>(tensor_->data)+offset,source,bytes);
+                record.sycl=sycl_copy_->fence();
+            } catch (...) {
+                try { drain(); } catch (...) {}
+                events_.erase(id);
+                throw;
+            }
+            return id;
+        }
+#endif
         auto * device = ggml_backend_get_device(copy_backend_);
         auto * event = device ? ggml_backend_event_new(device) : nullptr;
         try {
-            events_.emplace(id, CopyRecord{event,{}});
-            const void * source = block.data.data();
-            if (staging_) {
-                auto * destination = static_cast<unsigned char *>(ggml_backend_buffer_get_base(staging_.get())) + static_cast<std::size_t>(slot) * bytes;
-                std::memcpy(destination, source, bytes); source = destination;
-            }
+            events_.try_emplace(id).first->second.event=event;
+            const auto * source=stage_host(slot,0,block.data.data(),bytes);
             ggml_backend_tensor_set_async(copy_backend_, tensor_, source, offset, bytes);
             if (event) ggml_backend_event_record(event, copy_backend_);
             else ggml_backend_synchronize(copy_backend_);
@@ -142,6 +165,9 @@ public:
     std::optional<DeviceMemory> current_memory() const override {
 #ifdef SOLID_HAVE_CUDA_SELECTION
         if (ggml_backend_is_cuda(backend_)) return DeviceMemory::cuda;
+#endif
+#ifdef SOLID_HAVE_SYCL
+        if (sycl_copy_) return DeviceMemory::sycl;
 #endif
         auto * device=ggml_backend_get_device(backend_);
         if (device && ggml_backend_dev_type(device)==GGML_BACKEND_DEVICE_TYPE_CPU) return DeviceMemory::host_emulator;
@@ -159,7 +185,7 @@ public:
         if (!buffer || (*memory==DeviceMemory::host_emulator)!=ggml_backend_buffer_is_host(buffer) ||
             device_ranges_overlap(source->data,current.kv.elements,sizeof(Half),tensor_->data,
                 static_cast<std::size_t>(ggml_nelements(tensor_)),sizeof(Half))) throw std::invalid_argument("current device source buffer or alias");
-        if (*memory==DeviceMemory::cuda && ggml_backend_buffer_get_type(buffer)!=ggml_backend_buffer_get_type(tensor_->buffer)) {
+        if (*memory!=DeviceMemory::host_emulator && ggml_backend_buffer_get_type(buffer)!=ggml_backend_buffer_get_type(tensor_->buffer)) {
             throw std::invalid_argument("current KV and bank use different device buffer types");
         }
         current_source_=source;
@@ -177,27 +203,42 @@ public:
         }
         if (next_==UINT64_MAX) throw std::overflow_error("copy ticket exhausted");
         const auto id=next_++;
+        const auto head=slot/per_head_,local=slot%per_head_;
+        const auto offset=head*tensor_->nb[2]+local*geometry_.block_tokens*tensor_->nb[1];
+        const auto prefix_offset=static_cast<std::size_t>(prefix)*row_bytes;
+        const auto prefix_bytes=static_cast<std::size_t>(row-prefix)*row_bytes;
+        const auto * prefix_data=prefix_bytes?block->data.data()+static_cast<std::size_t>(prefix)*2*geometry_.dimension:nullptr;
+        const auto * current_row=static_cast<const unsigned char *>(current_source_->data)+head*row_bytes;
+#ifdef SOLID_HAVE_SYCL
+        if (sycl_copy_) {
+            auto & record=events_.try_emplace(id).first->second;
+            auto * target=static_cast<unsigned char *>(tensor_->data)+offset;
+            try {
+                if (prefix_bytes) sycl_copy_->copy(target+prefix_offset,stage_host(slot,prefix_offset,prefix_data,prefix_bytes),prefix_bytes);
+                sycl_copy_->copy(target+row*row_bytes,current_row,row_bytes);
+                record.sycl=sycl_copy_->fence();
+            } catch (...) {
+                try { drain(); } catch (...) {}
+                events_.erase(id);
+                throw;
+            }
+            return id;
+        }
+#endif
         auto * device=ggml_backend_get_device(copy_backend_);
         auto * event=device?ggml_backend_event_new(device):nullptr;
         try {
             auto rows=std::make_unique<RowCopy>();
-            const auto head=slot/per_head_,local=slot%per_head_;
-            const auto offset=head*tensor_->nb[2]+local*geometry_.block_tokens*tensor_->nb[1];
-            rows->source=row_tensor(*current_source_,static_cast<unsigned char *>(current_source_->data)+head*row_bytes);
+            rows->source=row_tensor(*current_source_,const_cast<unsigned char *>(current_row));
             rows->target=row_tensor(*tensor_,static_cast<unsigned char *>(tensor_->data)+offset+row*row_bytes);
-            auto & record=events_.emplace(id,CopyRecord{event,std::move(rows)}).first->second;
-            if (row>prefix) {
-                const auto bytes=static_cast<std::size_t>(row-prefix)*row_bytes;
-                const void * source=block->data.data()+static_cast<std::size_t>(prefix)*2*geometry_.dimension;
-                if (staging_) {
-                    auto * target=static_cast<unsigned char *>(ggml_backend_buffer_get_base(staging_.get()))+
-                        static_cast<std::size_t>(slot)*geometry_.block_tokens*row_bytes+prefix*row_bytes;
-                    std::memcpy(target,source,bytes); source=target;
-                }
-                ggml_backend_tensor_set_async(copy_backend_,tensor_,source,offset+prefix*row_bytes,bytes);
+            auto & record=events_.try_emplace(id).first->second;
+            record.event=event;
+            record.row=std::move(rows);
+            if (prefix_bytes) {
+                const auto * source=stage_host(slot,prefix_offset,prefix_data,prefix_bytes);
+                ggml_backend_tensor_set_async(copy_backend_,tensor_,source,offset+prefix_offset,prefix_bytes);
             }
-            // KV D2H has completed at the CPU frontier. Both endpoints belong
-            // to this device; enqueue D2D on the independent copy stream.
+            // The KV graph frontier has completed on the producing backend.
             ggml_backend_tensor_copy_async(copy_backend_,copy_backend_,&record.row->source,&record.row->target);
             if (event) ggml_backend_event_record(event,copy_backend_);
             else ggml_backend_synchronize(copy_backend_);
@@ -211,6 +252,17 @@ public:
     bool complete(std::uint64_t ticket, bool wait) override {
         const auto found = events_.find(ticket);
         if (found == events_.end()) throw std::logic_error("unknown upload ticket");
+#ifdef SOLID_HAVE_SYCL
+        if (found->second.sycl && ticket>completed_through_) {
+            if (!wait) {
+                ++stats_.copy_event_queries;
+                if (!found->second.sycl->ready()) return false;
+            }
+            found->second.sycl->wait();
+            completed_through_=ticket;
+            stats_.event_waits+=wait;
+        }
+#endif
         if (found->second.event && ticket > completed_through_ && !wait) {
             if (!native_) return false;
             ++stats_.copy_event_queries;
@@ -224,17 +276,46 @@ public:
         events_.erase(found);
         return true;
     }
-    void drain() override { ggml_backend_synchronize(copy_backend_); ++stats_.backend_drains; completed_through_ = next_ - 1; }
+    void drain() override {
+#ifdef SOLID_HAVE_SYCL
+        if (sycl_copy_) sycl_copy_->drain();
+        else
+#endif
+            ggml_backend_synchronize(copy_backend_);
+        ++stats_.backend_drains;
+        completed_through_=next_-1;
+    }
     void wait_batch() override {
         if (events_.empty()) return;
         ++stats_.batch_groups; stats_.events_coalesced += events_.size();
         const auto latest = events_.rbegin();
-        if (latest->first > completed_through_ && latest->second.event) {
-            ggml_backend_event_synchronize(latest->second.event); ++stats_.batch_waits;
+        if (latest->first > completed_through_) {
+#ifdef SOLID_HAVE_SYCL
+            if (sycl_copy_) {
+                for (auto i=events_.rbegin(); i!=events_.rend() && i->first>completed_through_; ++i) {
+                    if (!i->second.sycl) continue;
+                    i->second.sycl->wait();
+                    ++stats_.batch_waits;
+                    break;
+                }
+            } else
+#endif
+            if (latest->second.event) { ggml_backend_event_synchronize(latest->second.event); ++stats_.batch_waits; }
         }
         completed_through_ = next_ - 1;
     }
     void wait_on_compute() {
+#ifdef SOLID_HAVE_SYCL
+        if (sycl_copy_) {
+            for (auto i=events_.rbegin(); i!=events_.rend(); ++i) {
+                if (!i->second.sycl) continue;
+                i->second.sycl->wait_on_compute();
+                ++stats_.stream_waits;
+                break;
+            }
+            return;
+        }
+#endif
         if (!events_.empty() && events_.rbegin()->second.event) {
             ggml_backend_event_wait(backend_, events_.rbegin()->second.event); ++stats_.stream_waits;
         }
@@ -251,21 +332,36 @@ public:
             if (!archive_buffer_) throw std::runtime_error("KV archive allocation failed");
             stats_.staging_bytes+=ggml_backend_buffer_get_size(archive_buffer_.get());
         }
-        archive_event_=device?ggml_backend_event_new(device):nullptr;
+#ifdef SOLID_HAVE_SYCL
+        if (!sycl_copy_)
+#endif
+            archive_event_=device?ggml_backend_event_new(device):nullptr;
         archive_pending_=true;
         try {
             auto * output=static_cast<unsigned char *>(ggml_backend_buffer_get_base(archive_buffer_.get()));
             for (std::size_t h=0;h<slots.size();++h) {
                 if (slots[h]/per_head_!=h) throw std::logic_error("KV archive slot belongs to the wrong head");
                 const auto token=(slots[h]%per_head_)*geometry_.block_tokens+position%geometry_.block_tokens;
-                ggml_backend_tensor_get_async(copy_backend_, tensor_,output+h*row_bytes,h*tensor_->nb[2]+token*tensor_->nb[1],row_bytes);
+                const auto offset=h*tensor_->nb[2]+token*tensor_->nb[1];
+#ifdef SOLID_HAVE_SYCL
+                if (sycl_copy_) sycl_copy_->copy(output+h*row_bytes,static_cast<const unsigned char *>(tensor_->data)+offset,row_bytes);
+                else
+#endif
+                    ggml_backend_tensor_get_async(copy_backend_,tensor_,output+h*row_bytes,offset,row_bytes);
             }
+#ifdef SOLID_HAVE_SYCL
+            if (sycl_copy_) archive_sycl_=sycl_copy_->fence();
+            else
+#endif
             if (archive_event_) ggml_backend_event_record(archive_event_,copy_backend_);
             else ggml_backend_synchronize(copy_backend_);
         } catch (...) { drain(); clear_archive(); throw; }
     }
     std::vector<Half> finish_archive() {
         if (!archive_pending_) throw std::logic_error("no KV archive is in flight");
+#ifdef SOLID_HAVE_SYCL
+        if (archive_sycl_) archive_sycl_->wait();
+#endif
         if (archive_event_) ggml_backend_event_synchronize(archive_event_);
         const auto * data=static_cast<const Half *>(ggml_backend_buffer_get_base(archive_buffer_.get()));
         clear_archive();
@@ -273,6 +369,9 @@ public:
     }
     // The caller must already have completed or drained the copy stream.
     void clear_archive() {
+#ifdef SOLID_HAVE_SYCL
+        archive_sycl_.reset();
+#endif
         if (archive_event_) ggml_backend_event_free(archive_event_);
         archive_event_=nullptr;
         archive_pending_=false;
@@ -283,6 +382,13 @@ public:
     bool shared_memory() const override { return shared_; }
     ggml_tensor * tensor() const { return tensor_; }
 private:
+    const void * stage_host(std::uint32_t slot,std::size_t offset,const void * source,std::size_t bytes) {
+        if (!staging_) return source;
+        const auto block_bytes=static_cast<std::size_t>(geometry_.block_tokens)*2*geometry_.dimension*sizeof(Half);
+        auto * target=static_cast<unsigned char *>(ggml_backend_buffer_get_base(staging_.get()))+slot*block_bytes+offset;
+        std::memcpy(target, source, bytes);
+        return target;
+    }
     ggml_tensor row_tensor(const ggml_tensor & source,void * data) const {
         auto row=source; row.type=GGML_TYPE_F16; row.op=GGML_OP_NONE; row.flags=0;
         row.buffer=source.view_src?source.view_src->buffer:source.buffer;
@@ -299,6 +405,10 @@ private:
     std::uint32_t per_head_;
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> copy_owner_{nullptr, ggml_backend_free};
     ggml_backend_t copy_backend_ = nullptr;
+#ifdef SOLID_HAVE_SYCL
+    std::unique_ptr<SyclCopyQueue> sycl_copy_;
+    std::unique_ptr<SyclCopyEvent> archive_sycl_;
+#endif
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> staging_{nullptr, ggml_backend_buffer_free};
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> archive_buffer_{nullptr, ggml_backend_buffer_free};
     ggml_backend_event_t archive_event_=nullptr;
@@ -526,6 +636,9 @@ std::optional<DeviceMemory> GgmlPrefetch::direct_memory() const {
     if (*memory == DeviceMemory::host_emulator && ggml_backend_dev_type(ggml_backend_get_device(impl_->backend)) == GGML_BACKEND_DEVICE_TYPE_CPU) return memory;
 #ifdef SOLID_HAVE_CUDA_SELECTION
     if (*memory == DeviceMemory::cuda && ggml_backend_is_cuda(impl_->backend)) return memory;
+#endif
+#ifdef SOLID_HAVE_SYCL
+    if (*memory == DeviceMemory::sycl && ggml_backend_is_sycl(impl_->backend)) return memory;
 #endif
     return {};
 }

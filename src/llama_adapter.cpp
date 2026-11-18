@@ -222,7 +222,9 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
     }
     impl_->packed_inputs = packed_kv != nullptr;
     impl_->direct = impl_->prefetch ? impl_->prefetch->direct_memory() : (!impl_->gathered?impl_->session.prefill_direct_memory():std::optional<DeviceMemory>{});
-    if (impl_->direct && *impl_->direct == DeviceMemory::cuda && (!scheduler || !decode_backend)) throw std::invalid_argument("device Q/K graph requires scheduler and decode backend");
+    if (impl_->direct && *impl_->direct != DeviceMemory::host_emulator && (!scheduler || !decode_backend)) {
+        throw std::invalid_argument("device Q/K graph requires scheduler and decode backend");
+    }
     if (impl_->direct && !impl_->prefetch) {
         if (!decode_backend) throw std::invalid_argument("device prefill requires a result backend");
         const auto type=ggml_backend_dev_type(ggml_backend_get_device(decode_backend));
