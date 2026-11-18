@@ -39,9 +39,13 @@ std::unique_ptr<AttentionEvents> attention_events(AttentionSession & session,ggm
                 return make_cuda_attention_events(session.geometry().layers,static_cast<int>(ordinal));
         throw std::runtime_error("CUDA attention completion device identity mismatch");
     }
-#else
-    (void) session; (void) backend; (void) mode;
 #endif
+#ifdef SOLID_HAVE_SYCL
+    if (mode==ScheduleMode::sync_reuse && ggml_backend_is_sycl(backend)) {
+        return make_sycl_attention_events(session.geometry().layers,solid_sycl_queue(backend));
+    }
+#endif
+    (void) session; (void) backend;
     return {};
 }
 class GgmlTransport final : public DeviceTransport {
@@ -583,7 +587,8 @@ struct GgmlPrefetch::Impl {
                     else { ++totals.process_reused_fences; proof="process_synchronize_reuse"; }
                 }
                 const auto before=device.stats().uploads;
-                release_attention(proof,receipt->proof==AttentionProof::device_signal?std::optional<std::uint64_t>{receipt->device_ns}:std::nullopt); released=true;
+                release_attention(proof, receipt->device_ns ? std::optional<std::uint64_t>{receipt->device_ns} : std::nullopt);
+                released=true;
                 if (!events->boundary_seen(epoch)) totals.uploads_before_boundary+=device.stats().uploads-before;
             }
             if (released) {

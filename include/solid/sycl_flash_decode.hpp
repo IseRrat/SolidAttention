@@ -9,11 +9,13 @@
 
 namespace solid {
 inline constexpr std::size_t sycl_decode_tile = 64;
+void sycl_attention_decode(sycl::queue & queue,ggml_tensor * output);
 
 inline bool sycl_masked_decode_supported(const ggml_tensor * output) {
     constexpr char name[] = "solid_prefetched_flash_attention";
     if (!output || output->op != GGML_OP_FLASH_ATTN_EXT ||
-        std::strncmp(output->name, name, sizeof(name)-1) != 0 || output->src[4] || output->src[5]) return false;
+        (std::strncmp(output->name, name, sizeof(name)-1) != 0 && std::strcmp(output->name,"solid_gathered_flash_attention") != 0) ||
+        output->src[4] || output->src[5]) return false;
     const auto * q=output->src[0], * k=output->src[1], * v=output->src[2], * mask=output->src[3];
     if (!q || !k || !v || !mask || q->type!=GGML_TYPE_F32 || k->type!=GGML_TYPE_F16 || v->type!=GGML_TYPE_F16 ||
         mask->type!=GGML_TYPE_F16 || output->type!=GGML_TYPE_F32 || q->ne[1]!=1 || q->ne[3]!=1 ||
@@ -41,7 +43,7 @@ inline std::size_t sycl_masked_decode_alloc(const ggml_tensor * output) {
     return bytes+static_cast<std::size_t>(output->ne[1])*tiles*row_bytes;
 }
 
-inline void sycl_masked_decode(sycl::queue & queue, ggml_tensor * output) {
+inline sycl::event sycl_masked_decode(sycl::queue & queue, ggml_tensor * output) {
     const auto * q=output->src[0], * k=output->src[1], * v=output->src[2], * mask=output->src[3];
     const auto width=static_cast<std::size_t>(q->ne[0]), heads=static_cast<std::size_t>(q->ne[2]);
     const auto gqa=heads/static_cast<std::size_t>(k->ne[2]), tokens=static_cast<std::size_t>(k->ne[1]);
@@ -84,7 +86,7 @@ inline void sycl_masked_decode(sycl::queue & queue, ggml_tensor * output) {
         if (lane==0) { partial[width]=maximum; partial[width+1]=denominator; }
     });
 
-    queue.parallel_for(sycl::nd_range<1>(sycl::range<1>(heads*lanes),sycl::range<1>(lanes)), [=](sycl::nd_item<1> item) {
+    return queue.parallel_for(sycl::nd_range<1>(sycl::range<1>(heads*lanes),sycl::range<1>(lanes)), [=](sycl::nd_item<1> item) {
         const auto head=item.get_group_linear_id(), lane=item.get_local_linear_id();
         const auto * head_tiles=scratch+head*tiles*(width+2);
         float maximum=negative_inf;

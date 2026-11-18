@@ -183,9 +183,12 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
             throw std::invalid_argument("SYCL selection requires dynamic sparse GGML decode");
         }
         if (a.contains("prefill_backend")) target.prefill_backend=a.at("prefill_backend").get<std::string>();
-        if (target.prefill_backend!="auto" && target.prefill_backend!="cpu" && target.prefill_backend!="cuda") throw std::invalid_argument("prefill_backend must be auto, cpu or cuda");
+        if (target.prefill_backend!="auto" && target.prefill_backend!="cpu" && target.prefill_backend!="cuda" && target.prefill_backend!="sycl") {
+            throw std::invalid_argument("prefill_backend must be auto, cpu, cuda or sycl");
+        }
         if (a.contains("prefill_tile_tokens")) target.prefill_tile_tokens=positive(a,"prefill_tile_tokens");
         if (target.prefill_backend=="cuda" && !target.gpu_decode) throw std::invalid_argument("CUDA prefill requires gpu_decode=true");
+        if (target.prefill_backend=="sycl" && !target.gpu_decode) throw std::invalid_argument("SYCL prefill requires gpu_decode=true");
         if (a.contains("prefetch")) target.prefetch = a.at("prefetch").get<bool>();
         if (a.contains("prefetch_trace")) target.prefetch_trace = a.at("prefetch_trace").get<bool>();
         if (a.contains("schedule")) target.schedule = a.at("schedule").get<std::string>();

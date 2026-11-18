@@ -1,7 +1,5 @@
 #include "solid/sycl_backend.hpp"
-
-#include <sycl/sycl.hpp>
-#include <exception>
+#include "solid/sycl_runtime.hpp"
 
 namespace solid {
 namespace {
@@ -22,10 +20,7 @@ private:
 
 class CopyQueue final : public SyclCopyQueue {
 public:
-    explicit CopyQueue(sycl::queue & compute) : compute_(compute),
-        queue_(compute.get_context(), compute.get_device(),
-               [](sycl::exception_list errors) { for (const auto & error : errors) std::rethrow_exception(error); },
-               sycl::property::queue::in_order{}) {}
+    explicit CopyQueue(sycl::queue & compute) : compute_(compute), queue_(sycl_runtime::in_order_queue(compute)) {}
 
     void copy(void * target, const void * source, std::size_t bytes) override { queue_.memcpy(target, source, bytes); }
     std::unique_ptr<SyclCopyEvent> fence() override {

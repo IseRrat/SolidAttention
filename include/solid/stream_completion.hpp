@@ -12,6 +12,8 @@ struct StreamCompletionToken {
     void * begin_event=nullptr;
     void * end_event=nullptr;
     std::uint64_t identity=0;
+    std::uint64_t (*armed_epoch)(void *) noexcept=nullptr;
+    void (*notify_epoch)(void *,std::uint64_t) noexcept=nullptr;
 };
 struct StreamCompletionBinding {
     std::uint64_t magic=0;

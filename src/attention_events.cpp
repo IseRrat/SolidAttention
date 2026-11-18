@@ -29,6 +29,7 @@ AttentionEvents::AttentionEvents(std::uint32_t layers) {
     for (std::uint32_t i=0;i<layers;++i) {
         auto slot=std::make_unique<Slot>(); slot->owner=this;
         slot->token.notify=signal; slot->token.userdata=slot.get(); slot->token.identity=identity();
+        slot->token.armed_epoch=armed_epoch; slot->token.notify_epoch=signal_epoch;
         slots_.push_back(std::move(slot));
     }
 #ifdef __linux__
@@ -51,9 +52,21 @@ void AttentionEvents::arm(std::uint32_t layer,std::uint64_t epoch) {
     last_epoch_=epoch; active_.store(epoch,std::memory_order_release);
 }
 void AttentionEvents::signal(void * userdata) noexcept {
+    signal_epoch(userdata,armed_epoch(userdata));
+}
+std::uint64_t AttentionEvents::armed_epoch(void * userdata) noexcept {
+    return static_cast<Slot *>(userdata)->armed.load(std::memory_order_acquire);
+}
+void AttentionEvents::signal_epoch(void * userdata,std::uint64_t epoch) noexcept {
     auto & slot=*static_cast<Slot *>(userdata);
-    const auto epoch=slot.armed.load(std::memory_order_acquire);
-    if (epoch) { slot.done.store(epoch,std::memory_order_release); slot.owner->wake(); }
+    if (!epoch || armed_epoch(userdata)!=epoch) return;
+    auto done=slot.done.load(std::memory_order_relaxed);
+    while (done<epoch) {
+        if (slot.done.compare_exchange_weak(done,epoch,std::memory_order_release,std::memory_order_relaxed)) {
+            slot.owner->wake();
+            return;
+        }
+    }
 }
 void AttentionEvents::wake() noexcept {
 #ifdef __linux__

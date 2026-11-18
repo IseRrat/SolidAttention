@@ -40,7 +40,10 @@ private:
     std::uint64_t last_epoch_=0;
     int notification_=-1;
     static void signal(void * userdata) noexcept;
+    static std::uint64_t armed_epoch(void * userdata) noexcept;
+    static void signal_epoch(void * userdata,std::uint64_t epoch) noexcept;
     void wake() noexcept;
 };
 std::unique_ptr<AttentionEvents> make_cuda_attention_events(std::uint32_t layers,int device);
+std::unique_ptr<AttentionEvents> make_sycl_attention_events(std::uint32_t layers,void * backend_queue);
 } // namespace solid

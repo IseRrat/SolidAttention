@@ -1,16 +1,16 @@
 #include "solid/block_ranker.hpp"
 #include "solid/representative_math.hpp"
-
-#include <sycl/sycl.hpp>
+#include "solid/sycl_runtime.hpp"
 
 #include <algorithm>
 #include <cmath>
-#include <exception>
-#include <limits>
 #include <type_traits>
 
 namespace solid {
 namespace {
+using sycl_runtime::Buffer;
+using sycl_runtime::flag_invalid;
+using sycl_runtime::product;
 
 // A normalized two-float expansion for devices without fp64. The explicit
 // FMAs recover the rounding error of products and quotients.
@@ -64,22 +64,6 @@ template<class Score> double host_score(Score value) {
     else return value;
 }
 
-std::size_t product(std::size_t a, std::size_t b) {
-    if (b && a > std::numeric_limits<std::size_t>::max() / b) throw std::overflow_error("SYCL ranker buffer size");
-    return a * b;
-}
-
-struct UsmDelete {
-    sycl::queue * queue = nullptr;
-    void operator()(void * pointer) const { sycl::free(pointer, *queue); }
-};
-template<class T> using Buffer = std::unique_ptr<T, UsmDelete>;
-
-void flag_invalid(int * status) {
-    sycl::atomic_ref<int, sycl::memory_order::relaxed, sycl::memory_scope::device,
-                     sycl::access::address_space::global_space>(*status).store(1);
-}
-
 template<class Score> class SyclBlockRanker final : public BlockRanker {
     struct Layer {
         Buffer<Half> bank, pending_keys, top_keys;
@@ -91,9 +75,7 @@ template<class Score> class SyclBlockRanker final : public BlockRanker {
 public:
     SyclBlockRanker(KvGeometry geometry, std::uint32_t query_heads, std::uint32_t representatives,
                     std::uint32_t budget, const sycl::queue & backend_queue, std::uint32_t local) :
-        queue_(backend_queue.get_context(), backend_queue.get_device(),
-               [](sycl::exception_list errors) { for (const auto & error : errors) std::rethrow_exception(error); },
-               sycl::property::queue::in_order{}),
+        queue_(sycl_runtime::in_order_queue(backend_queue)),
         geometry_(geometry), query_heads_(query_heads), representatives_(representatives), budget_(budget), local_(local) {
         geometry_.validate();
         if (!query_heads || query_heads % geometry_.heads || !representatives || representatives > geometry_.block_tokens ||
@@ -150,7 +132,7 @@ public:
     std::vector<std::vector<std::uint64_t>> rank_device(std::uint32_t layer, DeviceQuery query,
                                                         const BlockCandidates & candidates) override {
         validate_device_query(query, DeviceMemory::sycl, query_heads_, geometry_.dimension);
-        validate_pointer(query.data);
+        sycl_runtime::validate_pointer(query.data, queue_);
         auto result = rank_impl(layer, query.data, candidates, true);
         ++stats_.device_rank_queries;
         return result;
@@ -282,7 +264,7 @@ public:
     std::optional<BuiltRepresentatives> build_query_device(std::uint32_t layer, std::uint64_t position,
                                                            DeviceQuery query) override {
         validate_device_query(query, DeviceMemory::sycl, query_heads_, geometry_.dimension);
-        validate_pointer(query.data);
+        sycl_runtime::validate_pointer(query.data, queue_);
         auto result = build_query_impl(layer, position, query.data, true);
         ++stats_.device_builder_queries;
         return result;
@@ -301,11 +283,7 @@ private:
             built.emplace();
             built->block = (position - local_) / geometry_.block_tokens;
             if (built->block != state.published) throw std::logic_error("SYCL representative publication boundary");
-            const auto slots = product(geometry_.heads, representatives_);
-            built->keys.resize(block_elements_);
-            built->positions.resize(slots);
-            built->scores.resize(slots);
-            scores.resize(slots);
+            prepare_mirror(*built, scores);
         }
         if (pending || direct) {
             int error = 0;
@@ -316,20 +294,13 @@ private:
                 if (pending) advance_window(state, direct ? input : query_.get(), position - pending, pending);
                 else check_device_query(input);
                 if (finalize) finalize_row(state, position - local_, complete);
-                if (built) {
-                    queue_.memcpy(built->keys.data(), state.bank.get() + built->block * block_elements_, block_elements_ * sizeof(Half));
-                    queue_.memcpy(built->positions.data(), built_positions_.get(), scores.size() * sizeof(std::uint64_t));
-                    queue_.memcpy(scores.data(), built_scores_.get(), scores.size() * sizeof(Score));
-                }
+                if (built) download_built(state, *built, scores);
                 queue_.memcpy(&error, error_.get(), sizeof(error));
             }, &error);
             if (!direct) stats_.query_upload_bytes += bytes;
         }
         if (built) {
-            // Project the device ordering into the host score type. A sub-ULP
-            // residual can turn adjacent device scores into a tie here.
-            std::transform(scores.begin(), scores.end(), built->scores.begin(), host_score<Score>);
-            order_host_ties(*built);
+            finish_mirror(*built, scores);
             ++state.published;
             ++stats_.published_blocks;
             ++stats_.built_blocks;
@@ -361,25 +332,77 @@ public:
         const auto heads = geometry_.heads;
         const auto width = geometry_.dimension;
         validate_device_keys(keys, DeviceMemory::sycl, heads, width);
-        validate_pointer(keys.data);
-        const auto slot = position % local_;
-        auto * target = state.pending_keys.get() + slot * keys_per_token_;
+        sycl_runtime::validate_pointer(keys.data, queue_);
         const auto status = error_.get();
         int error = 0;
         execute([&] {
             queue_.fill(status, 0, 1);
-            queue_.parallel_for(sycl::range<1>(keys_per_token_), [=](sycl::id<1> i) {
-                const auto key = keys.data[(i[0] / width) * keys.head_stride + i[0] % width];
-                if (!sycl::isfinite(decode_half(key))) flag_invalid(status);
-                target[i[0]] = key;
-            });
-            queue_.fill(state.pending_scores.get() + slot * heads, Score{}, heads);
+            append_device_row(state, position, keys.data, keys.head_stride);
             queue_.memcpy(&error, status, sizeof(error));
         }, &error);
         ++state.length;
         state.query_pending = false;
         ++stats_.builder_appends;
         ++stats_.device_builder_appends;
+    }
+
+    std::vector<BuiltRepresentatives> build_batch_device(std::uint32_t layer, std::uint64_t first, std::uint32_t tokens,
+                                                         DeviceQuery query, DeviceKvBatch kv) override {
+        auto & state = builder_layer(layer, first, false);
+        if (!tokens || tokens > geometry_.capacity_tokens - first) throw std::invalid_argument("SYCL builder batch range");
+        validate_device_query(query, DeviceMemory::sycl, query_heads_, geometry_.dimension, tokens);
+        validate_device_kv(kv, DeviceMemory::sycl, geometry_.heads, geometry_.dimension, tokens);
+        sycl_runtime::validate_pointer(query.data, queue_);
+        sycl_runtime::validate_pointer(kv.data, queue_);
+
+        const auto end = first + tokens;
+        const auto published = end > local_ ? (end - local_) / geometry_.block_tokens : 0;
+        const auto prefix = first > local_ ? (first - local_) / geometry_.block_tokens : 0;
+        if (state.published != prefix) throw std::logic_error("SYCL representative batch publication boundary");
+        const auto new_blocks = published - state.published;
+        std::vector<BuiltRepresentatives> result(new_blocks);
+        std::vector<std::vector<Score>> scores(new_blocks);
+        for (std::size_t i = 0; i < result.size(); ++i) {
+            result[i].block = state.published + i;
+            prepare_mirror(result[i], scores[i]);
+        }
+        const auto q_stride = product(query_heads_, geometry_.dimension);
+        const auto kv_stride = product(keys_per_token_, 2);
+        const auto head_stride = product(geometry_.dimension, 2);
+        auto * status = error_.get();
+        int error = 0;
+        execute([&] {
+            queue_.fill(status, 0, 1);
+            for (std::uint32_t i = 0; i < tokens; ++i) {
+                const auto position = first + i;
+                const auto pending = std::min<std::uint64_t>(position, local_);
+                const auto * q = query.data + i * q_stride;
+                if (pending) advance_window(state, q, position - pending, pending);
+                else check_device_query(q);
+                if (position >= local_) {
+                    const auto old = position - local_;
+                    const bool complete = (old + 1) % geometry_.block_tokens == 0;
+                    finalize_row(state, old, complete);
+                    if (complete) {
+                        const auto index = old / geometry_.block_tokens - state.published;
+                        download_built(state, result.at(index), scores.at(index));
+                    }
+                }
+                append_device_row(state, position, kv.data + i * kv_stride, head_stride);
+            }
+            queue_.memcpy(&error, status, sizeof(error));
+        }, &error);
+        for (std::size_t i = 0; i < result.size(); ++i) finish_mirror(result[i], scores[i]);
+        state.length = end;
+        state.published = published;
+        stats_.published_blocks += new_blocks;
+        stats_.built_blocks += new_blocks;
+        stats_.builder_queries += tokens;
+        stats_.builder_appends += tokens;
+        stats_.device_builder_queries += tokens;
+        stats_.device_builder_appends += tokens;
+        ++stats_.device_builder_batches;
+        return result;
     }
 
 private:
@@ -492,6 +515,32 @@ private:
         });
     }
 
+    void append_device_row(Layer & state, std::uint64_t position, const Half * keys, std::size_t stride) {
+        const auto slot = position % local_;
+        const auto width = geometry_.dimension;
+        auto * target = state.pending_keys.get() + slot * keys_per_token_;
+        const auto status = error_.get();
+        queue_.parallel_for(sycl::range<1>(keys_per_token_), [=](sycl::id<1> i) {
+            const auto key = keys[(i[0] / width) * stride + i[0] % width];
+            if (!sycl::isfinite(decode_half(key))) flag_invalid(status);
+            target[i[0]] = key;
+        });
+        queue_.fill(state.pending_scores.get() + slot * geometry_.heads, Score{}, geometry_.heads);
+    }
+
+    void prepare_mirror(BuiltRepresentatives & built, std::vector<Score> & scores) const {
+        const auto slots = product(geometry_.heads, representatives_);
+        built.keys.resize(block_elements_);
+        built.positions.resize(slots);
+        built.scores.resize(slots);
+        scores.resize(slots);
+    }
+    void download_built(const Layer & state, BuiltRepresentatives & built, std::vector<Score> & scores) {
+        queue_.memcpy(built.keys.data(), state.bank.get() + built.block * block_elements_, block_elements_ * sizeof(Half));
+        queue_.memcpy(built.positions.data(), built_positions_.get(), scores.size() * sizeof(std::uint64_t));
+        queue_.memcpy(scores.data(), built_scores_.get(), scores.size() * sizeof(Score));
+    }
+
     void finalize_row(Layer & state, std::uint64_t position, bool complete) {
         const auto heads = geometry_.heads;
         const auto width = geometry_.dimension;
@@ -522,7 +571,9 @@ private:
         });
     }
 
-    void order_host_ties(BuiltRepresentatives & built) const {
+    void finish_mirror(BuiltRepresentatives & built, const std::vector<Score> & scores) const {
+        std::transform(scores.begin(), scores.end(), built.scores.begin(), host_score<Score>);
+        // A sub-ULP residual can turn adjacent device scores into a host tie.
         if constexpr (std::is_same_v<Score, FloatPair>) {
             const auto width = geometry_.dimension;
             for (std::uint32_t h = 0; h < geometry_.heads; ++h) {
@@ -557,15 +608,6 @@ private:
             throw std::invalid_argument("invalid SYCL selection query");
         }
     }
-    void validate_pointer(const void * pointer) const {
-        const auto context = queue_.get_context();
-        const auto kind = sycl::get_pointer_type(pointer, context);
-        const auto device = queue_.get_device();
-        if (kind == sycl::usm::alloc::host || (kind == sycl::usm::alloc::unknown && device.has(sycl::aspect::usm_system_allocations))) return;
-        if (kind == sycl::usm::alloc::unknown || sycl::get_pointer_device(pointer, context) != device) {
-            throw std::invalid_argument("borrowed SYCL input belongs to another device or context");
-        }
-    }
     static void validate_keys(const std::vector<Half> & keys) {
         if (!std::all_of(keys.begin(), keys.end(), [](Half key) { return std::isfinite(from_half(key)); })) {
             throw std::invalid_argument("non-finite SYCL representative key");
@@ -573,8 +615,7 @@ private:
     }
     template<class T> Buffer<T> allocate(std::size_t count, bool builder = false) {
         const auto bytes = product(count, sizeof(T));
-        Buffer<T> buffer(sycl::malloc_device<T>(count, queue_), UsmDelete{&queue_});
-        if (!buffer) throw std::bad_alloc();
+        auto buffer = sycl_runtime::allocate<T>(count, queue_);
         stats_.device_bytes += bytes;
         if (builder) stats_.builder_device_bytes += bytes;
         return buffer;

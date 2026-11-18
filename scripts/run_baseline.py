@@ -81,6 +81,8 @@ def verify_features(config, info):
         raise ValueError("SYCL selection requires a runner built with SOLID_SYCL=ON")
     if config.get("attention", {}).get("prefill_backend") == "cuda" and not info.get("features", {}).get("cuda"):
         raise ValueError("CUDA prefill requires a runner built with SOLID_CUDA=ON")
+    if config.get("attention", {}).get("prefill_backend") == "sycl" and not info.get("features", {}).get("sycl"):
+        raise ValueError("SYCL prefill requires a runner built with SOLID_SYCL=ON")
 
 
 def atomic_json(path, data):

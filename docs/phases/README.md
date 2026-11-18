@@ -35,3 +35,5 @@
 | SYCL 共享 KV 与逐 head decode | [SYCL 共享 KV](../implementation/SYCL_SHARED_KV.md) | 阶段 2 的交错设备视图，阶段 4 的统一内存及槽位释放 |
 | SYCL 代表构造与动态选择 | [SYCL 动态选块](../implementation/SYCL_SELECTION.md) | 阶段 1 的后续窗口构造和逐 head token 预算 |
 | SYCL Decode 设备输入与复制队列 | [SYCL 设备输入](../implementation/SYCL_DEVICE_INPUTS.md) | 阶段 2 的设备交错、阶段 4 的 Q/KV 前沿和当前行归档 |
+| SYCL 分块 Prefill 与批量代表 | [SYCL Prefill](../implementation/SYCL_PREFILL.md) | 阶段 1 的窗口构造和长输入，阶段 2 的设备 KV 交接 |
+| SYCL Attention 完成通知 | [SYCL 完成通知](../implementation/SYCL_NATIVE_COMPLETION.md) | 阶段 4 的设备事件及后继上传 |

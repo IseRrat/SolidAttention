@@ -46,7 +46,7 @@ def variant_config(template, variant, block, budget):
     for key in ("prefill_backend","prefill_tile_tokens"):
         if key in template.get("attention",{}):
             value=template["attention"][key]
-            if key=="prefill_backend" and value not in ("auto","cpu","cuda"): raise ValueError("unknown prefill backend")
+            if key=="prefill_backend" and value not in ("auto","cpu","cuda","sycl"): raise ValueError("unknown prefill backend")
             if key=="prefill_tile_tokens": number(value,1,True)
             attention[key]=value
     if sparse:

@@ -54,14 +54,13 @@
 | selected 优先，§6.1 | 预测期跨 head 先派发 selected，正式请求提升至预测请求之前；尾块更新先提升在途的旧前缀读取 | 将跨层资源依赖纳入图 |
 | I/O 与协调分工，§7 | 独立 I/O 所有者执行 liburing 读写。协调线程收割 D2H 后追加并发起聚合异步回写。原 WRITE 释放打包工作区并推进磁盘版本 | 核对各资源的等待边界和吞吐 |
 | 同步与时间观测，§6.2 | [CUDA 原生完成事件](implementation/NATIVE_COMPLETION.md) 记录 Flash Attention 设备区间，图重放通知解锁槽位与后继上传；复制完成查询归还源；主机边界继续作为依赖依据 | 继续把 Q/KV 投影与其他传输的设备区间关联具体任务，核查完整执行路径的同步与成本 |
-| SYCL，§1、§3.1、§6.2、§8.1 | [共享 KV](implementation/SYCL_SHARED_KV.md) 提供集成 GPU 的共享 KV bank 与逐 head mask decode。[动态选块](implementation/SYCL_SELECTION.md) 在设备上构造代表并按 head 选块。[设备输入](implementation/SYCL_DEVICE_INPUTS.md) 接入图内 Q/KV、独立复制队列和归档 | 接入设备 prefill 和 attention 完成事件 |
+| SYCL，§1、§3.1、§6.2、§8.1 | [共享 KV](implementation/SYCL_SHARED_KV.md)、[动态选块](implementation/SYCL_SELECTION.md)、[设备输入](implementation/SYCL_DEVICE_INPUTS.md)、[分块 prefill](implementation/SYCL_PREFILL.md) 与 [attention 完成事件](implementation/SYCL_NATIVE_COMPLETION.md) 贯通 prefill、decode、归档和后继预取 | 在实验环境核查双后端的数值、性能与多资源重叠 |
 
 prefill 的 GPU 分块方案属于长上下文工程补齐；论文 §7 对实现的 GPU kernel 分配仅给出合计。选择器的设备归属、算子拆分和后端差异需结合论文及可获取的作者实现进一步锁定。
 
 ## 4. 后续开发顺序与交付
 
-1. 接入 SYCL 设备 prefill 和 attention 完成事件，复核双后端的数据布局与同步。
-2. 在 CUDA attention 事件基础上完善 Q/KV 投影及其他传输的设备观测。
-3. 每项完成代码与检查后更新所属阶段记录，再进入模型及设备评测。
+1. 完善 Q/KV 投影及传输的设备观测，核查跨层资源依赖和任务成本。
+2. 每项完成代码与检查后更新所属阶段记录，再进入模型及设备评测。
 
 本机核查使用编译、合成张量、临时文件和错误注入。模型推理、性能、准确率与真实设备实验在实验环境执行。

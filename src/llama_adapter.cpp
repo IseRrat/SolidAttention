@@ -325,6 +325,12 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         q = ggml_permute(context, q, 0, 2, 1, 3);
         result = ggml_flash_attn_ext(context, q, keys, values, mask, impl_->scale, 0, 0);
         ggml_prec_set_acc(result, GGML_PREC_F32);
+#ifdef SOLID_HAVE_SYCL
+        if (scheduler && decode_backend && ggml_backend_is_sycl(decode_backend)) {
+            ggml_set_name(result, "solid_gathered_flash_attention");
+            on_device(result);
+        }
+#endif
         result = ggml_reshape_2d(context, result, g.dimension * impl_->session.query_heads(), 1);
         ggml_set_name(result, "solid_gathered_attention");
     }
@@ -451,8 +457,9 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
                                                     bool gathered, ggml_backend_t backend) {
     if (impl_->configure_prefill) {
         bool configured=false;
+        const auto & prefill=impl_->prefill_backend;
 #ifdef SOLID_HAVE_CUDA_SELECTION
-        if (backend && ggml_backend_is_cuda(backend)) {
+        if ((prefill=="auto" || prefill=="cuda") && backend && ggml_backend_is_cuda(backend)) {
             auto * registry=ggml_backend_cuda_reg();
             for (std::size_t ordinal=0;ordinal<ggml_backend_reg_dev_count(registry);++ordinal) {
                 if (ggml_backend_reg_dev_get(registry,ordinal)!=ggml_backend_get_device(backend)) continue;
@@ -462,7 +469,15 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
             }
         }
 #endif
-        if (!configured && impl_->prefill_backend=="cuda") throw std::runtime_error("CUDA prefill requires a CUDA build and CUDA attention backend");
+#ifdef SOLID_HAVE_SYCL
+        if ((prefill=="auto" || prefill=="sycl") && backend && ggml_backend_is_sycl(backend)) {
+            impl_->session->set_prefill(make_sycl_tiled_prefill(impl_->session->geometry(),impl_->session->query_heads(),
+                impl_->prefill_queries,impl_->prefill_tile_tokens,solid_sycl_queue(backend)));
+            configured=true;
+        }
+#endif
+        if (!configured && prefill=="cuda") throw std::runtime_error("CUDA prefill requires a CUDA build and CUDA attention backend");
+        if (!configured && prefill=="sycl") throw std::runtime_error("SYCL prefill requires a SYCL build and SYCL attention backend");
         impl_->configure_prefill=false;
     }
     if (impl_->configure_ranker) {

@@ -37,4 +37,6 @@ public:
 };
 std::unique_ptr<TiledPrefill> make_cuda_tiled_prefill(const KvGeometry & geometry, std::uint32_t query_heads,
                                                     std::uint32_t queries, std::uint32_t tile_tokens, int device);
+std::unique_ptr<TiledPrefill> make_sycl_tiled_prefill(const KvGeometry & geometry, std::uint32_t query_heads,
+                                                    std::uint32_t queries, std::uint32_t tile_tokens, void * backend_queue);
 } // namespace solid

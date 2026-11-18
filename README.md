@@ -2,7 +2,7 @@
 
 复现 FAST 2026 论文 **SolidAttention: Low-Latency SSD-based Serving on Memory-Constrained PCs**，在 llama.cpp 上实现 SSD KV cache、动态稀疏注意力、历史预取和计算/I/O 重叠。
 
-系统采用单请求 decode、INT4 模型权重与 FP16 KV cache。CUDA 路径覆盖 GPU 代表构造、动态选块、有界 prefill、历史预取及当前 KV 安装与异步归档。SYCL 路径已接入共享 KV、设备 Q/KV、GPU 选块与代表构造、逐 head 稀疏 decode 和独立复制队列。后续设备算子及跨层资源核查见 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md)。
+系统采用单请求 decode、INT4 模型权重与 FP16 KV cache。CUDA 与 SYCL 路径覆盖 GPU 代表构造、动态选块、有界 prefill、历史预取、当前 KV 安装与异步归档。支持共享分配的集成 GPU 使用共享 KV bank。后续设备计时与跨层资源核查见 [论文实现核查](docs/PAPER_IMPLEMENTATION_AUDIT.md)。
 
 ## 开发入口
 
@@ -43,6 +43,8 @@
 26. [SYCL 共享 KV](docs/implementation/SYCL_SHARED_KV.md)：集成 GPU 的共享 bank、逐 head mask decode 和构建入口。
 27. [SYCL 动态选块](docs/implementation/SYCL_SELECTION.md)：设备代表构造、逐 head 相关度和 token 预算归约。
 28. [SYCL 设备输入](docs/implementation/SYCL_DEVICE_INPUTS.md)：图内 Q/KV、当前行安装、独立复制队列与归档。
+29. [SYCL Prefill](docs/implementation/SYCL_PREFILL.md)：因果分块、批量代表与 decode 交接。
+30. [SYCL 完成通知](docs/implementation/SYCL_NATIVE_COMPLETION.md)：设备事件、epoch 和后继上传。
 
 ## 系统机制
 

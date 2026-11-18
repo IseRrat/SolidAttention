@@ -150,7 +150,7 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
             if (!solid::sycl_device_op(*ctx.stream(), dst)) return false;
             break;
         case GGML_OP_FLASH_ATTN_EXT:
-            if (solid::sycl_masked_decode_supported(dst)) solid::sycl_masked_decode(*ctx.stream(), dst);
+            if (solid::sycl_masked_decode_supported(dst)) solid::sycl_attention_decode(*ctx.stream(), dst);
             else ggml_sycl_flash_attn_ext(ctx, dst);
             break;''')
     anchor = '''            return op->src[5] == nullptr && ggml_sycl_flash_attn_ext_supported(device, op);'''
@@ -161,6 +161,15 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
     sycl = replace_once(sycl, anchor, '''        case GGML_OP_CUSTOM:
             return solid::device_op_supported(op);
 ''' + anchor)
+    anchor = '''        const ggml_op node_op = node->op;
+
+        if (!graph_node_is_in_local_device(device_buft, node))'''
+    sycl = replace_once(sycl, anchor, '''        const ggml_op node_op = node->op;
+
+        // SolidAttention publishes a fresh host notification for every launch.
+        if (solid::sycl_masked_decode_supported(node) || solid::device_op(node) != solid::DeviceOp::none) return false;
+
+        if (!graph_node_is_in_local_device(device_buft, node))''')
     destination.mkdir(parents=True, exist_ok=True)
     for name, text in (("llama-graph.cpp", graph), ("llama-context.cpp", context), ("ggml-backend.cpp", backend),
                        ("ggml-cuda.cu", cuda), ("ggml-sycl.cpp", sycl)):
