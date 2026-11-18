@@ -34,16 +34,18 @@ public:
         if (!factory_ || depth<2 || depth>16384 || cpu < -1) throw std::invalid_argument("invalid I/O worker settings");
         wake_=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
         if (wake_<0) throw std::system_error(errno,std::generic_category(),"create I/O worker wakeup");
+        results_=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
+        if (results_<0) { const auto error=errno; close(wake_); throw std::system_error(error,std::generic_category(),"create I/O result wakeup"); }
         try {
             thread_=std::thread(&IoWorker::run,this);
             std::unique_lock<std::mutex> lock(mutex_); cv_.wait(lock,[&] { return ready_; });
             if (error_) { const auto error=error_; lock.unlock(); thread_.join(); std::rethrow_exception(error); }
-        } catch (...) { if (thread_.joinable()) thread_.join(); close(wake_); throw; }
+        } catch (...) { if (thread_.joinable()) thread_.join(); close(wake_); close(results_); throw; }
     }
     ~IoWorker() override {
         try { drain(); } catch (...) {}
         { std::lock_guard<std::mutex> lock(mutex_); stopping_=true; }
-        notify(); thread_.join(); close(wake_);
+        notify(); thread_.join(); close(wake_); close(results_);
     }
     bool submit(std::uint64_t id,int fd,void * destination,std::size_t bytes,std::uint64_t offset) override {
         return submit_prioritized(id,fd,destination,bytes,offset,ReadPriority::deterministic);
@@ -100,21 +102,24 @@ public:
     }
     AsyncIoStats stats() const override { std::lock_guard<std::mutex> lock(mutex_); return stats_; }
     void rethrow_failure() const override { std::lock_guard<std::mutex> lock(mutex_); if (error_) std::rethrow_exception(error_); }
+    int completion_handle() const override { return results_; }
+    void acknowledge_notifications() override { consume(results_); }
 private:
     void check() const { if (error_) std::rethrow_exception(error_); if (ended_ || stopping_) throw std::runtime_error("I/O worker stopped"); }
-    void notify() noexcept {
+    void notify() noexcept { signal(wake_); }
+    void signal(int fd) noexcept {
         std::uint64_t value=1;
         for (;;) {
-            const auto written=write(wake_,&value,sizeof(value));
+            const auto written=write(fd,&value,sizeof(value));
             if (written==static_cast<ssize_t>(sizeof(value)) || (written<0 && errno==EAGAIN)) return;
             if (written<0 && errno==EINTR) continue;
             std::terminate();
         }
     }
-    void clear_wakeup() {
+    void consume(int fd) {
         std::uint64_t value;
         for (;;) {
-            const auto read_bytes=read(wake_,&value,sizeof(value));
+            const auto read_bytes=read(fd,&value,sizeof(value));
             if (read_bytes==static_cast<ssize_t>(sizeof(value))) continue;
             if (read_bytes<0 && errno==EINTR) continue;
             if (read_bytes<0 && errno==EAGAIN) return;
@@ -140,7 +145,8 @@ private:
                 // Consume notification counters BEFORE inspecting their queues.
                 // A completion/command arriving after the queue check keeps a
                 // pending counter and wakes poll(), including cancellation CQEs.
-                clear_wakeup(); reader->acknowledge_notifications();
+                consume(wake_); reader->acknowledge_notifications();
+                bool delivered=false;
                 std::vector<std::uint64_t> cancel;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
@@ -149,6 +155,7 @@ private:
                         if (request.phase==Phase::queued && request.cancelled) {
                             request.phase=Phase::complete; ++queued_cancellations_;
                             completed_.push_back({item.first,-ECANCELED});
+                            delivered=true;
                         } else if (request.phase==Phase::active && request.cancelled && !request.cancel_sent) {
                             request.cancel_sent=true; cancel.push_back(item.first);
                         }
@@ -173,7 +180,6 @@ private:
                 }
                 reader->flush();
                 ReadCompletion completion{};
-                bool delivered=false;
                 while (reader->poll(completion,false)) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     const auto found=requests_.find(completion.id);
@@ -181,7 +187,7 @@ private:
                     found->second.phase=Phase::complete; completed_.push_back(completion);
                     delivered=true;
                 }
-                snapshot(*reader); cv_.notify_all();
+                snapshot(*reader); if (delivered) signal(results_); cv_.notify_all();
                 bool quiesce=false,stop=false,queued=false;
                 std::uint64_t epoch=0;
                 {
@@ -214,12 +220,13 @@ private:
             // First confirm all kernel writers have stopped, then report it.
             try { if (reader) reader->drain(); } catch (...) { std::terminate(); }
             { std::lock_guard<std::mutex> lock(mutex_); error_=error; ready_=true; ended_=true; safe_=true; }
+            signal(results_);
             cv_.notify_all();
         }
     }
     std::function<std::unique_ptr<AsyncReader>()> factory_;
     std::uint32_t depth_;
-    int cpu_,wake_=-1;
+    int cpu_,wake_=-1,results_=-1;
     mutable std::mutex mutex_;
     std::condition_variable cv_;
     std::thread thread_;

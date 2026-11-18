@@ -73,6 +73,8 @@ public:
     PrefetchStats stats() const;
     std::uint32_t slots_per_head() const { return slots_.slots_per_head(); }
     std::optional<std::uint32_t> active_layer() const { return layer_; }
+    int completion_handle() const { return reader_->completion_handle(); }
+    bool pending_reads() const { return !requests_.empty() || !queued_.empty(); }
 private:
     struct Job { SlotLease lease; KvReadSegment segment; ReadDispatch dispatch; };
     struct ReadStage { SlotLease lease; std::shared_ptr<BlockStage> stage; };

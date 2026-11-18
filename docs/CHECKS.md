@@ -154,3 +154,9 @@ CUDA 编译与链接、37 项 CTest、60 项 Linux Python 检查及源码指纹�
 CUDA 编译与链接、38 项 CTest、61 项 Linux Python 检查及源码指纹通过。核心库 11 项 CTest 的地址、泄漏和未定义行为检查通过。
 
 容量 1 的实际提交偏移核对关键路径/LST 对顺序的影响；覆盖两段 K/V、复制票据、空历史、上传和读取交错失败及回收。三组 CPU GGML 图、内存/线程化 liburing 的两级轨迹与指标独立重算。离线核查拒绝取消 ACK、复制提交、缺失汇合及错位父层帧。完成记录见 [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md)。
+
+## 2026-11-18：CUDA attention 原生完成事件
+
+CUDA 挂钩、原生事件及图重放设备程序编译与链接通过；42 项 CTest、62 项 Linux Python 检查及含 `.cuh` 的源码指纹通过。核心库 12 项 CTest 的地址、泄漏和未定义行为检查通过。
+
+CPU 合成图核对设备完成协议、FFN 等待期间下一层 H2D、正式选择接管、取消等待、错误传播及数值。受控 liburing 保持预测读取完成通知在途，正式选择可先接管。四组执行路径的层图、块图、设备区间与计数独立重算。实验环境的 CUDA 重放入口及生命周期证据见 [原生完成事件](implementation/NATIVE_COMPLETION.md)。

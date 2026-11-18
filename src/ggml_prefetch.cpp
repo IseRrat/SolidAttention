@@ -2,19 +2,47 @@
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
+#ifdef SOLID_HAVE_CUDA_SELECTION
+#include "ggml-cuda.h"
+#endif
 #include <limits>
 #include <map>
 #include <array>
 #include <cstring>
 #include <mutex>
 #include <stdexcept>
+#include <thread>
+#ifdef __linux__
+#include <poll.h>
+#include <cerrno>
+#include <system_error>
+#endif
 
 namespace solid {
 namespace {
+std::unique_ptr<AttentionEvents> attention_events(AttentionSession & session,ggml_backend_t backend,ScheduleMode mode,
+                                                  std::unique_ptr<AttentionEvents> supplied) {
+    if (supplied) {
+        if (mode!=ScheduleMode::sync_reuse) throw std::invalid_argument("device completion requires sync_reuse scheduling");
+        return supplied;
+    }
+#ifdef SOLID_HAVE_CUDA_SELECTION
+    if (mode==ScheduleMode::sync_reuse && ggml_backend_is_cuda(backend)) {
+        auto * registry=ggml_backend_cuda_reg();
+        for (std::size_t ordinal=0;ordinal<ggml_backend_reg_dev_count(registry);++ordinal)
+            if (ggml_backend_reg_dev_get(registry,ordinal)==ggml_backend_get_device(backend))
+                return make_cuda_attention_events(session.geometry().layers,static_cast<int>(ordinal));
+        throw std::runtime_error("CUDA attention completion device identity mismatch");
+    }
+#else
+    (void) session; (void) backend; (void) mode;
+#endif
+    return {};
+}
 class GgmlTransport final : public DeviceTransport {
 public:
-    GgmlTransport(ggml_backend_t backend, KvGeometry geometry, std::uint32_t per_head, ScheduleMode mode) :
-        backend_(backend), geometry_(geometry), per_head_(per_head) {
+    GgmlTransport(ggml_backend_t backend, KvGeometry geometry, std::uint32_t per_head, ScheduleMode mode,AttentionEvents * native) :
+        backend_(backend), geometry_(geometry), per_head_(per_head),native_(native) {
         if (!backend || geometry.layout != KvLayout::interleaved) throw std::invalid_argument("invalid GGML prefetch transport");
         const auto tokens = (static_cast<std::uint64_t>(per_head) * geometry.block_tokens + 31) / 32 * 32;
         if (tokens > INT32_MAX || tokens * geometry.heads > static_cast<std::uint64_t>(INT64_MAX) / (2ull * geometry.dimension * sizeof(Half))) {
@@ -84,7 +112,12 @@ public:
     bool complete(std::uint64_t ticket, bool wait) override {
         const auto found = events_.find(ticket);
         if (found == events_.end()) throw std::logic_error("unknown upload ticket");
-        if (found->second && ticket > completed_through_ && !wait) return false;
+        if (found->second && ticket > completed_through_ && !wait) {
+            if (!native_) return false;
+            ++stats_.copy_event_queries;
+            if (!native_->copy_ready(found->second)) return false;
+            completed_through_=ticket;
+        }
         if (found->second) {
             if (ticket > completed_through_) { ggml_backend_event_synchronize(found->second); ++stats_.event_waits; }
             ggml_backend_event_free(found->second);
@@ -125,6 +158,7 @@ private:
     std::uint64_t next_ = 1;
     std::uint64_t completed_through_ = 0;
     ScheduleStats stats_;
+    AttentionEvents * native_;
 };
 }
 namespace {
@@ -169,6 +203,7 @@ struct GgmlPrefetch::Impl {
     mutable std::mutex mutex;
     ScheduleTrace trace;
     ScheduleTrace block_trace;
+    std::unique_ptr<AttentionEvents> events;
     GgmlTransport transport;
     DeviceCache device;
     ScheduleStats totals;
@@ -178,11 +213,14 @@ struct GgmlPrefetch::Impl {
     std::uint64_t sequence = 0;
     bool quiesced = true;
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
-          const std::filesystem::path & schedule,int cpu) :
+          const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied) :
         session(s), mode(mode), worker(cpu), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
             schedule.parent_path()/(schedule.stem().string()+".blocks"+schedule.extension().string())),
-        transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode),
-        device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) { estimates.fill(1); totals.coordinator_cpu=cpu; }
+        events(attention_events(s,backend,mode,std::move(supplied))),
+        transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode,events.get()),
+        device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) {
+        estimates.fill(1); totals.coordinator_cpu=cpu; totals.completion_backend=events?events->name():"graph_boundaries";
+    }
     std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position) {
         if (work && !work->dag.finished()) throw std::logic_error("new layer started before previous completion proof");
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
@@ -190,9 +228,9 @@ struct GgmlPrefetch::Impl {
         work->dag.fence({q_ready,q_d2h}, trace.now(), "query_download_complete");
         return work;
     }
-    void finish_frame(const std::string & proof) {
+    void finish_frame(const std::string & proof,std::optional<std::uint64_t> device_ns={}) {
         if (!work || work->dag.task(attention).state != TaskState::running) throw std::logic_error("attention lacks a scheduled start");
-        work->dag.complete(attention, trace.now(), proof);
+        work->dag.complete(attention, trace.now(), proof,device_ns);
         if (!work->dag.finished()) throw std::logic_error("layer completed with unfinished microtasks");
         ++totals.frames; totals.tasks += work->dag.size();
         totals.critical_path_ns += work->dag.critical_path_ns();
@@ -221,23 +259,68 @@ struct GgmlPrefetch::Impl {
         session.begin_prefetch(next, position);
         current->dag.complete(next_prefetch, trace.now());
     }
-    void release_attention(const char * proof) {
+    void release_attention(const char * proof,std::optional<std::uint64_t> device_ns={}) {
         if (!device.attention_pending()) return;
         if (device.attention_complete(device.attention_epoch())) {
-            finish_frame(proof);
+            finish_frame(proof,device_ns);
             session.prefetcher().poll(); device.prefetch_ready();
+        }
+    }
+    void progress_after_attention(const std::shared_ptr<LayerWork> & current,std::uint64_t epoch) {
+        if (!events) return;
+        bool released=false;
+        auto & host=session.prefetcher();
+        while (!events->stopped()) {
+            // Clear notifications before inspecting queues/state. A producer
+            // arriving after these checks leaves a counter for the next wait.
+            events->acknowledge(); host.poll();
+            if (!released) if (const auto receipt=events->poll(current->layer,epoch)) {
+                const char * proof;
+                if (receipt->proof==AttentionProof::device_signal) {
+                    ++totals.device_event_completions; totals.device_attention_ns+=receipt->device_ns;
+                    proof="attention_device_event";
+                } else {
+                    ++totals.device_boundary_fallbacks;
+                    if (receipt->proof==AttentionProof::query_boundary) { ++totals.query_reused_fences; proof="query_dependency_reuse"; }
+                    else { ++totals.process_reused_fences; proof="process_synchronize_reuse"; }
+                }
+                const auto before=device.stats().uploads;
+                release_attention(proof,receipt->proof==AttentionProof::device_signal?std::optional<std::uint64_t>{receipt->device_ns}:std::nullopt); released=true;
+                if (!events->boundary_seen(epoch)) totals.uploads_before_boundary+=device.stats().uploads-before;
+            }
+            if (released) {
+                // Give formal correction the coordinator as soon as its query
+                // reaches the CPU. Remaining predicted SSD jobs stay queued.
+                if (events->boundary_seen(epoch)) return;
+                if (host.pending_reads() && host.completion_handle()<0) host.poll(true);
+                const auto before=device.stats().uploads;
+                device.prefetch_ready();
+                if (!events->boundary_seen(epoch)) totals.uploads_before_boundary+=device.stats().uploads-before;
+                if (!host.pending_reads()) return;
+            }
+#ifdef __linux__
+            pollfd descriptors[2]={{events->completion_handle(),POLLIN,0},{host.completion_handle(),POLLIN,0}};
+            int status;
+            do { status=::poll(descriptors,2,10); } while (status<0 && errno==EINTR);
+            if (status<0) throw std::system_error(errno,std::generic_category(),"wait for attention or prefetch completion");
+            for (const auto & descriptor:descriptors) if (descriptor.revents&(POLLERR|POLLHUP|POLLNVAL)) throw std::runtime_error("device completion notification failed");
+#else
+            std::this_thread::sleep_for(std::chrono::milliseconds(1));
+#endif
         }
     }
 };
 GgmlPrefetch::GgmlPrefetch(AttentionSession & session, ggml_backend_t backend, const std::filesystem::path & trace,
-                          ScheduleMode mode, const std::filesystem::path & schedule_trace,int cpu) :
-    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace,cpu)) {}
+                          ScheduleMode mode, const std::filesystem::path & schedule_trace,int cpu,std::unique_ptr<AttentionEvents> events) :
+    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace,cpu,std::move(events))) {}
 GgmlPrefetch::~GgmlPrefetch() { if (!impl_->quiesced) { try { quiesce(); } catch (...) {} } }
 ggml_tensor * GgmlPrefetch::tensor() const { return impl_->transport.tensor(); }
 std::uint32_t GgmlPrefetch::tokens_per_head() const { return impl_->device.tokens_per_head(); }
 std::uint64_t GgmlPrefetch::attention_epoch() const { return impl_->device.attention_epoch(); }
 bool GgmlPrefetch::early_enabled() const { return impl_->mode != ScheduleMode::naive; }
 bool GgmlPrefetch::reuses_sync() const { return impl_->mode == ScheduleMode::sync_reuse; }
+StreamCompletionToken * GgmlPrefetch::completion_token(std::uint32_t layer) const { return impl_->events?impl_->events->token(layer):nullptr; }
+bool GgmlPrefetch::completion_host_marker() const { return impl_->events && impl_->events->host_marker(); }
 void GgmlPrefetch::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -245,12 +328,20 @@ void GgmlPrefetch::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
 }
 void GgmlPrefetch::select_early(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, bool covers) {
     if (!early_enabled()) throw std::logic_error("early selection is disabled");
+    if (impl_->events) {
+        if (covers) impl_->events->boundary(AttentionProof::query_boundary);
+        else impl_->events->stop();
+    }
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->quiesced = false;
     if (impl_->device.attention_pending()) {
         if (reuses_sync() && covers) { ++impl_->totals.query_reused_fences; impl_->release_attention("query_dependency_reuse"); }
-        else { impl_->transport.synchronize_compute(); ++impl_->totals.fallback_fences; impl_->release_attention("explicit_fallback"); }
+        else {
+            impl_->transport.synchronize_compute();
+            if (impl_->events) impl_->events->retire_after_sync();
+            ++impl_->totals.fallback_fences; impl_->release_attention("explicit_fallback");
+        }
     }
     impl_->session.begin_prefetch(layer, position);
     const auto work = impl_->new_work(layer, position);
@@ -325,6 +416,8 @@ std::vector<Half> GgmlPrefetch::decode(std::uint32_t layer, std::uint64_t positi
     catch (...) { for (const auto & lease : leases) host.unpin(lease); throw; }
     for (const auto & lease : leases) host.unpin(lease);
     work->consumed = true;
+    const auto epoch=impl_->device.attention_epoch();
+    if (impl_->events) impl_->events->arm(layer,epoch);
     if (!early_enabled()) {
         work->dag.complete(current_h2d, impl_->trace.now(), "serial_upload_complete");
         work->dag.start(attention, impl_->trace.now());
@@ -337,7 +430,7 @@ std::vector<Half> GgmlPrefetch::decode(std::uint32_t layer, std::uint64_t positi
             work->dag.start(attention, impl_->trace.now());
         }
         ++impl_->totals.worker_jobs;
-        impl_->worker.submit([this, work] {
+        impl_->worker.submit([this, work,epoch] {
             std::lock_guard<std::mutex> lock(impl_->mutex);
             if (reuses_sync()) {
                 impl_->device.wait_transfers_coalesced();
@@ -356,11 +449,14 @@ std::vector<Half> GgmlPrefetch::decode(std::uint32_t layer, std::uint64_t positi
                     work->dag.complete(store_task, impl_->trace.now());
                 }
             }
+            impl_->progress_after_attention(work,epoch);
         });
     }
     return mask;
 }
 void GgmlPrefetch::completed(std::uint64_t epoch) {
+    if (impl_->events && epoch!=impl_->device.attention_epoch()) return;
+    if (impl_->events) impl_->events->boundary(AttentionProof::process_boundary,epoch);
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->device.attention_pending() && epoch == impl_->device.attention_epoch()) {
@@ -368,17 +464,20 @@ void GgmlPrefetch::completed(std::uint64_t epoch) {
     }
 }
 void GgmlPrefetch::process_complete() {
+    if (impl_->events) impl_->events->boundary(AttentionProof::process_boundary);
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->device.attention_pending()) { ++impl_->totals.process_reused_fences; impl_->release_attention("process_synchronize_reuse"); }
 }
 void GgmlPrefetch::quiesce() {
     if (impl_->quiesced) return;
+    if (impl_->events) impl_->events->stop();
     std::exception_ptr error;
     try { impl_->worker.join(); } catch (...) { error = std::current_exception(); }
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->transport.synchronize_compute(); impl_->transport.drain();
-    try { impl_->device.wait_transfers(); } catch (...) { error = std::current_exception(); }
+    if (impl_->events) impl_->events->retire_after_sync();
+    try { impl_->device.wait_transfers(); } catch (...) { if (!error) error = std::current_exception(); }
     try {
         if (impl_->device.attention_pending()) (void) impl_->device.attention_complete(impl_->device.attention_epoch());
     } catch (...) { if (!error) error = std::current_exception(); }
@@ -403,6 +502,7 @@ ScheduleStats GgmlPrefetch::schedule_stats() const {
     result.stream_waits = transport.stream_waits; result.staging_bytes = transport.staging_bytes;
     result.backend_drains = transport.backend_drains; result.backend_compute_waits = transport.backend_compute_waits;
     result.batch_groups = transport.batch_groups; result.events_coalesced = transport.events_coalesced;
+    result.copy_event_queries=transport.copy_event_queries;
     return result;
 }
 } // namespace solid

@@ -16,6 +16,15 @@
 
 using namespace test_prefetch;
 namespace {
+class Events final:public solid::AttentionEvents {
+public:
+    explicit Events(std::uint32_t layers):AttentionEvents(layers) {}
+    bool copy_ready(ggml_backend_event *) const override { return true; }
+    bool host_marker() const override { return true; }
+    const char * name() const override { return "cpu_protocol"; }
+protected:
+    std::uint64_t elapsed_ns(std::uint32_t) const override { return 7; }
+};
 struct Observer {
     solid::GgmlPrefetch * device;
     std::uint32_t completions = 0;
@@ -47,7 +56,7 @@ struct OverlapBarrier {
         std::memcpy(dst->data, dst->src[0]->data, ggml_nbytes(dst));
     }
 };
-void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces, bool builder) {
+void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces, bool builder,bool native) {
     constexpr int dimension = 128, kv_heads = 2, query_heads = 4;
     const solid::KvGeometry geometry{2, kv_heads, dimension, 2, 32, 64, solid::KvLayout::interleaved};
     const solid::SparseBudget budget{6, 1, 1, 1};
@@ -91,7 +100,8 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     const auto directory = traces.empty() ? std::filesystem::path{} : traces / (disk ? "uring" : "memory");
     if (!directory.empty()) std::filesystem::create_directory(directory);
     solid::GgmlPrefetch device(session, backend.get(), directory.empty() ? std::filesystem::path{} : directory / "residency.jsonl",
-        mode, directory.empty() ? std::filesystem::path{} : directory / "schedule.jsonl");
+        mode, directory.empty() ? std::filesystem::path{} : directory / "schedule.jsonl",-1,
+        native?std::make_unique<Events>(geometry.layers):nullptr);
     std::unique_ptr<ggml_context, decltype(&ggml_free)> context(ggml_init({4 * 1024 * 1024, nullptr, true}), ggml_free);
     auto * q = ggml_new_tensor_3d(context.get(), GGML_TYPE_F32, dimension, query_heads, 1);
     ggml_set_input(q);
@@ -161,7 +171,9 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     require(stats.frames == 12 && stats.tasks == 144, "microtask frames not fully completed");
     require(mode==solid::ScheduleMode::naive ? stats.block_frames==0 : stats.block_frames==12 && stats.block_tasks>12,
             "historical block DAG not completed through actual copy receipts");
-    if (mode == solid::ScheduleMode::sync_reuse) require(stats.query_reused_fences == 6 && stats.process_reused_fences == 6 && stats.attention_fences == 0,
+    if (native) require(stats.device_event_completions==12 && stats.device_attention_ns==84 && stats.device_boundary_fallbacks==0 &&
+        stats.query_reused_fences==0 && stats.process_reused_fences==0 && observer.completions==0,"native completion did not replace graph boundary fences");
+    else if (mode == solid::ScheduleMode::sync_reuse) require(stats.query_reused_fences == 6 && stats.process_reused_fences == 6 && stats.attention_fences == 0,
         "sync reuse did not remove per-attention host fences");
     else require(observer.completions == 12, "scheduler failed to confirm each layer's attention completion");
     if (controlled) require(stats.miss_projection_overlap_ns > 0, "missing I/O and KV projection did not overlap");
@@ -174,7 +186,8 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         output << nlohmann::json({{"frames", stats.frames}, {"tasks", stats.tasks}, {"critical_path_ns", stats.critical_path_ns},
             {"miss_projection_overlap_ns", stats.miss_projection_overlap_ns}, {"query_reused_fences", stats.query_reused_fences},
             {"process_reused_fences", stats.process_reused_fences}, {"attention_fences", stats.attention_fences},
-            {"fallback_fences", stats.fallback_fences}}).dump();
+            {"fallback_fences", stats.fallback_fences},{"device_event_completions",stats.device_event_completions},
+            {"device_attention_ns",stats.device_attention_ns}}).dump();
         require(output.good(), "graph trace stats write failed");
         std::ofstream blocks(directory/"block-stats.json");
         blocks<<nlohmann::json({{"block_frames",stats.block_frames},{"block_tasks",stats.block_tasks},
@@ -186,11 +199,17 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
 int main(int argc, char ** argv) {
     try {
         const auto mode = solid::parse_schedule_mode(argc > 1 ? argv[1] : "naive");
-        const bool builder = argc > 2 && std::string(argv[2]) == "--builder";
-        const auto index = builder ? 3 : 2;
+        bool builder=false,native=false;
+        int index=2;
+        for (;index<argc && std::string(argv[index]).rfind("--",0)==0;++index) {
+            const std::string option=argv[index];
+            if (option=="--builder") builder=true;
+            else if (option=="--native-events") native=true;
+            else throw std::invalid_argument("unknown graph check option");
+        }
         const std::filesystem::path traces = argc > index ? argv[index] : "";
-        run(false, mode, traces, builder);
-        if (solid::uring_available()) run(true, mode, traces, builder);
+        run(false, mode, traces, builder,native);
+        if (solid::uring_available()) run(true, mode, traces, builder,native);
         std::cout << "multi-layer prefetch, liburing, GQA slot masks and CPU Flash Attention parity passed\n";
         return 0;
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }

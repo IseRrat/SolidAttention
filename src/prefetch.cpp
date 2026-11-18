@@ -189,6 +189,7 @@ void Prefetcher::retire(const SlotLease & lease) {
 }
 void Prefetcher::poll(bool wait) {
     const auto start = std::chrono::steady_clock::now();
+    reader_->acknowledge_notifications();
     pump();
     ReadCompletion completion{};
     bool first = true;

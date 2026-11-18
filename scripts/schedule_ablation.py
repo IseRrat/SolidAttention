@@ -72,6 +72,10 @@ def audit_schedule(path, mode, *, blocks=False):
             if task["state"] != "running" or now < task["start"]:
                 raise ValueError("invalid schedule completion")
             task.update(state="complete", end=now, fence=item["fence"])
+            if "device_ns" in item:
+                if blocks or task["name"]!="attention_until_boundary" or item["fence"]!="attention_device_event":
+                    raise ValueError("device interval lacks a matching attention event proof")
+                task["device_ns"]=integer(item["device_ns"])
         else:
             raise ValueError("failed or unknown schedule event")
     if len(origins) > 1:
@@ -79,9 +83,9 @@ def audit_schedule(path, mode, *, blocks=False):
     if blocks:
         return audit_block_frames(frames)
     totals = {"frames": len(frames), "tasks": 0, "critical_path_ns": 0, "miss_projection_overlap_ns": 0,
-              "query_reused_fences": 0, "process_reused_fences": 0, "attention_fences": 0, "fallback_fences": 0}
+              "query_reused_fences": 0, "process_reused_fences": 0, "attention_fences": 0, "fallback_fences": 0,"device_event_completions":0,"device_attention_ns":0}
     proofs = {"query_dependency_reuse": "query_reused_fences", "process_synchronize_reuse": "process_reused_fences",
-              "attention_backend_complete": "attention_fences", "explicit_fallback": "fallback_fences"}
+              "attention_backend_complete": "attention_fences", "explicit_fallback": "fallback_fences", "attention_device_event":"device_event_completions"}
     identities = set()
     for frame in frames.values():
         tasks = frame["tasks"]
@@ -122,8 +126,11 @@ def audit_schedule(path, mode, *, blocks=False):
         totals["miss_projection_overlap_ns"] += max(0, min(miss["end"], kv["end"]) - max(miss["start"], kv["start"]))
         proof = names["attention_until_boundary"]["fence"]
         if proof not in proofs: raise ValueError("attention completion lacks a known proof")
-        if mode != "overlap+sync_reuse" and proof == "query_dependency_reuse":
+        if mode != "overlap+sync_reuse" and proof in ("query_dependency_reuse","attention_device_event"):
             raise ValueError("query reuse proof in a mode that requires attention completion")
+        if proof=="attention_device_event":
+            if "device_ns" not in names["attention_until_boundary"]: raise ValueError("native attention completion lacks device timing")
+            totals["device_attention_ns"]+=names["attention_until_boundary"]["device_ns"]
         totals[proofs[proof]] += 1
     return totals
 
@@ -251,7 +258,7 @@ def report(manifest_path, atol=1e-3, rtol=1e-4):
         for key, actual in audit.items():
             metric = {"critical_path_ns": "observed_critical_path_sum_ms",
                       "miss_projection_overlap_ns": "miss_projection_overlap_sum_ms",
-                      "block_critical_path_ns": "block_observed_critical_path_sum_ms"}.get(key, key)
+                      "block_critical_path_ns": "block_observed_critical_path_sum_ms","device_attention_ns":"device_attention_event_ms"}.get(key, key)
             expected = actual / 1e6 if key.endswith("_ns") else actual
             observed = recorded[metric]
             if type(observed) not in (int, float) or not math.isfinite(observed) or not math.isclose(observed, expected, rel_tol=1e-9, abs_tol=1e-8):

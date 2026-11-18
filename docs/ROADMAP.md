@@ -6,7 +6,7 @@
 
 当前阶段记录描述首版代码及其检查结果。论文核心路径的后续开发见 [论文实现核查](PAPER_IMPLEMENTATION_AUDIT.md)：设备 Q/K 直接接入、块级事件调度、设备完成观测及 SYCL。先完成这些代码，再推进正式评测与阶段 6。
 
-已完成的核心补齐：[CUDA 块评分与动态选块](implementation/GPU_SELECTION.md)、[CUDA 窗口代表构造](implementation/GPU_REPRESENTATIVES.md)、[有界 GPU 分块 prefill](implementation/GPU_PREFILL.md)。[独立 I/O 与协调线程](implementation/IO_WORKERS.md) 也已完成。[历史块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 已接入正式工作集。后续推进预测期与跨层调度、设备事件及设备 Q/K 直接接入。
+已完成的核心补齐：[CUDA 块评分与动态选块](implementation/GPU_SELECTION.md)、[CUDA 窗口代表构造](implementation/GPU_REPRESENTATIVES.md)、[有界 GPU 分块 prefill](implementation/GPU_PREFILL.md)。[独立 I/O 与协调线程](implementation/IO_WORKERS.md) 也已完成。[历史块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md) 已接入正式工作集。[CUDA attention 完成事件](implementation/NATIVE_COMPLETION.md) 已驱动后继上传。后续推进预测期任务图、设备 Q/K 直接接入及其他算子/传输事件。
 
 ## 阶段 0：上游与原版基线
 

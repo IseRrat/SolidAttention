@@ -126,6 +126,17 @@ class LauncherTests(unittest.TestCase):
             with self.assertRaisesRegex(ValueError, "different source"):
                 launcher.verify_build_info(info, root)
             kernel.write_text("kernel")
+            (root/"include/solid").mkdir(parents=True)
+            header=root/"include/solid/completion.cuh"
+            header.write_text("completion hook")
+            with self.assertRaisesRegex(ValueError,"build inputs differ"):
+                launcher.verify_build_info(info,root)
+            info["source_files"]["include/solid/completion.cuh"]=launcher.digest(header)
+            launcher.verify_build_info(info,root)
+            header.write_text("changed hook")
+            with self.assertRaisesRegex(ValueError,"different source"):
+                launcher.verify_build_info(info,root)
+            header.write_text("completion hook")
             source.write_text("changed")
             with self.assertRaisesRegex(ValueError, "different source"):
                 launcher.verify_build_info(info, root)

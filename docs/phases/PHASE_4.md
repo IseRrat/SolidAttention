@@ -1,6 +1,6 @@
 # 阶段 4：微任务调度
 
-首版代码与合成数据检查完成于 2026-11-17。依据为 SolidAttention §6、图 11 和算法 1。当前由 GGML 固定图推进计算，worker 重叠执行历史补读，并在回写和下一层预取之间应用关键路径/LST 优先级。2026-11-18 已加入 [正式历史工作集的块级 READ/H2D 图](../implementation/BLOCK_EVENT_SCHEDULER.md)，由关键路径/LST 和复制票据驱动。后续接入预测期读取、D2H/回写及跨层事件，补齐路径见 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md)。
+首版代码与合成数据检查完成于 2026-11-17。依据为 SolidAttention §6、图 11 和算法 1。当前由 GGML 固定图推进计算，worker 重叠执行历史补读，并在回写和下一层预取之间应用关键路径/LST 优先级。2026-11-18 已加入 [正式历史工作集的块级 READ/H2D 图](../implementation/BLOCK_EVENT_SCHEDULER.md)，由关键路径/LST 和复制票据驱动。2026-11-18 已接入 [CUDA attention 原生完成事件](../implementation/NATIVE_COMPLETION.md)，驱动后继上传和 Q 边界交接。后续接入预测期读取、D2H/回写及其他设备任务，补齐路径见 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md)。
 
 ## 1. 交付与代码入口
 

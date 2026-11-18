@@ -42,4 +42,4 @@ CUDA 编译与链接、37 项 CTest、59 项 Linux Python 检查及源码指纹�
 
 [uring_test.cpp](../../tests/uring_test.cpp) 在微小临时文件上分别检查直接与线程化 liburing 的短读、EOF、取消及 drain。[prefetch_graph_test.cpp](../../tests/prefetch_graph_test.cpp) 的磁盘路径使用独立 I/O 线程，三种调度模式与 GPU 代表协议模拟路径均与同步 CPU 数值参考核对。配置工具覆盖线程设置保留及消融转换。
 
-本机检查使用 CPU 合成张量和微小临时文件。GPU 执行、模型及性能评测在实验环境进行。块级资源队列和设备 attention 完成事件继续按 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md) 推进。
+本机检查使用 CPU 合成张量和微小临时文件。GPU 执行、模型及性能评测在实验环境进行。[CUDA attention 完成事件](NATIVE_COMPLETION.md) 已接入协调唤醒及后继上传；预测期与回写任务继续按 [论文实现核查](../PAPER_IMPLEMENTATION_AUDIT.md) 推进。

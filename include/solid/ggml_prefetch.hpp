@@ -2,6 +2,7 @@
 #include "solid/device_cache.hpp"
 #include "solid/session.hpp"
 #include "solid/scheduler.hpp"
+#include "solid/attention_events.hpp"
 
 struct ggml_backend;
 struct ggml_tensor;
@@ -9,7 +10,8 @@ namespace solid {
 class GgmlPrefetch {
 public:
     GgmlPrefetch(AttentionSession & session, ggml_backend * backend, const std::filesystem::path & trace = {},
-                 ScheduleMode mode = ScheduleMode::naive, const std::filesystem::path & schedule_trace = {},int coordinator_cpu=-1);
+                 ScheduleMode mode = ScheduleMode::naive, const std::filesystem::path & schedule_trace = {},int coordinator_cpu=-1,
+                 std::unique_ptr<AttentionEvents> events = {});
     ~GgmlPrefetch();
     ggml_tensor * tensor() const;
     std::uint32_t tokens_per_head() const;
@@ -20,6 +22,8 @@ public:
     void process_complete();
     bool early_enabled() const;
     bool reuses_sync() const;
+    StreamCompletionToken * completion_token(std::uint32_t layer) const;
+    bool completion_host_marker() const;
     void select_early(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, bool query_covers_attention);
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);
     ScheduleStats schedule_stats() const;

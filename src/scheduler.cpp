@@ -57,10 +57,12 @@ void ScheduleTrace::define(std::uint64_t frame, std::uint32_t layer, std::uint64
         {"predecessors", spec.predecessors}, {"estimate_ns", spec.estimate_ns}, {"origin_ns", origin_}, {"clock", "steady_clock_ns"}}).dump() << '\n';
     if (!stream_) throw std::runtime_error("schedule trace write failed");
 }
-void ScheduleTrace::event(std::uint64_t frame, std::uint32_t task, const char * name, std::uint64_t time, const std::string & fence) {
+void ScheduleTrace::event(std::uint64_t frame, std::uint32_t task, const char * name, std::uint64_t time, const std::string & fence,std::optional<std::uint64_t> device_ns) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!stream_.is_open()) return;
-    stream_ << nlohmann::json({{"event", name}, {"frame", frame}, {"task", task}, {"timestamp_ns", time}, {"fence", fence}}).dump() << '\n';
+    nlohmann::json record={{"event", name}, {"frame", frame}, {"task", task}, {"timestamp_ns", time}, {"fence", fence}};
+    if (device_ns) record["device_ns"]=*device_ns;
+    stream_ << record.dump() << '\n';
     if (!stream_) throw std::runtime_error("schedule trace write failed");
 }
 void ScheduleTrace::flush() {
@@ -137,12 +139,12 @@ void TaskDag::start(std::uint32_t id, std::uint64_t now,const std::string & proo
     record.start_ns = now; record.state = TaskState::running;
     if (trace_) trace_->event(frame_, id, "start", now,proof);
 }
-void TaskDag::complete(std::uint32_t id, std::uint64_t now, const std::string & proof) {
+void TaskDag::complete(std::uint32_t id, std::uint64_t now, const std::string & proof,std::optional<std::uint64_t> device_ns) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     auto & record = tasks_.at(id);
     if (record.state != TaskState::running || now < record.start_ns) throw std::logic_error("invalid task completion");
-    record.end_ns = now; record.state = TaskState::complete;
-    if (trace_) trace_->event(frame_, id, "complete", now, proof);
+    record.end_ns = now; record.state = TaskState::complete; record.device_ns=device_ns;
+    if (trace_) trace_->event(frame_, id, "complete", now, proof,device_ns);
 }
 void TaskDag::fence(const std::vector<std::uint32_t> & covered, std::uint64_t now, const std::string & proof) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);

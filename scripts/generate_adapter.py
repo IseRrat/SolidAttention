@@ -76,8 +76,20 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
     backend = replace_once(backend, anchor, "    solid_copy_scope solid_copy(input, input_backend, split_backend);\n\n" + anchor)
     anchor = "        ggml_backend_tensor_get_async(backend, input, input_cpy->data, 0, ggml_nbytes(input));\n"
     backend = replace_once(backend, anchor, "        solid_copy_scope solid_copy(input, backend, sched->backends[next->backend_id]);\n" + anchor)
+    cuda = (source.parent / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
+    cuda = '#include "solid/cuda_completion.cuh"\n' + cuda
+    anchor = '''        case GGML_OP_FLASH_ATTN_EXT:
+            ggml_cuda_flash_attn_ext(ctx, dst);
+            break;'''
+    cuda = replace_once(cuda, anchor, '''        case GGML_OP_FLASH_ATTN_EXT: {
+            auto * solid_completion = solid::stream_completion(dst->op_params, sizeof(dst->op_params));
+            if (solid_completion) CUDA_CHECK(solid::cuda_attention_begin(solid_completion, ctx.stream()));
+            ggml_cuda_flash_attn_ext(ctx, dst);
+            if (solid_completion) CUDA_CHECK(solid::cuda_attention_end(solid_completion, ctx.stream()));
+            break;
+        }''')
     destination.mkdir(parents=True, exist_ok=True)
-    for name, text in (("llama-graph.cpp", graph), ("llama-context.cpp", context), ("ggml-backend.cpp", backend)):
+    for name, text in (("llama-graph.cpp", graph), ("llama-context.cpp", context), ("ggml-backend.cpp", backend), ("ggml-cuda.cu", cuda)):
         target = destination / name
         if not target.exists() or target.read_text(encoding="utf-8") != text:
             target.write_text(text, encoding="utf-8", newline="\n")

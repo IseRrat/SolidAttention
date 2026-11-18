@@ -154,3 +154,5 @@ Event schedule(TaskDag dag, Resources resources)
 启动时校验模型形状、预算、文件容量、偏移和缓冲区容量。每次实验保存完整配置、命令、日志和原始逐 token 轨迹。
 
 历史正式工作集现使用每块 READ→H2D→全部就绪的任务图。关键路径/LST 进入独立 I/O 队列，H2D 由原 READ 完成解锁并以复制票据结束；块帧与父层帧、源码指标独立核对。完整执行与成本观测见 [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md)。
+
+CUDA 的同步复用模式在 Flash Attention 前后记录可重放设备事件，并以轻量流通知唤醒协调线程。完成后释放设备读者、发出后继 H2D；后继 Q 到达时交回正式选择。稳定注册、epoch、停止协议和逐帧设备区间见 [原生完成事件](implementation/NATIVE_COMPLETION.md)。

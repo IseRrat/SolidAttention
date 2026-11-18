@@ -30,6 +30,8 @@
 
 20. [历史块事件 DAG 与资源分派](docs/implementation/BLOCK_EVENT_SCHEDULER.md)：块级读取/H2D 依赖、关键路径/LST、实际队列顺序与两级轨迹核查。
 
+21. [CUDA attention 完成事件](docs/implementation/NATIVE_COMPLETION.md)：图捕获与重放通知、槽位释放、后继上传、正式选择接管和设备计时。
+
 ## 系统机制
 
 - KV consolidator：按 token 交错存储 K/V，以一次传输读取成对数据。

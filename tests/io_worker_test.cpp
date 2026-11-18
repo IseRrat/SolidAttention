@@ -12,6 +12,7 @@
 #include <thread>
 #ifdef __linux__
 #include <sys/eventfd.h>
+#include <poll.h>
 #include <unistd.h>
 #endif
 
@@ -152,6 +153,9 @@ void backlog_progress() {
     auto io=worker(control); Release release{control};
     std::array<unsigned char,8> a{},b{};
     require(io->submit(1,0,a.data(),a.size(),0) && io->submit(2,0,b.data(),b.size(),0),"worker backlog admission");
+    pollfd descriptor{io->completion_handle(),POLLIN,0};
+    require(descriptor.fd>=0 && ::poll(&descriptor,1,5000)==1 && (descriptor.revents&POLLIN),"coordinator result readiness was not published");
+    io->acknowledge_notifications();
     solid::ReadCompletion result{};
     require(io->poll(result,true) && io->poll(result,true) && a[0]==1 && b[0]==2,"worker did not refill engine after a completion");
     require(io->stats().worker_capacity==2,"worker capacity metadata");

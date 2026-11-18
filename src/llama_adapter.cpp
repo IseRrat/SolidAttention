@@ -55,6 +55,11 @@ struct AttentionNode::Impl {
     ggml_tensor * flash = nullptr;
     bool query_proof = false;
     std::uint64_t epoch = 0;
+    static void publish_completion(ggml_tensor * destination,int ith,int,void * userdata) {
+        if (ith) return;
+        std::memcpy(destination->data,destination->src[0]->data,ggml_nbytes(destination));
+        auto * token=static_cast<StreamCompletionToken *>(userdata); token->notify(token->userdata);
+    }
     static void select_query(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith != 0) return;
         auto & self = *static_cast<Impl *>(userdata);
@@ -186,6 +191,17 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         ggml_set_name(result, "solid_prefetched_flash_attention");
         impl_->flash = result;
         if (scheduler && decode_backend) ggml_backend_sched_set_tensor_backend(scheduler, result, decode_backend);
+        if (auto * token=impl_->prefetch->completion_token(impl_->layer)) {
+            static_assert(stream_completion_offset+sizeof(StreamCompletionBinding)<=GGML_MAX_OP_PARAMS,"completion binding exceeds GGML op params");
+            bind_stream_completion(result->op_params,sizeof(result->op_params),token);
+            ggml_set_name(result,"solid_prefetched_flash_attention_native");
+            if (impl_->prefetch->completion_host_marker()) {
+                auto * source=result;
+                result=ggml_custom_4d(context,GGML_TYPE_F32,source->ne[0],source->ne[1],source->ne[2],source->ne[3],
+                    &source,1,Impl::publish_completion,1,token);
+                ggml_set_name(result,"solid_attention_completion_emulator");
+            }
+        }
         result = ggml_reshape_2d(context, result, g.dimension * impl_->session.query_heads(), 1);
     } else if (impl_->gathered) {
         if (g.layout == KvLayout::interleaved && scheduler && decode_backend) {
@@ -217,7 +233,8 @@ ggml_tensor * AttentionNode::selection_node() const { return impl_->early; }
 ggml_tensor * AttentionNode::attention_node() const { return impl_->flash; }
 void AttentionNode::set_query_proof(bool covers) { impl_->query_proof = covers; }
 void AttentionNode::defer_completion() {
-    if (impl_->prefetch && impl_->prefetch->reuses_sync() && impl_->flash) ggml_set_name(impl_->flash, "solid_prefetched_flash_attention_reuse");
+    if (impl_->prefetch && impl_->prefetch->reuses_sync() && impl_->flash && !impl_->prefetch->completion_token(impl_->layer))
+        ggml_set_name(impl_->flash, "solid_prefetched_flash_attention_reuse");
 }
 void AttentionNode::complete_attention() { if (impl_->prefetch) impl_->prefetch->completed(impl_->epoch); }
 

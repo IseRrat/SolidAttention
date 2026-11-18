@@ -38,6 +38,7 @@
 | D32 | 专用 I/O 线程拥有 liburing，以有界队列与协调线程交接；命令/CQE 事件驱动自动续填；预留两个不同物理核并排除推理核集合中的 SMT 同胞 | [I/O 线程](implementation/IO_WORKERS.md)，io-worker-ownership、uring-io |
 | D33 | 预测集合固定后跨 head 优先发出 selected；正式所需请求提升优先级；历史块 ready 后独立上传，追加等待读取与复制汇合 | [块读取流水](implementation/BLOCK_READ_PIPELINE.md)，prefetch-and-residency、io-worker-ownership、schedule-trace-audit |
 | D34 | 正式历史工作集使用每块 READ→H2D 和全部就绪汇合图；关键路径/LST 调度键传入 I/O 所有者，复制票据确认完成；块轨迹与父层帧独立核对 | [块事件调度](implementation/BLOCK_EVENT_SCHEDULER.md)，block-event-scheduler、schedule-trace-audit |
+| D35 | CUDA 同步复用模式在 Flash Attention 前后记录设备事件，以可捕获的轻量通知唤醒协调线程；完成绑定含稳定注册身份；后继 Q 到达后交回正式选择前沿，设备区间逐帧保存 | [原生完成事件](implementation/NATIVE_COMPLETION.md)，attention-event-protocol、native-completion-progress、schedule-trace-audit |
 
 ## 参数锁定任务
 

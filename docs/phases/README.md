@@ -25,3 +25,4 @@
 | 独立 I/O 与协调线程 | [I/O 线程](../implementation/IO_WORKERS.md) | 阶段 3 的请求/完成及取消；阶段 4 的线程分工和 CPU 核预留 |
 | selected 优先与逐块 SSD/H2D 流水 | [块读取流水](../implementation/BLOCK_READ_PIPELINE.md) | 阶段 3 的预测/纠错、阶段 4 的读复制重叠和依赖汇合 |
 | 历史块事件 DAG 与资源分派 | [块事件调度](../implementation/BLOCK_EVENT_SCHEDULER.md) | 阶段 3 的原 READ；阶段 4 的块级关键路径/LST、复制票据及两级核查 |
+| CUDA attention 原生完成事件 | [原生完成事件](../implementation/NATIVE_COMPLETION.md) | 阶段 4 的槽位释放、后继上传、Q 边界交接和设备计时 |

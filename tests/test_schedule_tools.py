@@ -71,7 +71,7 @@ class ScheduleToolsTests(unittest.TestCase):
             jsonlines(folder/"schedule.blocks.jsonl",block_trace(variant["mode"]))
             audit.update(scheduling.audit_block_schedule(folder/"schedule.blocks.jsonl",variant["mode"]))
             metrics = {({"critical_path_ns": "observed_critical_path_sum_ms", "miss_projection_overlap_ns": "miss_projection_overlap_sum_ms",
-                         "block_critical_path_ns": "block_observed_critical_path_sum_ms"}.get(key, key)):
+                         "block_critical_path_ns": "block_observed_critical_path_sum_ms","device_attention_ns":"device_attention_event_ms"}.get(key, key)):
                        value / 1e6 if key.endswith("_ns") else value for key, value in audit.items()}
             value["schedule"] = dict(metrics, mode=variant["mode"], trace_enabled=True)
             value["schedule_trace_sha256"] = digest(folder / "schedule.jsonl")
@@ -172,6 +172,25 @@ class ScheduleToolsTests(unittest.TestCase):
                 jsonlines(path,rows)
                 with self.assertRaisesRegex(ValueError,"block frames differ"):
                     scheduling.audit_block_schedule(path,"overlap",parent)
+
+    def test_device_timing_requires_its_completion_proof(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"schedule.jsonl"
+            good=trace("overlap+sync_reuse")
+            completion=next(row for row in good if row["event"]=="complete" and row["task"]==9)
+            completion.update(fence="attention_device_event",device_ns=1234)
+            jsonlines(path,good)
+            audit=scheduling.audit_schedule(path,"overlap+sync_reuse")
+            self.assertEqual(audit["device_event_completions"],1)
+            self.assertEqual(audit["device_attention_ns"],1234)
+            for patch in ({"device_ns":-1},{"fence":"query_dependency_reuse"}):
+                wrong=copy.deepcopy(good)
+                next(row for row in wrong if row["event"]=="complete" and row["task"]==9).update(patch)
+                jsonlines(path,wrong)
+                with self.assertRaises(ValueError): scheduling.audit_schedule(path,"overlap+sync_reuse")
+            completion.pop("device_ns")
+            jsonlines(path,good)
+            with self.assertRaises(ValueError): scheduling.audit_schedule(path,"overlap+sync_reuse")
 
     def test_deferred_pin_keeps_copy_and_attention_lifetimes_separate(self):
         with tempfile.TemporaryDirectory() as temporary:

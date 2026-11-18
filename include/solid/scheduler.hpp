@@ -10,6 +10,7 @@
 #include <string>
 #include <thread>
 #include <vector>
+#include <optional>
 
 namespace solid {
 enum class ScheduleMode { naive, overlap, sync_reuse };
@@ -28,6 +29,7 @@ struct TaskRecord {
     TaskState state = TaskState::pending;
     std::uint64_t start_ns = 0, end_ns = 0, latest_start = 0;
     bool critical = false;
+    std::optional<std::uint64_t> device_ns{};
 };
 class ScheduleTrace {
 public:
@@ -37,7 +39,7 @@ public:
     void define(std::uint64_t frame, std::uint32_t layer, std::uint64_t position, ScheduleMode mode,
                 std::uint32_t task, const TaskSpec & spec);
     void event(std::uint64_t frame, std::uint32_t task, const char * name, std::uint64_t timestamp,
-               const std::string & fence = {});
+               const std::string & fence = {},std::optional<std::uint64_t> device_ns = {});
     void flush();
 private:
     std::uint64_t origin_;
@@ -50,7 +52,7 @@ public:
             std::uint32_t layer = 0, std::uint64_t position = 0, ScheduleMode mode = ScheduleMode::naive);
     std::vector<std::uint32_t> ready(const std::vector<std::uint32_t> & candidates = {}) const;
     void start(std::uint32_t task, std::uint64_t now,const std::string & proof = {});
-    void complete(std::uint32_t task, std::uint64_t now, const std::string & fence = {});
+    void complete(std::uint32_t task, std::uint64_t now, const std::string & fence = {},std::optional<std::uint64_t> device_ns = {});
     void fence(const std::vector<std::uint32_t> & covered, std::uint64_t now, const std::string & proof);
     void abort(std::uint64_t now);
     std::uint64_t critical_path_ns() const;
@@ -85,9 +87,11 @@ private:
     void run();
 };
 struct ScheduleStats {
+    std::string completion_backend="graph_boundaries";
     int coordinator_cpu=-1;
     std::uint64_t frames = 0, tasks = 0, worker_jobs = 0;
     std::uint64_t block_frames=0,block_tasks=0,block_critical_path_ns=0;
+    std::uint64_t device_event_completions=0,device_attention_ns=0,device_boundary_fallbacks=0,uploads_before_boundary=0,copy_event_queries=0;
     std::uint64_t critical_path_ns = 0, miss_projection_overlap_ns = 0;
     std::uint64_t query_reused_fences = 0, process_reused_fences = 0, attention_fences = 0;
     std::uint64_t fallback_fences = 0, event_waits = 0, batch_waits = 0, stream_waits = 0;
