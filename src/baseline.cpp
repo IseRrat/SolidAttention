@@ -432,6 +432,7 @@ int main(int argc, char ** argv) {
                     {"stale_completions", stats.prefetch.stale_completions}, {"host_buffer_bytes", stats.prefetch.host_bytes},
                     {"wait_ms", stats.prefetch.wait_ns / 1e6}, {"resolve_inclusive_ms", stats.prefetch.resolve_ns / 1e6},
                     {"async_read_requests", stats.prefetch.io.read_requests}, {"async_read_bytes", stats.prefetch.io.read_bytes},
+                    {"async_write_requests", stats.prefetch.io.write_requests}, {"async_write_bytes", stats.prefetch.io.write_bytes},
                     {"completed_reads", stats.prefetch.io.completed_reads}, {"cancel_requests", stats.prefetch.io.cancel_requests},
                     {"cancel_completions", stats.prefetch.io.cancel_completions}, {"read_completion_latency_sum_ms", stats.prefetch.io.completion_ns / 1e6},
                     {"cancel_successes", stats.prefetch.io.cancel_successes}, {"cancel_not_found", stats.prefetch.io.cancel_not_found},

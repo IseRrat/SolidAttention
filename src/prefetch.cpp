@@ -95,9 +95,11 @@ Prefetcher::Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t per_h
                        std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace) :
     store_(store), budget_(budget), slots_(store.geometry().heads, per_head), blocks_(slots_.size()), pending_(slots_.size()),stages_(slots_.size()),
     upload_order_(slots_.size()),
-    history_(store.geometry().layers, std::vector<std::vector<std::uint64_t>>(store.geometry().heads)), reader_(std::move(reader)) {
+    history_(store.geometry().layers, std::vector<std::vector<std::uint64_t>>(store.geometry().heads)), reader_(std::move(reader)),
+    store_receipts_(store.geometry().layers) {
     budget.validate(store.geometry());
     if (!reader_) throw std::invalid_argument("prefetch reader is required");
+    if (reader_->supports_write() && store_.native_handle() >= 0) disk_ = dynamic_cast<FileKvStore *>(&store_);
     const auto & g = store.geometry();
     for (auto & block : blocks_) block.data.reserve(static_cast<std::size_t>(g.block_tokens) * 2 * g.dimension);
     for (const auto & block : blocks_) stats_.host_bytes += block.data.capacity() * sizeof(Half);
@@ -110,9 +112,72 @@ Prefetcher::Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t per_h
 }
 Prefetcher::~Prefetcher() {
     try { finish(); }
-    catch (...) { try { reader_->drain(); } catch (...) { std::terminate(); } }
+    catch (...) {
+        try {
+            reader_->drain();
+            if (write_batch_) disk_->complete_write(write_queue_.front(), false);
+        } catch (...) { std::terminate(); }
+    }
 }
 void Prefetcher::check() const { if (failed_) throw std::runtime_error("prefetch session failed"); }
+std::shared_ptr<const StoreReceipt> Prefetcher::store_full_layer(std::uint32_t layer) {
+    check();
+    if (!disk_) { store_.flush_full_layer(layer); return {}; }
+    if (auto receipt = store_receipts_.at(layer)) return receipt;
+    if (!disk_->write_buffer_full(layer)) return {};
+    auto receipt = std::make_shared<StoreReceipt>();
+    write_queue_.push_back(layer);
+    store_receipts_[layer] = receipt;
+    try { pump(); }
+    catch (...) { failed_ = true; throw; }
+    return receipt;
+}
+void Prefetcher::wait_store(std::uint32_t layer) {
+    while (store_receipts_.at(layer)) { check(); poll(true); }
+}
+void Prefetcher::finish_stores() {
+    while (pending_stores()) { check(); poll(true); }
+}
+void Prefetcher::pump_store() {
+    if (failed_ || write_queue_.empty()) return;
+    if (!write_batch_) write_batch_.emplace(WriteBatch{disk_->begin_write(write_queue_.front()), 0, {}});
+    auto & batch = *write_batch_;
+    while (batch.next < batch.segments.size()) {
+        if (next_id_ >= (std::uint64_t{1} << 63)) throw std::overflow_error("write request identity exhausted");
+        const auto & segment = batch.segments[batch.next];
+        const auto it = batch.inflight.emplace(next_id_, segment.bytes).first;
+        if (!reader_->submit_write(next_id_, disk_->native_handle(), segment.source, segment.bytes, segment.file_offset)) {
+            batch.inflight.erase(it);
+            break;
+        }
+        ++next_id_;
+        ++batch.next;
+    }
+}
+bool Prefetcher::complete_store(const ReadCompletion & completion) {
+    if (!write_batch_) return false;
+    auto & batch = *write_batch_;
+    const auto found = batch.inflight.find(completion.id);
+    if (found == batch.inflight.end()) return false;
+    const auto layer = write_queue_.front();
+    const auto bytes = found->second;
+    batch.inflight.erase(found);
+    if (batch.failed) return true;
+    if (completion.result < 0 || static_cast<std::uint64_t>(completion.result) != bytes) {
+        failed_ = true;
+        batch.failed = true;
+        throw std::runtime_error("async KV write failed: layer=" + std::to_string(layer) + " result=" + std::to_string(completion.result));
+    }
+    if (!failed_ && batch.next == batch.segments.size() && batch.inflight.empty()) {
+        disk_->complete_write(layer, true);
+        store_receipts_[layer]->completed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
+            std::chrono::steady_clock::now().time_since_epoch()).count();
+        store_receipts_[layer].reset();
+        write_queue_.pop_front();
+        write_batch_.reset();
+    }
+    return true;
+}
 void Prefetcher::event(const char * name, const SlotLease & lease) {
     if (!trace_.is_open()) return;
     trace_ << "{\"event\":\"" << name << "\",\"timestamp_ns\":"
@@ -135,6 +200,8 @@ void Prefetcher::pump() {
         if (observer.stage && observer.lease==job.lease) observer.stage->read_started(job.lease.identity);
         event("read_submit",job.lease);
     }
+    try { pump_store(); }
+    catch (...) { failed_ = true; throw; }
     reader_->flush();
 }
 void Prefetcher::issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch) {
@@ -209,6 +276,7 @@ void Prefetcher::poll(bool wait) {
     bool first = true;
     while (reader_->poll(completion, wait && first)) {
         first = false;
+        if (complete_store(completion)) { pump(); continue; }
         const auto found = requests_.find(completion.id);
         if (found == requests_.end()) { ++stats_.stale_completions; continue; }
         const auto job = found->second;
@@ -451,6 +519,7 @@ void Prefetcher::finish() {
         if (slots_.entry(i).state != SlotState::free) retire(slots_.lease(i));
     }
     while (!requests_.empty()) poll(true);
+    finish_stores();
     reader_->drain();
     reader_->rethrow_failure();
     if (trace_.is_open()) { trace_.flush(); if (!trace_) throw std::runtime_error("prefetch trace flush failed"); }

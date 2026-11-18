@@ -2,10 +2,11 @@
 #include "solid/kv_store.hpp"
 #include <memory>
 #include <functional>
+#include <stdexcept>
 
 namespace solid {
 struct ReadCompletion { std::uint64_t id; std::int64_t result; };
-enum class ReadPriority : std::uint8_t { correction_selected, correction_deterministic, selected, deterministic };
+enum class ReadPriority : std::uint8_t { correction_selected, correction_deterministic, selected, deterministic, writeback };
 struct ReadDispatch {
     ReadPriority priority=ReadPriority::deterministic;
     bool critical=false;
@@ -24,6 +25,7 @@ struct AsyncIoStats {
     std::uint64_t read_requests = 0;
     std::uint64_t read_bytes = 0;
     std::uint64_t completed_reads = 0;
+    std::uint64_t write_requests = 0, write_bytes = 0, write_ns = 0;
     std::uint64_t cancel_requests = 0;
     std::uint64_t cancel_completions = 0;
     std::uint64_t cancel_successes = 0;
@@ -50,9 +52,13 @@ public:
         return submit_prioritized(id,fd,destination,bytes,offset,dispatch.priority);
     }
     virtual void schedule(std::uint64_t id,ReadDispatch dispatch) { prioritize(id,dispatch.priority); }
+    virtual bool supports_write() const { return false; }
+    virtual bool submit_write(std::uint64_t, int, const void *, std::size_t, std::uint64_t) {
+        throw std::logic_error("I/O engine does not support writes");
+    }
     virtual void cancel(std::uint64_t id) = 0;
     virtual void flush() = 0;
-    // Only original READ completion ends a buffer's kernel-write lifetime.
+    // Only the original operation completion releases the kernel's buffer access.
     // A queued job can complete as canceled before a kernel writer exists.
     virtual bool poll(ReadCompletion & completion, bool wait) = 0;
     virtual void drain() = 0;

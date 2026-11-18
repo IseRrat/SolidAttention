@@ -4,6 +4,7 @@
 #include <cstdint>
 #include <filesystem>
 #include <memory>
+#include <optional>
 #include <vector>
 
 namespace solid {
@@ -57,6 +58,11 @@ struct KvReadSegment {
     std::uint64_t file_offset = 0;
     std::size_t buffer_offset = 0;
     std::size_t bytes = 0;
+};
+struct KvWriteSegment {
+    std::uint64_t file_offset;
+    const Half * source;
+    std::size_t bytes;
 };
 
 class RandomAccessFile {
@@ -123,6 +129,10 @@ public:
     std::uint64_t resident_bytes() const override;
     IoStats io_stats() const override { return stats_; }
     bool failed() const { return failed_; }
+    bool write_buffer_full(std::uint32_t layer) const;
+    // The segments borrow a single packed workspace until all writes finish.
+    std::vector<KvWriteSegment> begin_write(std::uint32_t layer);
+    void complete_write(std::uint32_t layer, bool success);
     int native_handle() const override { return file_->native_handle(); }
     std::vector<KvReadSegment> plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
                                         KvBlock & destination, std::uint32_t prefix = 0) override;
@@ -136,6 +146,7 @@ private:
     std::vector<std::uint64_t> lengths_;
     std::vector<std::uint64_t> committed_;
     std::vector<Half> scratch_;
+    std::optional<std::uint32_t> writing_layer_;
     std::size_t token_elements_;
     std::size_t pending_tokens_;
     IoStats stats_;

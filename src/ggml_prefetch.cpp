@@ -9,6 +9,7 @@
 #include <map>
 #include <array>
 #include <cstring>
+#include <deque>
 #include <mutex>
 #include <stdexcept>
 #include <thread>
@@ -251,6 +252,7 @@ struct LayerWork {
     std::vector<HeadSelection> selection;
     TaskDag dag;
     std::shared_ptr<BlockStage> blocks;
+    std::shared_ptr<const StoreReceipt> store;
     bool consumed = false;
     bool direct = false;
     LayerWork(std::uint32_t layer, std::uint64_t position, ScheduleMode mode, ScheduleTrace & trace,
@@ -292,6 +294,7 @@ struct GgmlPrefetch::Impl {
     std::array<std::uint64_t, task_count> estimates;
     std::uint64_t block_read_estimate=1,block_copy_estimate=1;
     std::shared_ptr<LayerWork> work;
+    std::deque<std::shared_ptr<LayerWork>> storing;
     std::uint64_t sequence = 0;
     bool quiesced = true;
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
@@ -304,15 +307,14 @@ struct GgmlPrefetch::Impl {
         estimates.fill(1); totals.coordinator_cpu=cpu; totals.completion_backend=events?events->name():"graph_boundaries";
     }
     std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position,bool direct=false) {
-        if (work && !work->dag.finished()) throw std::logic_error("new layer started before previous completion proof");
+        if (work && work->dag.task(attention).state != TaskState::complete) throw std::logic_error("new layer started before previous attention completion");
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
         work = std::make_shared<LayerWork>(layer, position, mode, trace, ++sequence, estimates);
         work->dag.fence({q_ready,q_d2h}, trace.now(), direct?"query_device_input_ready":"query_download_complete");
         return work;
     }
-    void finish_frame(const std::string & proof,std::optional<std::uint64_t> device_ns={}) {
-        if (!work || work->dag.task(attention).state != TaskState::running) throw std::logic_error("attention lacks a scheduled start");
-        work->dag.complete(attention, trace.now(), proof,device_ns);
+    void finish_frame(const std::shared_ptr<LayerWork> & finished) {
+        const auto & work = finished;
         if (!work->dag.finished()) throw std::logic_error("layer completed with unfinished microtasks");
         ++totals.frames; totals.tasks += work->dag.size();
         totals.critical_path_ns += work->dag.critical_path_ns();
@@ -334,6 +336,15 @@ struct GgmlPrefetch::Impl {
             if (duration) estimates[id] = duration >= estimates[id] ? estimates[id] + (duration - estimates[id]) / 8 : estimates[id] - (estimates[id] - duration) / 8;
         }
     }
+    void observe_stores() {
+        for (auto it = storing.begin(); it != storing.end();) {
+            auto & frame = *it;
+            if (!frame->store->completed_ns) { ++it; continue; }
+            frame->dag.complete(store_task, *frame->store->completed_ns, "original_write_complete");
+            if (frame->dag.finished()) finish_frame(frame);
+            it = storing.erase(it);
+        }
+    }
     void next_layer(const std::shared_ptr<LayerWork> & current) {
         const auto next = current->layer + 1 < session.geometry().layers ? current->layer + 1 : 0;
         const auto position = next ? current->position : current->position + 1;
@@ -343,12 +354,16 @@ struct GgmlPrefetch::Impl {
     }
     void begin_prediction(std::uint32_t layer, std::uint64_t position) {
         session.begin_prefetch(layer, position, {block_read_estimate, block_copy_estimate});
+        observe_stores();
     }
     void release_attention(const char * proof,std::optional<std::uint64_t> device_ns={}) {
         if (!device.attention_pending()) return;
         if (device.attention_complete(device.attention_epoch())) {
-            finish_frame(proof,device_ns);
-            session.prefetcher().poll(); device.prefetch_ready();
+            work->dag.complete(attention, trace.now(), proof, device_ns);
+            if (work->dag.finished()) finish_frame(work);
+            session.prefetcher().poll();
+            observe_stores();
+            device.prefetch_ready();
         }
     }
     void progress_after_attention(const std::shared_ptr<LayerWork> & current,std::uint64_t epoch) {
@@ -358,7 +373,7 @@ struct GgmlPrefetch::Impl {
         while (!events->stopped()) {
             // Clear notifications before inspecting queues/state. A producer
             // arriving after these checks leaves a counter for the next wait.
-            events->acknowledge(); host.poll();
+            events->acknowledge(); host.poll(); observe_stores();
             if (!released) if (const auto receipt=events->poll(current->layer,epoch)) {
                 const char * proof;
                 if (receipt->proof==AttentionProof::device_signal) {
@@ -377,11 +392,14 @@ struct GgmlPrefetch::Impl {
                 // Give formal correction the coordinator as soon as its query
                 // reaches the CPU. Remaining predicted SSD jobs stay queued.
                 if (events->boundary_seen(epoch)) return;
-                if (host.pending_reads() && host.completion_handle()<0) host.poll(true);
+                if ((host.pending_reads() || host.pending_stores()) && host.completion_handle()<0) {
+                    host.poll(true);
+                    observe_stores();
+                }
                 const auto before=device.stats().uploads;
                 device.prefetch_ready();
                 if (!events->boundary_seen(epoch)) totals.uploads_before_boundary+=device.stats().uploads-before;
-                if (!host.pending_reads()) return;
+                if (!host.pending_reads() && !host.pending_stores()) return;
             }
 #ifdef __linux__
             pollfd descriptors[2]={{events->completion_handle(),POLLIN,0},{host.completion_handle(),POLLIN,0}};
@@ -570,8 +588,9 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
                 if (io.front() == next_prefetch) impl_->next_layer(work);
                 else {
                     work->dag.start(store_task, impl_->trace.now());
-                    impl_->session.flush_full_layer(work->layer);
-                    work->dag.complete(store_task, impl_->trace.now());
+                    work->store = impl_->session.prefetcher().store_full_layer(work->layer);
+                    if (work->store) impl_->storing.push_back(work);
+                    else work->dag.complete(store_task, impl_->trace.now(), "buffered_or_synchronous_store");
                 }
             }
             impl_->progress_after_attention(work,epoch);
@@ -607,6 +626,15 @@ void GgmlPrefetch::quiesce() {
         if (impl_->device.attention_pending()) (void) impl_->device.attention_complete(impl_->device.attention_epoch());
     } catch (...) { if (!error) error = std::current_exception(); }
     try { impl_->device.finish(); } catch (...) { if (!error) error = std::current_exception(); }
+    try {
+        impl_->session.prefetcher().finish_stores();
+        impl_->observe_stores();
+    } catch (...) { if (!error) error = std::current_exception(); }
+    for (const auto & frame : impl_->storing) {
+        try { if (!frame->dag.finished()) frame->dag.abort(impl_->trace.now()); }
+        catch (...) { if (!error) error = std::current_exception(); }
+    }
+    impl_->storing.clear();
     try {
         if (impl_->work && !impl_->work->dag.finished()) impl_->work->dag.abort(impl_->trace.now());
     } catch (...) { if (!error) error=std::current_exception(); }

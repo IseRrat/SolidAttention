@@ -168,6 +168,7 @@ void AttentionSession::append_token(std::uint32_t layer, std::uint64_t position,
         kv[i] = to_half(value);
         if (!std::isfinite(from_half(kv[i]))) throw std::invalid_argument("K/V cannot be represented as finite FP16");
     }
+    if (prefetch_) prefetch_->wait_store(layer);
     store_->append_interleaved(layer, position, kv);
     if (representatives_) {
         std::vector<Half> k(elements);
@@ -413,6 +414,7 @@ void AttentionSession::append_after_selection_half(std::uint32_t layer, std::uin
     try {
         for (const auto value : kv) if (!std::isfinite(from_half(value))) throw std::invalid_argument("non-finite device KV offload");
         const auto start = Clock::now();
+        prefetch_->wait_store(layer);
         representatives_->append_keys_device(layer, position, keys);
         store_->append_interleaved(layer, position, kv);
         stats_.append_ns += elapsed(start);
@@ -487,6 +489,7 @@ std::vector<HeadSelection> AttentionSession::select(std::uint32_t layer, std::ui
 void AttentionSession::flush() {
     if (failed_) throw std::runtime_error("attention session failed");
     try {
+        if (prefetch_) prefetch_->finish_stores();
         store_->flush();
         if (trace_.is_open()) { trace_.flush(); if (!trace_) throw std::runtime_error("selection trace flush failed"); }
     } catch (...) { failed_ = true; throw; }
@@ -512,7 +515,12 @@ SessionStats AttentionSession::stats() const {
         result.representative_backend = representatives_->builder_name();
     }
     result.io = store_->io_stats();
-    if (prefetch_) result.prefetch = prefetch_->stats();
+    if (prefetch_) {
+        result.prefetch = prefetch_->stats();
+        result.io.write_requests += result.prefetch.io.write_requests;
+        result.io.write_bytes += result.prefetch.io.write_bytes;
+        result.io.write_ns += result.prefetch.io.write_ns;
+    }
     if (prefill_) result.prefill=prefill_->stats();
     result.prefill_host_bytes=prefill_tile_.capacity()*sizeof(Half);
     return result;

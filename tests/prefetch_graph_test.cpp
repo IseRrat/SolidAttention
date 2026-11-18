@@ -208,6 +208,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         }
         ggml_backend_sched_reset(scheduler.get());
     }
+    device.quiesce(); session.finish();
     require(device.stats().uploads > 0 && session.stats().prefetch.predicted_blocks > 0, "prefetch path was not exercised");
     const auto stats = device.schedule_stats();
     require(stats.frames == 12 && stats.tasks == 144, "microtask frames not fully completed");
@@ -220,6 +221,10 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     else require(observer.completions == 12, "scheduler failed to confirm each layer's attention completion");
     if (controlled) require(stats.miss_projection_overlap_ns > 0, "missing I/O and KV projection did not overlap");
     if (disk) require(session.stats().prefetch.io.completed_reads > 0, "GGML path did not complete liburing reads");
+    if (disk && mode != solid::ScheduleMode::naive) {
+        require(session.stats().prefetch.io.write_bytes == 12ull*kv_heads*dimension*2*sizeof(solid::Half),
+                "decode did not commit its full write buffers through liburing");
+    }
     if (builder || direct) require(session.stats().ranking.builder_queries == 24 && session.stats().ranking.builder_appends == 24 &&
         session.stats().ranking.built_blocks == 10, "graph did not execute representative builder across prefill and decode");
     if (direct) require(session.stats().direct_prefill_queries==12 && session.stats().ranking.device_builder_batches==4 &&
@@ -228,7 +233,6 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         session.stats().decode_kv_download_bytes==12ull*kv_heads*dimension*2*sizeof(solid::Half),"device decode counters or FP16 transfer size");
     if (direct) require(device.stats().current_device_rows==12ull*kv_heads &&
         device.stats().current_device_bytes==12ull*kv_heads*dimension*2*sizeof(solid::Half),"current KV did not use device row transfers");
-    device.quiesce(); session.finish();
     if (!directory.empty()) {
         std::ofstream output(directory / "stats.json");
         output << nlohmann::json({{"frames", stats.frames}, {"tasks", stats.tasks}, {"critical_path_ns", stats.critical_path_ns},

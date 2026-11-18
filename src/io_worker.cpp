@@ -23,9 +23,9 @@ namespace {
 class IoWorker final:public AsyncReader {
     enum class Phase { queued, active, complete };
     struct Request {
-        int fd; void * destination; std::size_t bytes; std::uint64_t offset,sequence;
+        int fd; const void * data; std::size_t bytes; std::uint64_t offset,sequence;
         Phase phase=Phase::queued;
-        bool cancelled=false,cancel_sent=false;
+        bool cancelled=false,cancel_sent=false,write=false;
         ReadDispatch dispatch{};
     };
 public:
@@ -54,14 +54,22 @@ public:
         return submit_scheduled(id,fd,destination,bytes,offset,{priority});
     }
     bool submit_scheduled(std::uint64_t id,int fd,void * destination,std::size_t bytes,std::uint64_t offset,ReadDispatch dispatch) override {
+        return admit(id, fd, destination, bytes, offset, dispatch, false);
+    }
+    bool supports_write() const override { return writes_supported_; }
+    bool submit_write(std::uint64_t id,int fd,const void * source,std::size_t bytes,std::uint64_t offset) override {
+        if (!supports_write()) throw std::logic_error("I/O worker write support is disabled");
+        return admit(id, fd, source, bytes, offset, {ReadPriority::writeback}, true);
+    }
+    bool admit(std::uint64_t id,int fd,const void * data,std::size_t bytes,std::uint64_t offset,ReadDispatch dispatch,bool write) {
         {
             std::lock_guard<std::mutex> lock(mutex_); check();
-            if (!id || id>=(std::uint64_t{1}<<63) || fd<0 || !destination || !bytes || bytes>INT_MAX ||
+            if (!id || id>=(std::uint64_t{1}<<63) || fd<0 || !data || !bytes || bytes>INT_MAX ||
                 offset>static_cast<std::uint64_t>(INT64_MAX)-bytes || requests_.count(id)) throw std::invalid_argument("invalid queued I/O request");
             if (draining_) throw std::logic_error("read submitted during I/O drain");
-            if (requests_.size()>=depth_) return false;
+            if (requests_.size() >= depth_ - (write ? 1 : 0)) return false;
             if (sequence_==UINT64_MAX) throw std::overflow_error("I/O submission sequence exhausted");
-            auto request=Request{fd,destination,bytes,offset,++sequence_}; request.dispatch=dispatch;
+            auto request=Request{fd,data,bytes,offset,++sequence_}; request.dispatch=dispatch; request.write=write;
             requests_.emplace(id,request);
         }
         notify(); return true;
@@ -139,7 +147,7 @@ private:
             bind_thread_cpu(cpu_); reader=factory_();
             if (!reader || reader->stats().dedicated_worker) throw std::invalid_argument("I/O worker requires a direct reader");
             snapshot(*reader);
-            { std::lock_guard<std::mutex> lock(mutex_); ready_=true; }
+            { std::lock_guard<std::mutex> lock(mutex_); writes_supported_=reader->supports_write(); ready_=true; }
             cv_.notify_all();
             for (;;) {
                 // Consume notification counters BEFORE inspecting their queues.
@@ -173,7 +181,9 @@ private:
                         if (best==requests_.end()) break;
                         id=best->first; request=best->second; best->second.phase=Phase::active;
                     }
-                    if (!reader->submit(id,request.fd,request.destination,request.bytes,request.offset)) {
+                    const bool submitted = request.write ? reader->submit_write(id,request.fd,request.data,request.bytes,request.offset) :
+                        reader->submit(id,request.fd,const_cast<void *>(request.data),request.bytes,request.offset);
+                    if (!submitted) {
                         std::lock_guard<std::mutex> lock(mutex_); requests_.at(id).phase=Phase::queued; break;
                     }
                     ++submissions_;
@@ -183,7 +193,7 @@ private:
                 while (reader->poll(completion,false)) {
                     std::lock_guard<std::mutex> lock(mutex_);
                     const auto found=requests_.find(completion.id);
-                    if (found==requests_.end() || found->second.phase!=Phase::active) throw std::logic_error("unknown I/O worker READ completion");
+                    if (found==requests_.end() || found->second.phase!=Phase::active) throw std::logic_error("unknown I/O worker completion");
                     found->second.phase=Phase::complete; completed_.push_back(completion);
                     delivered=true;
                 }
@@ -234,6 +244,7 @@ private:
     std::deque<ReadCompletion> completed_;
     std::exception_ptr error_;
     bool ready_=false,ended_=false,safe_=false,stopping_=false,draining_=false;
+    bool writes_supported_=false;
     std::uint64_t sequence_=0,drain_requested_=0,drain_completed_=0,queued_cancellations_=0,submissions_=0;
     AsyncIoStats stats_;
 };

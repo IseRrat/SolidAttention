@@ -267,7 +267,7 @@ FileKvStore::FileKvStore(KvGeometry geometry, std::unique_ptr<RandomAccessFile> 
     const std::uint16_t endian = 1;
     if (*reinterpret_cast<const unsigned char *>(&endian) != 1) throw std::invalid_argument("KV v1 requires little-endian storage");
     for (auto & pending : pending_) pending.values.reserve(pending_tokens_ * token_elements_);
-    scratch_.resize(static_cast<std::size_t>(geometry.block_tokens) * 2 * geometry.dimension);
+    scratch_.reserve(pending_tokens_ * token_elements_);
     file_->resize(geometry.file_bytes());
     std::array<unsigned char, header_bytes> header{};
     std::memcpy(header.data(), "SOLIDKV1", 8);
@@ -311,6 +311,7 @@ void FileKvStore::write_exact(const void * source, std::size_t bytes, std::uint6
 void FileKvStore::append_interleaved(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv) {
     check_ready();
     validate_append(layer, position, length(layer), kv);
+    if (writing_layer_ == layer) throw std::logic_error("KV append before the layer's write completed");
     auto & pending = pending_.at(layer);
     if (pending.values.size() / token_elements_ == pending_tokens_) flush_layer(layer);
     if (pending.values.empty()) pending.first = position;
@@ -318,10 +319,27 @@ void FileKvStore::append_interleaved(std::uint32_t layer, std::uint64_t position
     ++lengths_[layer];
 }
 void FileKvStore::flush_layer(std::uint32_t layer) {
+    if (pending_.at(layer).values.empty()) return;
+    const auto segments = begin_write(layer);
+    try {
+        for (const auto & segment : segments) write_exact(segment.source, segment.bytes, segment.file_offset);
+    } catch (...) { complete_write(layer, false); throw; }
+    complete_write(layer, true);
+}
+bool FileKvStore::write_buffer_full(std::uint32_t layer) const {
     check_ready();
-    auto & pending = pending_.at(layer);
+    return pending_.at(layer).values.size() / token_elements_ == pending_tokens_;
+}
+std::vector<KvWriteSegment> FileKvStore::begin_write(std::uint32_t layer) {
+    check_ready();
+    if (writing_layer_) throw std::logic_error("KV write workspace is in use");
+    const auto & pending = pending_.at(layer);
+    if (pending.values.empty()) throw std::logic_error("cannot start an empty KV write");
     const auto count = pending.values.size() / token_elements_;
     const auto dimension = geometry_.dimension;
+    scratch_.resize(pending.values.size());
+    std::vector<KvWriteSegment> segments;
+    auto * packed = scratch_.data();
     for (std::size_t first = 0; first < count;) {
         const auto position = pending.first + first;
         const auto in_block = position % geometry_.block_tokens;
@@ -331,23 +349,33 @@ void FileKvStore::flush_layer(std::uint32_t layer) {
             if (geometry_.layout == KvLayout::separate) {
                 for (std::size_t i = 0; i < take; ++i) {
                     const auto source = (first + i) * token_elements_ + head * 2 * dimension;
-                    std::copy_n(pending.values.data() + source, dimension, scratch_.data() + i * dimension);
-                    std::copy_n(pending.values.data() + source + dimension, dimension, scratch_.data() + (take + i) * dimension);
+                    std::copy_n(pending.values.data() + source, dimension, packed + i * dimension);
+                    std::copy_n(pending.values.data() + source + dimension, dimension, packed + (take + i) * dimension);
                 }
-                write_exact(scratch_.data(), take * dimension * sizeof(Half), offset + in_block * dimension * sizeof(Half));
-                write_exact(scratch_.data() + take * dimension, take * dimension * sizeof(Half),
-                            offset + align_up(geometry_.plane_bytes(), geometry_.alignment) + in_block * dimension * sizeof(Half));
+                const auto bytes = take * dimension * sizeof(Half);
+                segments.push_back({offset + in_block * dimension * sizeof(Half), packed, bytes});
+                segments.push_back({offset + align_up(geometry_.plane_bytes(), geometry_.alignment) + in_block * dimension * sizeof(Half),
+                                    packed + take * dimension, bytes});
             } else {
                 for (std::size_t i = 0; i < take; ++i) {
                     std::copy_n(pending.values.data() + (first + i) * token_elements_ + head * 2 * dimension,
-                                2 * dimension, scratch_.data() + i * 2 * dimension);
+                                2 * dimension, packed + i * 2 * dimension);
                 }
-                write_exact(scratch_.data(), take * 2 * dimension * sizeof(Half), offset + in_block * 2 * dimension * sizeof(Half));
+                segments.push_back({offset + in_block * 2 * dimension * sizeof(Half), packed, take * 2 * dimension * sizeof(Half)});
             }
+            packed += take * 2 * dimension;
         }
         first += take;
     }
-    committed_[layer] = lengths_[layer];
+    writing_layer_ = layer;
+    return segments;
+}
+void FileKvStore::complete_write(std::uint32_t layer, bool success) {
+    if (writing_layer_ != layer) throw std::logic_error("KV write receipt has a different layer");
+    writing_layer_.reset();
+    if (!success) { failed_ = true; return; }
+    auto & pending = pending_.at(layer);
+    committed_[layer] = pending.first + pending.values.size() / token_elements_;
     pending.values.clear();
     pending.first = committed_[layer];
 }
@@ -396,7 +424,10 @@ std::vector<KvReadSegment> FileKvStore::plan_read(std::uint32_t layer, std::uint
     }
     return segments;
 }
-void FileKvStore::flush() { for (std::uint32_t layer = 0; layer < geometry_.layers; ++layer) flush_layer(layer); }
+void FileKvStore::flush() {
+    check_ready();
+    for (std::uint32_t layer = 0; layer < geometry_.layers; ++layer) flush_layer(layer);
+}
 void FileKvStore::flush_full_layer(std::uint32_t layer) {
     check_ready();
     if (pending_.at(layer).values.size() / token_elements_ == pending_tokens_) flush_layer(layer);

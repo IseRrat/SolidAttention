@@ -4,6 +4,7 @@
 #include "solid/block_identity.hpp"
 #include "solid/block_stage.hpp"
 #include <fstream>
+#include <deque>
 #include <map>
 #include <optional>
 #include <tuple>
@@ -56,6 +57,9 @@ struct PredictionCosts {
     std::uint64_t full_read_ns = 1;
     std::uint64_t full_upload_ns = 1;
 };
+struct StoreReceipt {
+    std::optional<std::uint64_t> completed_ns;
+};
 class Prefetcher {
 public:
     using ReadyBlock = std::function<void(const SlotLease &)>;
@@ -73,15 +77,25 @@ public:
     void pin(const SlotLease & lease) { slots_.pin(lease); }
     void unpin(const SlotLease & lease) { slots_.unpin(lease); }
     std::vector<SlotLease> ready() const;
+    std::shared_ptr<const StoreReceipt> store_full_layer(std::uint32_t layer);
+    void wait_store(std::uint32_t layer);
+    void finish_stores();
     void finish();
     PrefetchStats stats() const;
     std::uint32_t slots_per_head() const { return slots_.slots_per_head(); }
     std::optional<std::uint32_t> active_layer() const { return layer_; }
     int completion_handle() const { return reader_->completion_handle(); }
     bool pending_reads() const { return !requests_.empty() || !queued_.empty(); }
+    bool pending_stores() const { return !write_queue_.empty(); }
 private:
     struct Job { SlotLease lease; KvReadSegment segment; ReadDispatch dispatch; };
     struct ReadStage { SlotLease lease; std::shared_ptr<BlockStage> stage; };
+    struct WriteBatch {
+        std::vector<KvWriteSegment> segments;
+        std::size_t next = 0;
+        std::map<std::uint64_t, std::size_t> inflight;
+        bool failed = false;
+    };
     KvStore & store_;
     SparseBudget budget_;
     SlotTable slots_;
@@ -93,6 +107,10 @@ private:
     std::map<std::uint64_t, Job> requests_;
     std::vector<Job> queued_;
     std::unique_ptr<AsyncReader> reader_;
+    FileKvStore * disk_ = nullptr;
+    std::vector<std::shared_ptr<StoreReceipt>> store_receipts_;
+    std::deque<std::uint32_t> write_queue_;
+    std::optional<WriteBatch> write_batch_;
     std::ofstream trace_;
     std::optional<std::uint32_t> layer_;
     std::uint64_t position_ = 0;
@@ -108,6 +126,8 @@ private:
     bool selected(std::uint64_t block) const;
     void retire(const SlotLease & lease);
     void pump();
+    void pump_store();
+    bool complete_store(const ReadCompletion & completion);
     void event(const char * name, const SlotLease & lease);
     std::vector<SlotLease> resolve_impl(std::uint32_t layer, std::uint64_t position,
                                        const std::vector<HeadSelection> & actual, bool historical,

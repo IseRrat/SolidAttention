@@ -32,15 +32,23 @@ public:
         close(notification_);
     }
     bool submit(std::uint64_t id, int fd, void * destination, std::size_t bytes, std::uint64_t offset) override {
-        if (!id || id >= cancel_bit || !destination || bytes == 0 || bytes > INT_MAX || fd < 0 ||
+        return submit_io(id, fd, destination, bytes, offset, false);
+    }
+    bool supports_write() const override { return true; }
+    bool submit_write(std::uint64_t id, int fd, const void * source, std::size_t bytes, std::uint64_t offset) override {
+        return submit_io(id, fd, source, bytes, offset, true);
+    }
+    bool submit_io(std::uint64_t id, int fd, const void * data, std::size_t bytes, std::uint64_t offset, bool write) {
+        if (!id || id >= cancel_bit || !data || bytes == 0 || bytes > INT_MAX || fd < 0 ||
             offset > static_cast<std::uint64_t>(INT64_MAX) - bytes || reads_.count(id) || cancellations_.count(id)) {
-            throw std::invalid_argument("invalid async read request");
+            throw std::invalid_argument("invalid async KV I/O request");
         }
-        if (reads_.size() >= limit_) return false;
-        Request request{fd, static_cast<unsigned char *>(destination), bytes, 0, offset, false, 0, std::chrono::steady_clock::now()};
+        if (reads_.size() >= limit_ || (write && active_writes_ >= limit_ / 2)) return false;
+        Request request{fd, static_cast<const unsigned char *>(data), bytes, 0, offset, write, false, 0, std::chrono::steady_clock::now()};
         auto inserted = reads_.emplace(id, request);
         try { stage(id, inserted.first->second); }
         catch (...) { reads_.erase(inserted.first); throw; }
+        if (write) ++active_writes_;
         return true;
     }
     void cancel(std::uint64_t id) override {
@@ -82,7 +90,7 @@ public:
                 else if (result == -ENOENT) ++stats_.cancel_not_found;
                 else if (result == -EALREADY) ++stats_.cancel_busy;
                 else ++stats_.cancel_errors;
-                // Cancellation CQEs never release the original read buffer.
+                // A cancellation CQE does not release the original operation's buffer.
                 continue;
             }
             const auto found = reads_.find(tag);
@@ -95,13 +103,15 @@ public:
             if (result > 0 && static_cast<std::size_t>(result) <= request.bytes - request.done) {
                 request.done += result;
                 request.retries = 0;
-                stats_.read_bytes += result;
+                if (request.write) stats_.write_bytes += result;
+                else stats_.read_bytes += result;
                 if (request.done < request.bytes && !request.cancelled) { stage(tag, request); flush(); continue; }
                 final_result = request.done == request.bytes ? static_cast<std::int64_t>(request.done) : -ECANCELED;
-            } else if (result == 0) final_result = -ENODATA;
+            } else if (result == 0) final_result = request.write ? -EIO : -ENODATA;
             else if (result > 0) final_result = -EOVERFLOW;
-            stats_.completion_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - request.start).count();
-            ++stats_.completed_reads;
+            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - request.start).count();
+            if (request.write) { stats_.write_ns += ns; --active_writes_; }
+            else { stats_.completion_ns += ns; ++stats_.completed_reads; }
             completion = {tag, final_result};
             reads_.erase(found);
             return true;
@@ -130,11 +140,11 @@ public:
 private:
     struct Request {
         int fd;
-        unsigned char * destination;
+        const unsigned char * data;
         std::size_t bytes;
         std::size_t done;
         std::uint64_t offset;
-        bool cancelled;
+        bool write, cancelled;
         std::uint32_t retries;
         std::chrono::steady_clock::time_point start;
     };
@@ -142,6 +152,7 @@ private:
     io_uring ring_{};
     int notification_=-1;
     std::uint32_t limit_;
+    std::uint32_t active_writes_ = 0;
     std::map<std::uint64_t, Request> reads_;
     std::set<std::uint64_t> cancellations_;
     AsyncIoStats stats_;
@@ -153,10 +164,16 @@ private:
     }
     void stage(std::uint64_t id, Request & request) {
         auto * sqe = get_sqe();
-        io_uring_prep_read(sqe, request.fd, request.destination + request.done,
-                           static_cast<unsigned int>(request.bytes - request.done), request.offset + request.done);
+        const auto bytes = static_cast<unsigned int>(request.bytes - request.done);
+        const auto offset = request.offset + request.done;
+        if (request.write) {
+            io_uring_prep_write(sqe, request.fd, request.data + request.done, bytes, offset);
+            ++stats_.write_requests;
+        } else {
+            io_uring_prep_read(sqe, request.fd, const_cast<unsigned char *>(request.data) + request.done, bytes, offset);
+            ++stats_.read_requests;
+        }
         io_uring_sqe_set_data64(sqe, id);
-        ++stats_.read_requests;
     }
 };
 }
