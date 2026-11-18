@@ -345,6 +345,12 @@ struct GgmlPrefetch::Impl {
             it = storing.erase(it);
         }
     }
+    void start_store(const std::shared_ptr<LayerWork> & frame) {
+        frame->dag.start(store_task, trace.now());
+        frame->store = session.prefetcher().store_full_layer(frame->layer);
+        if (frame->store) storing.push_back(frame);
+        else frame->dag.complete(store_task, trace.now(), "buffered_or_synchronous_store");
+    }
     void next_layer(const std::shared_ptr<LayerWork> & current) {
         const auto next = current->layer + 1 < session.geometry().layers ? current->layer + 1 : 0;
         const auto position = next ? current->position : current->position + 1;
@@ -575,23 +581,25 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         ++impl_->totals.worker_jobs;
         impl_->worker.submit([this, work,epoch] {
             std::lock_guard<std::mutex> lock(impl_->mutex);
+            bool store_started = false;
             if (reuses_sync()) {
+                auto & host = impl_->session.prefetcher();
+                if (host.asynchronous_stores()) {
+                    // The append is complete and the write buffers do not
+                    // borrow the host slots that the copy stream still owns.
+                    impl_->start_store(work);
+                    store_started = true;
+                }
                 impl_->device.wait_transfers_coalesced();
                 work->dag.complete(current_h2d, impl_->trace.now(), "shared_upload_batch");
                 work->dag.start(attention, impl_->trace.now());
             }
-            // At the shared frontier both I/O tasks are ready. Choose by the
-            // DAG's critical-path/LST priority using the previous frame costs.
-            for (int remaining = 2; remaining; --remaining) {
+            // Dispatch the remaining I/O tasks at their shared frontier.
+            for (int remaining = store_started ? 1 : 2; remaining; --remaining) {
                 const auto io = work->dag.ready({store_task,next_prefetch});
                 if (io.empty()) throw std::logic_error("post-attention I/O dependencies missing");
                 if (io.front() == next_prefetch) impl_->next_layer(work);
-                else {
-                    work->dag.start(store_task, impl_->trace.now());
-                    work->store = impl_->session.prefetcher().store_full_layer(work->layer);
-                    if (work->store) impl_->storing.push_back(work);
-                    else work->dag.complete(store_task, impl_->trace.now(), "buffered_or_synchronous_store");
-                }
+                else impl_->start_store(work);
             }
             impl_->progress_after_attention(work,epoch);
         });

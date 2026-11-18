@@ -78,6 +78,7 @@ public:
     void unpin(const SlotLease & lease) { slots_.unpin(lease); }
     std::vector<SlotLease> ready() const;
     std::shared_ptr<const StoreReceipt> store_full_layer(std::uint32_t layer);
+    bool asynchronous_stores() const { return disk_ != nullptr; }
     void wait_store(std::uint32_t layer);
     void finish_stores();
     void finish();
