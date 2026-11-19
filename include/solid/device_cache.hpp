@@ -53,7 +53,9 @@ public:
     DeviceCache(Prefetcher & host, KvGeometry geometry, std::uint32_t query_heads, DeviceTransport & transport,
                 const std::filesystem::path & trace = {});
     ~DeviceCache();
-    void prefetch_ready();
+    // before_upload runs immediately before a new transfer starts, not after its
+    // enqueue returns; the graph boundary may arrive during that enqueue.
+    void prefetch_ready(const std::function<void()> & before_upload = {});
     void reap_transfers();
     void wait_transfers();
     void wait_transfers_coalesced();
@@ -86,7 +88,8 @@ private:
     std::uint64_t epoch_ = 0;
     void poll_transfers(bool wait);
     void retain(const std::vector<BlockIdentity> & identities);
-    SlotLease upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage = {});
+    SlotLease upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage = {},
+                     const std::function<void()> & before_upload = {});
     SlotLease upload_current(const BlockIdentity & identity,const std::optional<SlotLease> & host,const CurrentDeviceKv & current);
     std::optional<SlotLease> acquire_shared(const BlockIdentity & identity,std::uint32_t slot);
     std::optional<SlotLease> prefix(const BlockIdentity & identity) const;

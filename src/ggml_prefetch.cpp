@@ -537,7 +537,7 @@ struct LayerWork {
     bool direct = false;
     bool deferred_archive;
     LayerWork(std::uint32_t layer, std::uint64_t position, ScheduleMode mode, ScheduleTrace & trace,
-               std::uint64_t id, const std::array<std::uint64_t, task_count> & estimates, bool archive, bool single_layer,bool shared) :
+               std::uint64_t id, const std::array<std::uint64_t, task_count> & estimates, bool archive, bool single_layer) :
         layer(layer), position(position), dag([&] {
             const bool serial = mode == ScheduleMode::naive;
             std::vector<TaskSpec> specs = {
@@ -561,7 +561,6 @@ struct LayerWork {
                 specs[current_h2d].predecessors={kv_projection,miss_read,history_h2d};
                 if (single_layer) specs[next_prefetch].predecessors.push_back(append);
             }
-            if (shared) specs[next_prefetch].predecessors.push_back(attention);
             for (std::size_t i = 0; i < specs.size(); ++i) specs[i].estimate_ns = estimates[i];
             return specs;
         }(), &trace, id, layer, position, mode), deferred_archive(archive) {}
@@ -599,7 +598,7 @@ struct GgmlPrefetch::Impl {
         if (work && work->dag.task(attention).state != TaskState::complete) throw std::logic_error("new layer started before previous attention completion");
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
         work = std::make_shared<LayerWork>(layer, position, mode, trace, ++sequence, estimates,
-            direct && mode!=ScheduleMode::naive, session.geometry().layers==1,transport.aliases_host_slots());
+            direct && mode!=ScheduleMode::naive, session.geometry().layers==1);
         const auto time=trace.now();
         if (projection_ns) {
             work->dag.start(q_ready,time);
@@ -647,34 +646,35 @@ struct GgmlPrefetch::Impl {
         else frame->dag.complete(store_task, trace.now(), "buffered_or_synchronous_store");
     }
     void next_layer(const std::shared_ptr<LayerWork> & current) {
-        if (transport.aliases_host_slots() && current->dag.task(attention).state!=TaskState::complete) return;
         const auto next = current->layer + 1 < session.geometry().layers ? current->layer + 1 : 0;
         const auto position = next ? current->position : current->position + 1;
         current->dag.start(next_prefetch, trace.now());
         if (position<session.geometry().capacity_tokens) {
             begin_prediction(next, position);
-            current->dag.complete(next_prefetch, trace.now(),transport.aliases_host_slots()?"shared_attention_buffer_released":"");
-        } else current->dag.complete(next_prefetch,trace.now(),transport.aliases_host_slots()?"shared_context_capacity_reached":"context_capacity_reached");
+            current->dag.complete(next_prefetch, trace.now(),transport.aliases_host_slots()?"shared_prefetch_planned":"");
+        } else current->dag.complete(next_prefetch,trace.now(),"context_capacity_reached");
     }
     void begin_prediction(std::uint32_t layer, std::uint64_t position) {
         session.begin_prefetch(layer, position, {block_read_estimate, block_copy_estimate});
         observe_stores();
     }
-    void release_attention(const char * proof,std::optional<std::uint64_t> device_ns={}) {
+    void release_attention(const char * proof,std::optional<std::uint64_t> device_ns={},const std::function<void()> & before_upload={}) {
         if (!device.attention_pending()) return;
         if (device.attention_complete(device.attention_epoch())) {
             work->dag.complete(attention, trace.now(), proof, device_ns);
-            if (transport.aliases_host_slots()) next_layer(work);
             if (work->dag.finished()) finish_frame(work);
             session.prefetcher().poll();
             observe_stores();
-            device.prefetch_ready();
+            device.prefetch_ready(before_upload);
         }
     }
     void progress_after_attention(const std::shared_ptr<LayerWork> & current,std::uint64_t epoch) {
         if (!events) return;
         bool released=false;
         auto & host=session.prefetcher();
+        const auto before_upload=[this,epoch] {
+            if (!events->boundary_seen(epoch)) ++totals.uploads_before_boundary;
+        };
         while (!events->stopped()) {
             // Clear notifications before inspecting queues/state. A producer
             // arriving after these checks leaves a counter for the next wait.
@@ -689,11 +689,9 @@ struct GgmlPrefetch::Impl {
                     if (receipt->proof==AttentionProof::query_boundary) { ++totals.query_reused_fences; proof="query_dependency_reuse"; }
                     else { ++totals.process_reused_fences; proof="process_synchronize_reuse"; }
                 }
-                const auto before=device.stats().uploads;
-                release_attention(proof, receipt->device_ns ? std::optional<std::uint64_t>{receipt->device_ns} : std::nullopt);
+                release_attention(proof, receipt->device_ns ? std::optional<std::uint64_t>{receipt->device_ns} : std::nullopt,before_upload);
                 device.reap_transfers();
                 released=true;
-                if (!events->boundary_seen(epoch)) totals.uploads_before_boundary+=device.stats().uploads-before;
             }
             if (released) {
                 // Give formal correction the coordinator as soon as its query
@@ -703,9 +701,7 @@ struct GgmlPrefetch::Impl {
                     host.poll(true);
                     observe_stores();
                 }
-                const auto before=device.stats().uploads;
-                device.prefetch_ready();
-                if (!events->boundary_seen(epoch)) totals.uploads_before_boundary+=device.stats().uploads-before;
+                device.prefetch_ready(before_upload);
                 if (!host.pending_reads() && !host.pending_stores()) {
                     device.reap_transfers();
                     return;
@@ -936,7 +932,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
                 work->dag.complete(current_h2d, impl_->trace.now(), "shared_upload_batch");
                 work->dag.start(attention, impl_->trace.now());
             }
-            bool next_started=impl_->transport.aliases_host_slots();
+            bool next_started=false;
             if (work->deferred_archive) {
                 work->dag.start(kv_d2h,impl_->trace.now());
                 if (!next_started && impl_->session.geometry().layers>1) { impl_->next_layer(work); next_started=true; }

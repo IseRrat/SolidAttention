@@ -116,7 +116,7 @@
 
 4. **Attention 完成通知**
 
-   CUDA 已接入原生事件和图捕获/重放通知；SYCL 已接入结束事件和带 epoch 的独立队列通知。协调线程据此释放旧工作集读者并推进后继上传，后继 Q 与请求边界也具有完成证明。
+   CUDA 已接入原生事件和图捕获/重放通知；SYCL 已接入结束事件和带 epoch 的独立队列通知。协调线程据此释放旧工作集读者并推进后继上传，后继 Q 与请求边界也具有完成证明。早于后继边界的上传次数，以上传开始派发时的边界状态为准。
 
    [attention_events.cpp](../src/attention_events.cpp)、[attention_events.cu](../src/cuda/attention_events.cu)、[cuda_completion.cuh](../include/solid/cuda_completion.cuh)、[attention_events.cpp](../src/sycl/attention_events.cpp)。
 
@@ -124,7 +124,7 @@
 
    SYCL 已为支持共享 USM 的集成 GPU 分配共享 KV bank，SSD READ 与 dirty 数据转发直接填入该 bank 的历史槽位，attention 使用同一地址。主机释放独立块载荷，历史块安装只登记槽位和完成票据。共享内存的所有权随块视图保留，覆盖原 I/O 完成及排空过程。
 
-   共享槽位在 attention 期间同时持有主机和设备读者。下一层预取依赖 attention 完成，释放读者后复用同一缓冲。每个 KV head 另保留一个当前块，写入当前设备行并复用尾块前缀。独立复制队列处理当前行及其历史缺口，具有事件查询和计算队列依赖。
+   共享槽位在 attention 期间同时持有主机和设备读者。下一层预测先使用空闲槽位发起 SSD 读取；没有空位的块保留在有界预测计划中，原读者释放后继续派发。正式选择接管时清除尚未派发的预测，按纠错顺序加载所需块。每个 KV head 另保留一个当前块，写入当前设备行并复用尾块前缀。独立复制队列处理当前行及其历史缺口，具有事件查询和计算队列依赖。
 
    CUDA 及独立显存的异步复制路径将主机块直接绑定到上传所用的固定内存 bank，SSD READ 和 dirty 转发直接填充上传源。历史块与尾块前缀上传复用该地址，原复制票据持有源租约，省去普通内存到固定内存的中间复制。固定内存计入复制缓冲占用。
 

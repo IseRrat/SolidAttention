@@ -18,7 +18,7 @@ DeviceCache::DeviceCache(Prefetcher & host, KvGeometry geometry, std::uint32_t q
         for (std::uint32_t head=0;head<geometry.heads;++head) for (std::uint32_t slot=0;slot<host.slots_per_head();++slot) {
             addresses.push_back(transport_.host_slot_storage(head*slots_.slots_per_head()+slot));
         }
-        host_.bind_shared_blocks(addresses,transport_.host_storage_owner());
+        host_.bind_shared_blocks(addresses,transport_.host_storage_owner(),transport_.aliases_host_slots());
     }
     if (!trace.empty()) {
         if (std::filesystem::exists(trace)) throw std::runtime_error("device trace already exists");
@@ -94,7 +94,7 @@ void DeviceCache::retain(const std::vector<BlockIdentity> & identities) {
         ++stats_.overwritten_blocks;
     }
 }
-SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage) {
+SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage,const std::function<void()> & before_upload) {
     auto existing = slots_.find(host.identity);
     const auto shared_index=host.identity.head*slots_.slots_per_head()+host.slot%host_.slots_per_head();
     if (existing && transport_.aliases_host_slots() && existing->slot!=shared_index) {
@@ -117,6 +117,7 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
     try {
         const auto & block = host_.block(host);
         if (stage) stage->copy_started(host.identity);
+        if (before_upload) before_upload();
         ticket = transport_.upload(device->slot, block);
         transfers_.push_back({ticket, host, *device,stage});
         ++stats_.uploads;
@@ -186,7 +187,7 @@ SlotLease DeviceCache::upload_current(const BlockIdentity & identity,const std::
     }
     return *device;
 }
-void DeviceCache::prefetch_ready() {
+void DeviceCache::prefetch_ready(const std::function<void()> & before_upload) {
     if (!attention_.empty()) throw std::logic_error("prefetch upload while device attention still owns slots");
     poll_transfers(false);
     const auto ready = host_.ready();
@@ -198,7 +199,7 @@ void DeviceCache::prefetch_ready() {
     for (const auto & lease : ready) {
         const auto existing=slots_.find(lease.identity);
         if (transport_.aliases_host_slots() && existing && existing->slot%slots_.slots_per_head()==slots_.slots_per_head()-1) continue;
-        (void) upload(lease);
+        (void) upload(lease,{},before_upload);
     }
 }
 void DeviceCache::stage(const std::vector<SlotLease> & host_leases) {

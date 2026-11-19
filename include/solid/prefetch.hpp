@@ -69,7 +69,7 @@ public:
     Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t slots_per_head,
                std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace = {});
     ~Prefetcher();
-    void bind_shared_blocks(const std::vector<Half *> & addresses, std::shared_ptr<void> owner);
+    void bind_shared_blocks(const std::vector<Half *> & addresses, std::shared_ptr<void> owner,bool attention_shared=false);
     void begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
@@ -89,11 +89,12 @@ public:
     std::uint32_t slots_per_head() const { return slots_.slots_per_head(); }
     std::optional<std::uint32_t> active_layer() const { return layer_; }
     int completion_handle() const { return reader_->completion_handle(); }
-    bool pending_reads() const { return !requests_.empty() || !queued_.empty(); }
+    bool pending_reads() const { return !requests_.empty() || !queued_.empty() || !predictions_.empty(); }
     bool pending_stores() const { return !write_queue_.empty(); }
 private:
     struct Job { SlotLease lease; KvReadSegment segment; ReadDispatch dispatch; };
     struct ReadStage { SlotLease lease; std::shared_ptr<BlockStage> stage; };
+    struct Prediction { BlockIdentity identity; ReadDispatch read; ReadDispatch copy; };
     struct WriteBatch {
         std::vector<KvWriteSegment> segments;
         std::size_t next = 0;
@@ -110,6 +111,7 @@ private:
     std::vector<std::vector<std::vector<std::uint64_t>>> history_;
     std::map<std::uint64_t, Job> requests_;
     std::vector<Job> queued_;
+    std::vector<Prediction> predictions_;
     std::unique_ptr<AsyncReader> reader_;
     FileKvStore * disk_ = nullptr;
     std::vector<std::shared_ptr<StoreReceipt>> store_receipts_;
@@ -121,8 +123,9 @@ private:
     std::uint64_t next_id_ = 1;
     PrefetchStats stats_;
     bool failed_ = false;
+    bool attention_shared_ = false;
     void check() const;
-    void issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch);
+    void issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch,bool dispatch_now=true);
     SlotLease load(const BlockIdentity & identity, ReadDispatch dispatch,const std::shared_ptr<BlockStage> & stage = {});
     void promote(const SlotLease & lease, ReadDispatch dispatch);
     std::optional<SlotLease> prefix(const BlockIdentity & identity) const;
@@ -130,6 +133,7 @@ private:
     bool selected(std::uint64_t block) const;
     void retire(const SlotLease & lease);
     void pump();
+    void pump_predictions();
     void pump_store();
     bool complete_store(const ReadCompletion & completion);
     void event(const char * name, const SlotLease & lease);

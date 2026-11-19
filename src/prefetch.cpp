@@ -127,7 +127,7 @@ Prefetcher::~Prefetcher() {
         } catch (...) { std::terminate(); }
     }
 }
-void Prefetcher::bind_shared_blocks(const std::vector<Half *> & addresses,std::shared_ptr<void> owner) {
+void Prefetcher::bind_shared_blocks(const std::vector<Half *> & addresses,std::shared_ptr<void> owner,bool attention_shared) {
     check();
     if (layer_ || pending_reads() || addresses.size()!=blocks_.size() || !owner ||
         std::any_of(addresses.begin(),addresses.end(),[](const auto * p) { return !p; })) {
@@ -135,6 +135,7 @@ void Prefetcher::bind_shared_blocks(const std::vector<Half *> & addresses,std::s
     }
     const auto elements=static_cast<std::size_t>(store_.geometry().block_tokens)*2*store_.geometry().dimension;
     for (std::size_t i=0;i<blocks_.size();++i) blocks_[i].bind_shared(addresses[i],elements,owner);
+    attention_shared_=attention_shared;
     stats_.host_bytes=0; // The shared bank is counted by the device transport.
 }
 void Prefetcher::check() const { if (failed_) throw std::runtime_error("prefetch session failed"); }
@@ -206,6 +207,7 @@ void Prefetcher::event(const char * name, const SlotLease & lease) {
     if (!trace_) { failed_ = true; throw std::runtime_error("prefetch trace write failed"); }
 }
 void Prefetcher::pump() {
+    pump_predictions();
     while (!queued_.empty()) {
         const auto next=std::min_element(queued_.begin(),queued_.end(),[](const Job & a,const Job & b) { return a.dispatch.before(b.dispatch); });
         const auto job = *next;
@@ -222,14 +224,30 @@ void Prefetcher::pump() {
     catch (...) { failed_ = true; throw; }
     reader_->flush();
 }
-void Prefetcher::issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch) {
+void Prefetcher::issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch,bool dispatch_now) {
     const auto & id = lease.identity;
     const auto segments = store_.plan_read(id.layer, id.head, id.block, blocks_[lease.slot], prefix);
     if (blocks_[lease.slot].version != id.version) throw std::logic_error("read plan version changed before submission");
     pending_[lease.slot] = segments.size();
     for (const auto & segment : segments) queued_.push_back({lease, segment, dispatch});
     if (segments.empty()) { slots_.complete(lease); read_complete(lease,"host_forwarded"); event("ready", lease); }
-    pump();
+    if (dispatch_now) pump();
+}
+void Prefetcher::pump_predictions() {
+    if (failed_) return;
+    for (auto it=predictions_.begin();it!=predictions_.end();) {
+        auto lease=slots_.find(it->identity);
+        if (!lease) {
+            lease=slots_.acquire(it->identity);
+            if (!lease) { ++it; continue; }
+            stages_[lease->slot]={*lease,{}};
+            upload_order_[lease->slot]=it->copy;
+            issue(*lease,0,it->read,false);
+            event("predict",*lease);
+        } else upload_order_[lease->slot]=it->copy;
+        ++stats_.predicted_blocks;
+        it=predictions_.erase(it);
+    }
 }
 SlotLease Prefetcher::load(const BlockIdentity & id, ReadDispatch dispatch,const std::shared_ptr<BlockStage> & stage) {
     auto lease = slots_.acquire(id);
@@ -326,7 +344,10 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
     const auto & g = store_.geometry();
     if (layer >= g.layers || position >= g.capacity_tokens || store_.length(layer) != position) throw std::invalid_argument("prefetch begin position mismatch");
     if (layer_ == layer && position_ == position) { poll(); return; }
-    for (std::uint32_t i = 0; i < slots_.size(); ++i) if (slots_.entry(i).readers) throw std::logic_error("host slots still held by a transfer");
+    if (!attention_shared_) for (std::uint32_t i = 0; i < slots_.size(); ++i) {
+        if (slots_.entry(i).readers) throw std::logic_error("host slots still held by a transfer");
+    }
+    predictions_.clear();
     layer_ = layer;
     position_ = position;
     std::vector<BlockIdentity> predicted;
@@ -355,7 +376,7 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
     };
     const auto read_cost = [&](const BlockIdentity & id) {
         const auto lease = slots_.find(id);
-        if (lease && slots_.entry(lease->slot).state == SlotState::ready) return std::uint64_t{1};
+        if (lease && !slots_.entry(lease->slot).producer) return std::uint64_t{1};
         const auto full = costs.full_read_ns;
         return std::max<std::uint64_t>(1, full / g.block_tokens * id.version +
             full % g.block_tokens * id.version / g.block_tokens);
@@ -364,14 +385,14 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
     tasks.reserve(predicted.size());
     for (const auto & id : predicted) tasks.push_back({id, priority(id), read_cost(id), costs.full_upload_ns});
     const BlockStage plan(std::move(tasks), nullptr, 0, layer, position);
-    struct PlannedRead { BlockIdentity identity; ReadDispatch read; ReadDispatch copy; };
-    std::vector<PlannedRead> ordered;
+    std::vector<Prediction> ordered;
     ordered.reserve(predicted.size());
     for (const auto & id : predicted) ordered.push_back({id, plan.dispatch(id), plan.copy_dispatch(id)});
-    std::stable_sort(ordered.begin(), ordered.end(), [](const PlannedRead & a, const PlannedRead & b) {
+    std::stable_sort(ordered.begin(), ordered.end(), [](const Prediction & a, const Prediction & b) {
         return a.read.before(b.read);
     });
-    for (const auto & job : ordered) {
+    if (attention_shared_) predictions_=std::move(ordered);
+    else for (const auto & job : ordered) {
         auto lease = slots_.find(job.identity);
         if (!lease) {
             lease = load(job.identity, job.read);
@@ -437,6 +458,9 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
         needed=ordered;
     }
     const auto dispatch=[&](const BlockIdentity & id) { return stage?stage->dispatch(id):ReadDispatch{priority(id)}; };
+    // Formal selection owns admission now. It will issue the required blocks
+    // with correction keys, rather than filling freed slots with stale guesses.
+    predictions_.clear();
     // Promote all existing required jobs before waiting for any old producer.
     for (const auto & id:needed) {
         const auto lease=slots_.find(id);
@@ -540,6 +564,7 @@ std::vector<SlotLease> Prefetcher::ready() const {
     return result;
 }
 void Prefetcher::finish() {
+    predictions_.clear();
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
         if (slots_.entry(i).readers) throw std::logic_error("finish with pinned host slot");
         if (slots_.entry(i).state != SlotState::free) retire(slots_.lease(i));

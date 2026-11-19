@@ -24,8 +24,14 @@ public:
     bool copy_ready(ggml_backend_event *) const override { return true; }
     bool host_marker() const override { return true; }
     const char * name() const override { return "cpu_protocol"; }
+    std::function<void()> first_receipt;
 protected:
-    std::uint64_t elapsed_ns(std::uint32_t) const override { return 7; }
+    std::uint64_t elapsed_ns(std::uint32_t) const override {
+        if (!checked_) { checked_=true; if (first_receipt) first_receipt(); }
+        return 7;
+    }
+private:
+    mutable bool checked_=false;
 };
 struct Observer {
     solid::GgmlPrefetch * device;
@@ -65,6 +71,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(), ggml_backend_free);
     std::unique_ptr<solid::KvStore> store;
     std::unique_ptr<solid::AsyncReader> reader;
+    Reader * submitted_reads=nullptr;
     OverlapBarrier barrier;
     const bool controlled = !disk && mode != solid::ScheduleMode::naive && !shared;
     if (disk) {
@@ -75,6 +82,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     } else {
         auto file = std::make_unique<File>();
         auto fake = std::make_unique<Reader>(file.get());
+        submitted_reads=fake.get();
         if (controlled) fake->before_wait = [&] { barrier.io_wait(); };
         store = std::make_unique<solid::FileKvStore>(geometry, std::move(file), 2048);
         reader = std::move(fake);
@@ -118,9 +126,16 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     session.flush();
     const auto directory = traces.empty() ? std::filesystem::path{} : traces / (disk ? "uring" : "memory");
     if (!directory.empty()) std::filesystem::create_directory(directory);
+    auto events=native?std::make_unique<Events>(geometry.layers):nullptr;
+    if (shared && events && submitted_reads) events->first_receipt=[&] {
+        const auto next_layer=geometry.block_offset(1,0,0);
+        require(std::any_of(submitted_reads->submitted.begin(),submitted_reads->submitted.end(),[&](const auto & read) {
+            return read.offset>=next_layer;
+        }),"shared next-layer READ waited for attention completion");
+    };
     solid::GgmlPrefetch device(session, backend.get(), directory.empty() ? std::filesystem::path{} : directory / "residency.jsonl",
         mode, directory.empty() ? std::filesystem::path{} : directory / "schedule.jsonl",-1,
-        native?std::make_unique<Events>(geometry.layers):nullptr,shared);
+        std::move(events),shared);
     std::unique_ptr<ggml_context, decltype(&ggml_free)> context(ggml_init({4 * 1024 * 1024, nullptr, true}), ggml_free);
     auto * q = ggml_new_tensor_3d(context.get(), GGML_TYPE_F32, dimension, query_heads, 1);
     ggml_set_input(q);

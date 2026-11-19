@@ -212,12 +212,55 @@ void streaming(bool fail_upload) {
     }
     cache.finish(); host.finish();
 }
+void shared_prediction_admission(std::uint32_t slots) {
+    const solid::KvGeometry g{2,1,2,2,16,64,solid::KvLayout::interleaved};
+    const auto elements=static_cast<std::size_t>(g.block_tokens)*2*g.dimension;
+    auto file=std::make_unique<File>(); auto reader=std::make_unique<Reader>(file.get(),8); auto * observe=reader.get();
+    solid::FileKvStore store(g,std::move(file),16); fill(store,6);
+    solid::Prefetcher host(store,{6,1,3,1},slots,std::move(reader));
+    auto bank=std::make_shared<std::vector<solid::Half>>(slots*elements);
+    std::vector<solid::Half *> addresses;
+    for (std::uint32_t i=0;i<slots;++i) addresses.push_back(bank->data()+i*elements);
+    host.bind_shared_blocks(addresses,bank,true);
+    const std::vector<solid::HeadSelection> actual{{{0,1,2,4,5,6},{}}};
+    host.begin(0,6);
+    const auto old=host.resolve_history(0,6,actual);
+    require(old.size()==3,"shared admission needs three attention readers");
+    std::vector<std::vector<solid::Half>> snapshots;
+    for (const auto & lease:old) {
+        const auto & block=host.block(lease);
+        snapshots.emplace_back(block.storage(),block.storage()+block.storage_size());
+    }
+    const auto before=observe->submitted.size();
+    host.begin(1,6); // Must not wait for the previous attention's readers.
+    observe->auto_complete=true; host.poll(); observe->auto_complete=false;
+    require(observe->submitted.size()==before+(slots-3),"free shared slots were not admitted before attention completed");
+    require(host.pending_reads(),"blocked shared predictions were dropped");
+    for (std::size_t i=0;i<old.size();++i) require(std::equal(snapshots[i].begin(),snapshots[i].end(),addresses[old[i].slot]),
+        "prediction overwrote a live shared attention reader");
+    host.unpin(old.front()); host.poll();
+    require(observe->submitted.size()==before+(slots-2),"released shared slot did not resume prediction admission");
+    for (std::size_t i=1;i<old.size();++i) {
+        require(std::equal(snapshots[i].begin(),snapshots[i].end(),addresses[old[i].slot]),"partial release exposed another reader");
+        host.unpin(old[i]);
+    }
+    const auto next=host.resolve_history(1,6,actual);
+    for (const auto & lease:next) {
+        solid::KvBlock expected; store.read(1,0,lease.identity.block,expected);
+        const auto & block=host.block(lease);
+        require(block.storage_size()==expected.data.size() && std::equal(expected.data.begin(),expected.data.end(),block.storage()),
+                "deferred shared read returned stale layer data");
+        host.unpin(lease);
+    }
+    host.finish();
+}
 int main() {
     try {
         slots(); prefix(); wrong_predictions(); read_error(solid::KvLayout::interleaved);
         read_error(solid::KvLayout::separate); capacity(); device(); deferred_device();
         for (const auto layout:{solid::KvLayout::separate,solid::KvLayout::interleaved}) for (const auto capacity:{1u,64u}) selected_first(layout,capacity);
         streaming(false); streaming(true);
+        shared_prediction_admission(3); shared_prediction_admission(4);
         std::cout << "prefetch, correction, cancellation races, versions, host/device leases and stable slots passed\n";
         return 0;
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }
