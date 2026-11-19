@@ -80,7 +80,10 @@ void RepresentativeIndex::observe_query(std::uint32_t layer, std::uint64_t posit
             ++block.finalized;
         }
         const auto block = token.position / geometry_.block_tokens;
-        if (ranker_ && ready(layer, block)) publish(*ranker_, layer, block, 1);
+        if (ranker_ && ready(layer, block)) {
+            publish(*ranker_, layer, block, 1);
+            release_published_keys(layer, block);
+        }
         pending.pop_front();
     }
     query_pending_[layer] = true;
@@ -140,12 +143,22 @@ double RepresentativeIndex::score(std::uint32_t layer, std::uint32_t head, std::
         throw std::invalid_argument("block representative is not ready or query has wrong shape");
     }
     const auto & tokens = blocks_.at(index(layer, head)).at(block).tokens;
+    std::vector<Half> device_keys;
+    if (std::any_of(tokens.begin(), tokens.end(), [](const auto & token) { return token.key.empty(); })) {
+        if (!ranker_ || !ranker_->owns_representative_keys()) throw std::logic_error("representative key owner is missing");
+        device_keys = ranker_->read_representatives(layer, block);
+        const auto elements = static_cast<std::size_t>(geometry_.heads) * budget_.representatives * geometry_.dimension;
+        if (device_keys.size() != elements) throw std::runtime_error("representative readback shape mismatch");
+        for (const auto key : device_keys) if (!std::isfinite(from_half(key))) throw std::runtime_error("non-finite representative readback");
+    }
     const auto group = query_heads_ / geometry_.heads;
     double value = 0;
-    for (const auto & token : tokens) {
+    for (std::size_t r = 0; r < tokens.size(); ++r) {
+        const auto * key = device_keys.empty() ? tokens[r].key.data() :
+            device_keys.data() + (static_cast<std::size_t>(head) * budget_.representatives + r) * geometry_.dimension;
         for (std::uint32_t q = head * group; q < (head + 1) * group; ++q) {
             for (std::uint32_t d = 0; d < geometry_.dimension; ++d) {
-                value += static_cast<double>(query[q * geometry_.dimension + d]) * from_half(token.key[d]) / group;
+                value += static_cast<double>(query[q * geometry_.dimension + d]) * from_half(key[d]) / group;
             }
         }
     }
@@ -187,6 +200,17 @@ void RepresentativeIndex::set_ranker(std::unique_ptr<BlockRanker> ranker) {
             auto & partial = blocks_[index(layer, head)].at(matured/geometry_.block_tokens);
             partial.tokens.clear(); partial.finalized = 0;
         }
+    }
+    for (std::uint32_t layer = 0; layer < geometry_.layers; ++layer) {
+        for (std::uint64_t block = 0; block < geometry_.blocks_per_head() && ready(layer, block); ++block) {
+            release_published_keys(layer, block);
+        }
+    }
+}
+void RepresentativeIndex::release_published_keys(std::uint32_t layer, std::uint64_t block) {
+    if (!ranker_ || !ranker_->owns_representative_keys()) return;
+    for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
+        for (auto & token : blocks_[index(layer, head)].at(block).tokens) std::vector<Half>().swap(token.key);
     }
 }
 RepresentativeSeed RepresentativeIndex::builder_seed(std::uint32_t layer) const {
@@ -241,7 +265,9 @@ void RepresentativeIndex::accept_built(std::uint32_t layer, std::uint64_t positi
         for (std::uint32_t r = 0; r < budget_.representatives; ++r) {
             const auto i = static_cast<std::size_t>(head)*budget_.representatives+r;
             const auto begin = built->keys.begin()+i*geometry_.dimension;
-            target.tokens.push_back({built->positions[i], built->scores[i], {begin, begin+geometry_.dimension}});
+            std::vector<Half> keys;
+            if (!ranker_->owns_representative_keys()) keys.assign(begin, begin+geometry_.dimension);
+            target.tokens.push_back({built->positions[i], built->scores[i], std::move(keys)});
         }
         target.finalized = geometry_.block_tokens;
     }

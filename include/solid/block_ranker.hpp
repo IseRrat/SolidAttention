@@ -60,6 +60,12 @@ public:
                                                         const BlockCandidates & candidates) = 0;
     virtual RankerStats stats() const = 0;
     virtual const char * name() const = 0;
+    // An owning backend keeps every published immutable K block. The index may
+    // release its host payload; diagnostic scoring reads back one block only.
+    virtual bool owns_representative_keys() const { return false; }
+    virtual std::vector<Half> read_representatives(std::uint32_t, std::uint64_t) {
+        throw std::logic_error("representative readback is disabled");
+    }
     virtual std::uint32_t builder_window() const { return 0; }
     virtual const char * builder_name() const { return "cpu"; }
     virtual std::optional<DeviceMemory> direct_memory() const { return {}; }

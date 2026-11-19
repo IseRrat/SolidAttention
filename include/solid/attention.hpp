@@ -54,6 +54,7 @@ private:
     void publish(BlockRanker & ranker, std::uint32_t layer, std::uint64_t first, std::uint64_t count) const;
     RepresentativeSeed builder_seed(std::uint32_t layer) const;
     void accept_built(std::uint32_t layer, std::uint64_t position, const std::optional<BuiltRepresentatives> & built);
+    void release_published_keys(std::uint32_t layer, std::uint64_t block);
     std::size_t index(std::uint32_t layer, std::uint32_t head) const;
     std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const std::vector<float> * query,
                                                      const DeviceQuery * device, const BlockCandidates & candidates) const;

@@ -179,6 +179,10 @@ public:
     }
     solid::RankerStats stats() const override { return stats_; }
     const char * name() const override { return "host_builder_and_ranker"; }
+    bool owns_representative_keys() const override { return true; }
+    std::vector<solid::Half> read_representatives(std::uint32_t layer,std::uint64_t block) override {
+        return bank.at({layer,block});
+    }
     solid::KvGeometry g;
     std::uint32_t qh;
     solid::SparseBudget b;
@@ -197,8 +201,11 @@ template<class Factory> void run_case(Factory factory, solid::KvGeometry g, std:
     std::vector<solid::Half> keys(static_cast<std::size_t>(g.heads)*g.dimension);
     std::mt19937 random(1871);
     std::uint64_t device_bytes = 0;
+    bool owns_keys = false;
     const auto configure = [&] {
-        actual.set_ranker(factory(g,qh,budget)); device_bytes = actual.ranker_stats().device_bytes;
+        auto ranker=factory(g,qh,budget);
+        owns_keys=ranker->owns_representative_keys();
+        actual.set_ranker(std::move(ranker)); device_bytes = actual.ranker_stats().device_bytes;
     };
     if (!attach) configure();
     for (std::uint32_t p = 0; p < g.capacity_tokens; ++p) {
@@ -225,6 +232,10 @@ template<class Factory> void run_case(Factory factory, solid::KvGeometry g, std:
     require(stats.builder_queries == static_cast<std::uint64_t>(g.capacity_tokens-attach)*g.layers &&
             stats.builder_appends == stats.builder_queries,"builder query/append counters");
     require(stats.published_blocks == static_cast<std::uint64_t>(g.capacity_tokens-budget.local)/g.block_tokens*g.layers,"builder published prefix");
+    const auto finalized_keys=static_cast<std::uint64_t>((g.capacity_tokens-budget.local)/g.block_tokens)*
+        g.layers*g.heads*budget.representatives*g.dimension*sizeof(solid::Half);
+    if (owns_keys && finalized_keys) require(actual.resident_bytes()+finalized_keys<=reference.resident_bytes(),
+        "owning builder retained finalized K payloads on the host");
 }
 
 template<class Factory> void run_cases(Factory factory) {

@@ -200,6 +200,14 @@ public:
     }
     const char * name() const override { return std::is_same_v<Score, double> ? "sycl_fp64_topk" : "sycl_float_pair_topk"; }
     RankerStats stats() const override { return stats_; }
+    bool owns_representative_keys() const override { return true; }
+    std::vector<Half> read_representatives(std::uint32_t layer, std::uint64_t block) override {
+        const auto & state = checked_layer(layer);
+        if (block >= state.published) throw std::out_of_range("SYCL representative readback block");
+        std::vector<Half> keys(block_elements_);
+        execute([&] { queue_.memcpy(keys.data(), state.bank.get() + block * block_elements_, keys.size() * sizeof(Half)); });
+        return keys;
+    }
 
     void seed_builder(std::uint32_t layer, const RepresentativeSeed & seed) override {
         auto & state = checked_layer(layer);

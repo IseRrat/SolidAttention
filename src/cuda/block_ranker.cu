@@ -533,6 +533,19 @@ public:
     }
     RankerStats stats() const override { return stats_; }
     const char * name() const override { return "cuda_fp64_topk"; }
+    bool owns_representative_keys() const override { return true; }
+    std::vector<Half> read_representatives(std::uint32_t layer, std::uint64_t block) override {
+        check();
+        if (layer >= geometry_.layers || block >= published_[layer]) throw std::out_of_range("CUDA representative readback block");
+        std::vector<Half> keys(block_elements_);
+        DeviceScope scope(device_);
+        try {
+            checked(cudaMemcpyAsync(keys.data(), static_cast<const Half *>(banks_[layer]) + block * block_elements_,
+                product(block_elements_, sizeof(Half)), cudaMemcpyDeviceToHost, stream_), "read back representative block");
+            checked(cudaStreamSynchronize(stream_), "complete representative readback");
+        } catch (...) { fail(); throw; }
+        return keys;
+    }
 private:
     void validate_pointer(const void * pointer) const {
         check();

@@ -67,6 +67,10 @@ public:
     }
     solid::RankerStats stats() const override { return {123, 45, calls, 0, publications}; }
     const char * name() const override { return "host_contract_oracle"; }
+    bool owns_representative_keys() const override { return true; }
+    std::vector<solid::Half> read_representatives(std::uint32_t layer,std::uint64_t block) override {
+        return banks.at({layer,block});
+    }
     solid::KvGeometry geometry;
     std::uint32_t query_heads, representatives;
     std::map<std::pair<std::uint32_t, std::uint64_t>, std::vector<solid::Half>> banks;
@@ -107,6 +111,8 @@ void incremental(bool late_attach, bool ties, std::uint32_t count) {
     }
     require(inspect->calls > 0 && inspect->publications == 30, "missing device calls or incremental finalized blocks");
     require(offloaded.ranker_stats().device_bytes == 123, "device memory accounting");
+    const auto finalized_keys=static_cast<std::uint64_t>(inspect->publications)*g.heads*count*g.dimension*sizeof(solid::Half);
+    require(offloaded.resident_bytes()+finalized_keys<=reference.resident_bytes(),"published K mirror survived device ownership transfer");
     rejects([&] { offloaded.set_ranker(std::make_unique<OracleRanker>(g, 6, count)); });
     // Neither the last partial block nor tokens still in the local window publish.
     require(inspect->published[0] == 15 && inspect->published[1] == 15, "tail publication boundary");

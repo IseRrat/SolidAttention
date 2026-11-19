@@ -42,7 +42,7 @@
 
 2. **代表向量构造**
 
-   已实现后续 local 窗口评分、GQA 查询均值、块内 top-R 和完整块定稿。代表同分按绝对位置排序。支持 CPU 状态种子和定稿代表增量发布。
+   已实现后续 local 窗口评分、GQA 查询均值、块内 top-R 和完整块定稿。代表同分按绝对位置排序。支持 CPU 状态种子和定稿代表增量发布。CUDA/SYCL 接管后，已发布代表的 K 数据由设备 bank 保存，主机释放对应载荷并保留位置、分数和定稿状态；后续定稿也采用这一归属。逐块评分核查按需回读单块，保持原累加顺序，正常选块直接使用设备 bank。
 
    [attention.cpp](../src/attention.cpp)、[representative_builder.cpp](../src/representative_builder.cpp)、[representative_math.hpp](../include/solid/representative_math.hpp)。
 
