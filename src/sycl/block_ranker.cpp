@@ -424,22 +424,38 @@ private:
         const auto ids = ids_.get();
         const auto scores = scores_.get();
         const auto status = error_.get();
-        queue_.parallel_for(sycl::range<1>(product(heads, count)), [=](sycl::id<1> id) {
-            const auto head = id[0] / count;
-            const auto block = ids[id[0] % count];
-            const auto keys = bank + (block * heads + head) * reps * width;
-            const auto queries = query + head * group * width;
-            Score relevance{};
-            for (std::uint32_t r = 0; r < reps; ++r) {
-                for (std::uint32_t q = 0; q < group; ++q) {
-                    for (std::uint32_t d = 0; d < width; ++d) {
-                        relevance = relevance + device_score<Score>(queries[static_cast<std::size_t>(q) * width + d]) *
-                                                decode_half(keys[static_cast<std::size_t>(r) * width + d]) / group;
+        queue_.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<Score, 1> terms(sycl::range<1>(work_group_size), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(product(product(heads, count), work_group_size), work_group_size), [=](sycl::nd_item<1> item) {
+                const auto candidate = item.get_group_linear_id();
+                const auto lane = item.get_local_linear_id();
+                const auto head = candidate / count;
+                const auto block = ids[candidate % count];
+                const auto keys = bank + (block * heads + head) * reps * width;
+                const auto queries = query + head * group * width;
+                Score relevance{};
+                for (std::uint32_t r = 0; r < reps; ++r) {
+                    for (std::uint32_t q = 0; q < group; ++q) {
+                        for (std::size_t first = 0; first < width; first += work_group_size) {
+                            const auto d = first + lane;
+                            // Adjacent work items read adjacent dimensions. Lane zero
+                            // keeps the scalar accumulation order, including FloatPair
+                            // residuals and cancellation-sensitive representative ties.
+                            terms[lane] = d < width ? device_score<Score>(queries[static_cast<std::size_t>(q) * width + d]) *
+                                decode_half(keys[static_cast<std::size_t>(r) * width + d]) / group : Score{};
+                            item.barrier(sycl::access::fence_space::local_space);
+                            if (!lane) for (std::size_t i = 0; i < work_group_size && first + i < width; ++i) {
+                                relevance = relevance + terms[i];
+                            }
+                            item.barrier(sycl::access::fence_space::local_space);
+                        }
                     }
                 }
-            }
-            if (!finite(relevance)) flag_invalid(status);
-            scores[id[0]] = relevance;
+                if (!lane) {
+                    if (!finite(relevance)) flag_invalid(status);
+                    scores[candidate] = relevance;
+                }
+            });
         });
     }
 
@@ -505,14 +521,27 @@ private:
             }
             mean[id[0]] = value;
         });
-        queue_.parallel_for(sycl::range<1>(product(count, heads)), [=](sycl::id<1> id) {
-            const auto h = id[0] % heads;
-            const auto slot = (first + id[0] / heads) % local;
-            const auto row = slot * heads + h;
-            Score value = scores[row];
-            for (std::uint32_t d = 0; d < width; ++d) value = value + mean[h * width + d] * decode_half(keys[row * width + d]);
-            if (!finite(value)) flag_invalid(status);
-            scores[row] = value;
+        queue_.submit([&](sycl::handler & cgh) {
+            sycl::local_accessor<Score, 1> terms(sycl::range<1>(work_group_size), cgh);
+            cgh.parallel_for(sycl::nd_range<1>(product(product(count, heads), work_group_size), work_group_size), [=](sycl::nd_item<1> item) {
+                const auto index = item.get_group_linear_id();
+                const auto lane = item.get_local_linear_id();
+                const auto h = index % heads;
+                const auto slot = (first + index / heads) % local;
+                const auto row = slot * heads + h;
+                Score value = scores[row];
+                for (std::size_t base = 0; base < width; base += work_group_size) {
+                    const auto d = base + lane;
+                    terms[lane] = d < width ? mean[h * width + d] * decode_half(keys[row * width + d]) : Score{};
+                    item.barrier(sycl::access::fence_space::local_space);
+                    if (!lane) for (std::size_t i = 0; i < work_group_size && base + i < width; ++i) value = value + terms[i];
+                    item.barrier(sycl::access::fence_space::local_space);
+                }
+                if (!lane) {
+                    if (!finite(value)) flag_invalid(status);
+                    scores[row] = value;
+                }
+            });
         });
     }
 
