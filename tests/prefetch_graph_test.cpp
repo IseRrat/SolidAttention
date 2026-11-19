@@ -60,7 +60,7 @@ struct OverlapBarrier {
 };
 void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces, bool builder,bool native,bool direct,bool packed) {
     constexpr int dimension = 128, kv_heads = 2, query_heads = 4;
-    const solid::KvGeometry geometry{2, kv_heads, dimension, 2, 32, 64, solid::KvLayout::interleaved};
+    const solid::KvGeometry geometry{2, kv_heads, dimension, 2, 12, 64, solid::KvLayout::interleaved};
     const solid::SparseBudget budget{6, 1, 1, 1};
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(), ggml_backend_free);
     std::unique_ptr<solid::KvStore> store;

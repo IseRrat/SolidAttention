@@ -621,8 +621,10 @@ struct GgmlPrefetch::Impl {
         const auto next = current->layer + 1 < session.geometry().layers ? current->layer + 1 : 0;
         const auto position = next ? current->position : current->position + 1;
         current->dag.start(next_prefetch, trace.now());
-        begin_prediction(next, position);
-        current->dag.complete(next_prefetch, trace.now());
+        if (position<session.geometry().capacity_tokens) {
+            begin_prediction(next, position);
+            current->dag.complete(next_prefetch, trace.now());
+        } else current->dag.complete(next_prefetch,trace.now(),"context_capacity_reached");
     }
     void begin_prediction(std::uint32_t layer, std::uint64_t position) {
         session.begin_prefetch(layer, position, {block_read_estimate, block_copy_estimate});

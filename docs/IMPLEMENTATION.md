@@ -110,7 +110,7 @@
 
 3. **当前行安装与主机归档**
 
-   已将当前设备行装入 bank，保留原尾块前缀，只复制缺口。安装后 attention 和 D2H 归档分别推进，归档追加后提交聚合回写，多层时可提前派发下一层 SSD 读取。
+   已将当前设备行装入 bank，保留原尾块前缀，只复制缺口。安装后 attention 和 D2H 归档分别推进，归档追加后提交聚合回写，多层时可提前派发下一层 SSD 读取。最后一层到达上下文容量末尾时，完成后继预取任务的收尾记录，停止向容量外的位置发起预测，当前 attention、归档及回写照常完成。
 
    [ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[session.cpp](../src/session.cpp)、[device_cache.cpp](../src/device_cache.cpp)。
 
