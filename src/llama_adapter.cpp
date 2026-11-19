@@ -568,6 +568,16 @@ std::uint64_t AttentionAdapter::projection_initialization_ns() const {
     for (const auto & p : impl_->projections) ns += p->stats().initialization_ns;
     return ns;
 }
+std::uint64_t AttentionAdapter::projection_source_bytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto & p : impl_->projections) bytes += p->stats().source_bytes;
+    return bytes;
+}
+std::uint64_t AttentionAdapter::projection_source_host_bytes() const {
+    std::uint64_t bytes = 0;
+    for (const auto & p : impl_->projections) bytes += p->stats().source_host_bytes;
+    return bytes;
+}
 std::vector<std::string> AttentionAdapter::projection_weight_types() const {
     std::vector<std::string> types;
     for (const auto & p : impl_->projections) types.push_back(p->stats().weight_type);

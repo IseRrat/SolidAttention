@@ -74,6 +74,8 @@ public:
     const class KvProjection & projection(std::uint32_t layer) const;
     ProjectionIntervals * projection_intervals(std::uint32_t layer, ggml_backend * backend);
     std::uint64_t projection_buffer_bytes() const;
+    std::uint64_t projection_source_bytes() const;
+    std::uint64_t projection_source_host_bytes() const;
     std::uint64_t projection_initialization_ns() const;
     std::vector<std::string> projection_weight_types() const;
     bool prefetch_enabled() const;

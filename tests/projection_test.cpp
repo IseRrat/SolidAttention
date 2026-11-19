@@ -105,6 +105,9 @@ void run(ggml_type kt, ggml_type vt, bool biases, bool neox = false) {
         }
     }
     require(projection.stats().buffer_bytes >= ggml_nbytes(projection.weight()), "projection memory accounting");
+    const auto source_bytes = ggml_nbytes(key) + ggml_nbytes(value) + (kb ? ggml_nbytes(kb) + ggml_nbytes(vb) : 0);
+    require(projection.stats().source_bytes == source_bytes && projection.stats().source_host_bytes == source_bytes,
+            "host projection source memory accounting");
     bool rejected = false;
     try { solid::KvProjection invalid(key, value, kb, vb, heads + 1, dimension, ggml_backend_get_default_buffer_type(backend.get())); }
     catch (const std::invalid_argument &) { rejected = true; }

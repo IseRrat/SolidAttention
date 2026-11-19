@@ -12,6 +12,7 @@ namespace solid {
 struct ProjectionStats {
     std::uint64_t buffer_bytes = 0;
     std::uint64_t source_bytes = 0;
+    std::uint64_t source_host_bytes = 0;
     std::uint64_t initialization_ns = 0;
     std::string weight_type;
 };

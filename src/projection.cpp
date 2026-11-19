@@ -108,6 +108,9 @@ KvProjection::KvProjection(const ggml_tensor * key, const ggml_tensor * value,
     }
     impl_->stats.buffer_bytes = ggml_backend_buffer_get_size(impl_->buffer.get());
     impl_->stats.source_bytes = ggml_nbytes(key) + ggml_nbytes(value) + (key_bias ? ggml_nbytes(key_bias) : 0) + (value_bias ? ggml_nbytes(value_bias) : 0);
+    for (const auto * source : {key, value, key_bias, value_bias}) {
+        if (source && ggml_backend_buffer_is_host(source->buffer)) impl_->stats.source_host_bytes += ggml_nbytes(source);
+    }
     impl_->stats.weight_type = ggml_type_name(type);
     impl_->stats.initialization_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
 }

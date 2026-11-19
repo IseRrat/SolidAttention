@@ -8,9 +8,9 @@
 
 1. **合并 K/V 投影权重**
 
-   初始化时按 KV head 交错拼接 K/V 权重和 bias，用一次矩阵乘法生成交错结果。相同量化类型保留原始行编码，每个 head 的连续权重行整段读取、写入，主机中转区只持有一份 head 数据。混合类型逐行解码为 F32，再写入融合权重。已记录融合权重的额外分配和初始化耗时。
+   初始化时按 KV head 交错拼接 K/V 权重和 bias，用一次矩阵乘法生成交错结果。runner 的融合配置将原始 K/V 权重和 bias 加载到 CPU 侧，按层设备分配融合权重，避免在 GPU 同时保存原始与融合的两份权重。加载时保留 GGUF 原始行编码。相同量化类型每个 head 的连续权重行整段读取、写入，主机中转区只持有一份 head 数据。混合类型逐行解码为 F32，再写入融合权重。已记录融合分配、源权重总字节、其中的主机字节及初始化耗时。
 
-   [projection.cpp](../src/projection.cpp)。
+   [projection.cpp](../src/projection.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[baseline.cpp](../src/baseline.cpp)。
 
 2. **交错 KV 与 Attention 视图**
 

@@ -190,6 +190,18 @@ int main(int argc, char ** argv) {
         auto mp = llama_model_default_params();
         mp.n_gpu_layers = tokenize_only ? 0 : config.gpu_layers;
         mp.vocab_only = tokenize_only;
+        llama_model_tensor_buft_override projection_sources[2]{};
+        if (!tokenize_only && config.attention.enabled && config.attention.fuse_kv_projection) {
+            auto * cpu = ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_CPU);
+            if (!cpu) throw std::runtime_error("fused projection loading requires a CPU backend");
+            // The graph consumes the consolidated weights. Keep their source
+            // tensors on the host instead of retaining a second GPU copy.
+            projection_sources[0] = {"^blk\\.[0-9]+\\.attn_[kv]\\.(weight|bias)$", ggml_backend_dev_buffer_type(cpu)};
+            mp.tensor_buft_overrides = projection_sources;
+            // Source rows must keep the GGUF encoding for the consolidator;
+            // CPU-specific repacked formats cannot be copied as native rows.
+            mp.use_extra_bufts = false;
+        }
         const auto load_start = Clock::now();
         std::unique_ptr<llama_model, decltype(&llama_model_free)> model(
             llama_model_load_from_file(config.model.string().c_str(), mp), llama_model_free);
@@ -383,6 +395,8 @@ int main(int argc, char ** argv) {
                 {"selection_trace_enabled", config.attention.selection_trace},
                 {"schedule", config.attention.schedule},
                 {"projection_extra_weight_bytes", adapter->projection_buffer_bytes()},
+                {"projection_source_bytes", adapter->projection_source_bytes()},
+                {"projection_source_host_bytes", adapter->projection_source_host_bytes()},
                 {"projection_initialization_ms", adapter->projection_initialization_ns() / 1e6},
                 {"projection_weight_types", adapter->projection_weight_types()},
                 {"selection_source", config.attention.selection_replay.empty() ? "dynamic" : "replay"},
