@@ -88,9 +88,11 @@
 
 4. **主机/设备缓冲保护**
 
-   已维护 layer/head/block/version 身份及 slot/generation 租约。原 READ、复制源和 attention 读者分别持有缓冲，取消后保留原请求完成时的释放处理。
+   已维护 layer/head/block/version 身份及 slot/generation 租约。槽位记录写入者和读者数量，读取中、可用、被读取及待回收状态分别处理。取消 READ 后，槽位保持待回收，收到原请求完成回执并释放全部读者后才允许覆盖；取消操作自身的回执只更新取消结果。GPU 复制持有主机源和设备目标，attention 持有设备工作集；共享内存路径同时持有对应主机槽位。尾块更新递增 generation，保留已完成的旧前缀，只填入新增行。
 
-   [block_identity.hpp](../include/solid/block_identity.hpp)、[prefetch.cpp](../src/prefetch.cpp)、[device_cache.cpp](../src/device_cache.cpp)。
+   请求结束时先停止设备完成通知的后续推进，等待协调任务、计算与复制完成，再释放 attention 和历史块读者、完成已提交 WRITE。会话结束排空预测 READ 和取消请求，写出剩余聚合缓冲。
+
+   [block_identity.hpp](../include/solid/block_identity.hpp)、[prefetch.cpp](../src/prefetch.cpp)、[device_cache.cpp](../src/device_cache.cpp)、[async_reader.cpp](../src/async_reader.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[session.cpp](../src/session.cpp)。
 
 ## 四、SSD-aware Scheduler
 
@@ -169,5 +171,3 @@
    已写模型和源码哈希、配置检查、固定 token/选择回放、运行监控、数值输出和分项内存/I/O 统计。已写实验矩阵、准确率接口、结果核查及绘图工具。
 
    [baseline.cpp](../src/baseline.cpp)、[config.cpp](../src/config.cpp)、[run_baseline.py](../scripts/run_baseline.py)、[experiments.py](../scripts/experiments.py)、[accuracy.py](../scripts/accuracy.py)、[plot_experiments.py](../scripts/plot_experiments.py)。
-
-模型级数值、真实 GPU 性能及论文实验数据待实验环境核查。
