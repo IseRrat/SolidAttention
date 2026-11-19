@@ -24,6 +24,9 @@ int main() {
         auto * key = ggml_view_3d(context.get(), packed, 2, 1, 3, 2 * sizeof(float), 8 * sizeof(float), 4 * sizeof(float));
         auto * value = ggml_view_3d(context.get(), packed, 2, 1, 3, 2 * sizeof(float), 8 * sizeof(float), 6 * sizeof(float));
         auto * result = operation.build(context.get(), query, key, value);
+        frame->positions = {2};
+        if (operation.can_reuse(3)) throw std::runtime_error("prefill graph reused as decode");
+        frame->positions = {0, 1, 2};
         auto * graph = ggml_new_graph_custom(context.get(), 128, false);
         ggml_build_forward_expand(graph, result);
         std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(), ggml_backend_free);

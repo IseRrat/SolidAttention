@@ -351,6 +351,14 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
     return result;
 }
 void AttentionNode::check() const { impl_->failure->check(); }
+bool AttentionNode::can_reuse(std::uint64_t next_position) const {
+    // Decode uses a fixed bank and mask shape. Prefill owns batch-sized output
+    // storage and must be rebuilt, including a one-token final prefill batch.
+    return impl_->host && impl_->gathered && impl_->frame->positions.size() == 1 &&
+        next_position < impl_->session.geometry().capacity_tokens &&
+        impl_->frame->positions.front() < next_position &&
+        next_position - impl_->frame->positions.front() == 1;
+}
 ggml_tensor * AttentionNode::host_node() const { return impl_->host; }
 ggml_tensor * AttentionNode::selection_node() const { return impl_->early; }
 ggml_tensor * AttentionNode::attention_node() const { return impl_->flash; }
@@ -622,14 +630,24 @@ public:
         }
         frame->positions.resize(batch->n_tokens);
         for (std::uint32_t i = 0; i < batch->n_tokens; ++i) {
-            if (batch->pos[i] < 0 || batch->n_seq_id[i] != 1 || batch->seq_id[i][0] != 0) {
+            if (batch->pos[i] < 0 || batch->n_seq_id[i] != 1 || !batch->seq_id[i] || batch->seq_id[i][0] != 0) {
                 throw std::invalid_argument("adapter supports one sequence with nonnegative positions");
             }
             frame->positions[i] = static_cast<std::uint64_t>(batch->pos[i]);
         }
         if (batch->n_tokens == 1) adapter.begin_prefetch(0, frame->positions.front());
     }
-    bool can_reuse(const llm_graph_params &) override { return false; }
+    bool can_reuse(const llm_graph_params & params) override {
+        // llm_graph_result checks model, topology, outputs and the other inputs.
+        // This input owns the mutable positions and the custom attention nodes.
+        const auto & batch = params.ubatch;
+        if (batch.n_tokens != 1 || batch.n_pos != 1 || !batch.pos || batch.pos[0] < 0 ||
+            !batch.n_seq_id || batch.n_seq_id[0] != 1 || !batch.seq_id || !batch.seq_id[0] ||
+            batch.seq_id[0][0] != 0 || nodes.size() != params.hparams.n_layer()) return false;
+        return !nodes.empty() && std::all_of(nodes.begin(), nodes.end(), [&](const auto & node) {
+            return node->can_reuse(static_cast<std::uint64_t>(batch.pos[0]));
+        });
+    }
     AttentionAdapter & adapter;
     std::shared_ptr<AttentionFrame> frame;
     std::vector<std::unique_ptr<AttentionNode>> nodes;

@@ -156,6 +156,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         if (controlled && layer == 0) projected_key = ggml_custom_4d(context.get(), GGML_TYPE_F32, dimension, kv_heads, 1, 1,
             &keys[layer], 1, OverlapBarrier::compute, 1, &barrier);
         operations[layer] = std::make_unique<solid::AttentionNode>(session, frames[layer], layer, scale, nullptr, true, &device);
+        require(!operations[layer]->can_reuse(6), "unbuilt attention graph must not be reused");
         if (packed) {
             packed_kv[layer] = ggml_concat(context.get(),projected_key,values[layer],0);
             projected_key = ggml_view_3d(context.get(),packed_kv[layer],dimension,kv_heads,1,
@@ -205,6 +206,9 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     Observer observer{&device};
     ggml_backend_sched_set_eval_callback(scheduler.get(), Observer::evaluate, &observer);
     for (int p = 6; p < 12; ++p) {
+        for (const auto & operation : operations) {
+            require(operation->can_reuse(p) == (p > 6), "decode graph reuse requires an initialized previous position");
+        }
         device.begin_prefetch(0, p); // Before current Q/K/V are available.
         if (direct) require(ggml_backend_sched_alloc_graph(scheduler.get(),graph),"reusing direct graph allocation");
         std::vector<float> expected[2];
@@ -212,6 +216,9 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
             inputs(layer, p);
             expected[layer] = reference.process(layer, p, 1, query, key, value, scale);
             frames[layer]->positions = {static_cast<std::uint64_t>(p)};
+            require(!operations[layer]->can_reuse(p) && !operations[layer]->can_reuse(p + 2) &&
+                    operations[layer]->can_reuse(p + 1) == (p + 1 < geometry.capacity_tokens),
+                    "decode reuse accepted a repeated, skipped or out-of-capacity position");
             ggml_backend_tensor_set(q, query.data(), 0, query.size() * sizeof(float));
             ggml_backend_tensor_set(keys[layer], key.data(), 0, key.size() * sizeof(float));
             // Packed views are produced from the separate source leaf.

@@ -43,6 +43,7 @@ public:
                        ggml_tensor * packed_kv = nullptr, ggml_backend_sched * scheduler = nullptr,
                        ggml_backend * decode_backend = nullptr);
     void check() const;
+    bool can_reuse(std::uint64_t next_position) const;
     ggml_tensor * host_node() const;
     ggml_tensor * selection_node() const;
     ggml_tensor * attention_node() const;
