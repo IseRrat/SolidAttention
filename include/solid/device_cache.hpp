@@ -32,6 +32,10 @@ public:
     virtual void wait_batch() { drain(); }
     virtual std::uint64_t resident_bytes() const = 0;
     virtual bool shared_memory() const { return false; }
+    virtual bool aliases_host_slots() const { return false; }
+    virtual bool binds_host_slots() const { return aliases_host_slots(); }
+    virtual Half * host_slot_storage(std::uint32_t) const { return nullptr; }
+    virtual std::shared_ptr<void> host_storage_owner() const { return {}; }
 };
 struct DeviceCacheStats {
     std::uint64_t uploads = 0;
@@ -76,6 +80,7 @@ private:
     SlotTable slots_;
     std::vector<Transfer> transfers_;
     std::vector<SlotLease> attention_;
+    std::vector<SlotLease> attention_hosts_;
     std::ofstream trace_;
     DeviceCacheStats stats_;
     std::uint64_t epoch_ = 0;
@@ -83,6 +88,7 @@ private:
     void retain(const std::vector<BlockIdentity> & identities);
     SlotLease upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage = {});
     SlotLease upload_current(const BlockIdentity & identity,const std::optional<SlotLease> & host,const CurrentDeviceKv & current);
+    std::optional<SlotLease> acquire_shared(const BlockIdentity & identity,std::uint32_t slot);
     std::optional<SlotLease> prefix(const BlockIdentity & identity) const;
     void event(const char * name, const SlotLease & lease,const CurrentDeviceKv * current=nullptr,
                std::uint32_t retained=0,std::uint64_t source_generation=0);

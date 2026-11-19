@@ -195,7 +195,18 @@ std::vector<KvReadSegment> KvStore::plan_read(std::uint32_t layer, std::uint32_t
     return {};
 }
 Half * KvBlock::key(std::size_t row) {
-    return data.data() + row * dimension * (layout == KvLayout::interleaved ? 2 : 1);
+    return storage() + row * dimension * (layout == KvLayout::interleaved ? 2 : 1);
+}
+void KvBlock::bind_shared(Half * address, std::size_t elements, std::shared_ptr<void> owner) {
+    if (!address || !elements || !owner) throw std::invalid_argument("shared KV storage requires an address and owner");
+    shared=std::make_shared<SharedStorage>(SharedStorage{address,elements,std::move(owner)});
+    std::vector<Half>().swap(data);
+}
+void KvBlock::clear_storage(std::size_t elements) {
+    if (shared) {
+        if (elements!=shared->elements) throw std::invalid_argument("shared KV storage shape mismatch");
+        std::fill_n(shared->address,elements,Half{0});
+    } else data.assign(elements,0);
 }
 Half * KvBlock::value(std::size_t row) {
     return key(row) + (layout == KvLayout::interleaved ? dimension : static_cast<std::size_t>(capacity) * dimension);
@@ -232,7 +243,7 @@ void KvStore::prepare_block(std::uint32_t layer, std::uint32_t head, std::uint64
     result.layout = geometry_.layout;
     result.dimension = geometry_.dimension;
     result.capacity = geometry_.block_tokens;
-    result.data.assign(static_cast<std::size_t>(geometry_.block_tokens) * 2 * geometry_.dimension, 0);
+    result.clear_storage(static_cast<std::size_t>(geometry_.block_tokens) * 2 * geometry_.dimension);
 }
 MemoryKvStore::MemoryKvStore(KvGeometry geometry) : KvStore(geometry), data_(geometry.layers), lengths_(geometry.layers, 0) {
     const auto elements = static_cast<std::size_t>(geometry.capacity_tokens) * geometry.heads * 2 * geometry.dimension;
@@ -382,7 +393,7 @@ void FileKvStore::complete_write(std::uint32_t layer, bool success) {
 void FileKvStore::read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & result) {
     const auto segments = plan_read(layer, head, block, result);
     for (const auto & segment : segments) {
-        read_exact(reinterpret_cast<unsigned char *>(result.data.data()) + segment.buffer_offset, segment.bytes, segment.file_offset);
+        read_exact(reinterpret_cast<unsigned char *>(result.storage()) + segment.buffer_offset, segment.bytes, segment.file_offset);
     }
 }
 std::vector<KvReadSegment> FileKvStore::plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
@@ -393,7 +404,7 @@ std::vector<KvReadSegment> FileKvStore::plan_read(std::uint32_t layer, std::uint
         const auto first = block * geometry_.block_tokens;
         (void) geometry_.block_offset(layer, head, block);
         if (result.first_position != first || result.dimension != geometry_.dimension || result.layout != geometry_.layout ||
-            result.capacity != geometry_.block_tokens || result.data.size() != static_cast<std::size_t>(geometry_.block_tokens) * 2 * geometry_.dimension ||
+            result.capacity != geometry_.block_tokens || result.storage_size() != static_cast<std::size_t>(geometry_.block_tokens) * 2 * geometry_.dimension ||
             prefix > result.valid_tokens || first >= length(layer)) {
             throw std::invalid_argument("invalid KV read prefix");
         }

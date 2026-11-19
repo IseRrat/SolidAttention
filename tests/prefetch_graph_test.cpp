@@ -58,7 +58,7 @@ struct OverlapBarrier {
         std::memcpy(dst->data, dst->src[0]->data, ggml_nbytes(dst));
     }
 };
-void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces, bool builder,bool native,bool direct,bool packed) {
+void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces, bool builder,bool native,bool direct,bool packed,bool shared=false) {
     constexpr int dimension = 128, kv_heads = 2, query_heads = 4;
     const solid::KvGeometry geometry{2, kv_heads, dimension, 2, 12, 64, solid::KvLayout::interleaved};
     const solid::SparseBudget budget{6, 1, 1, 1};
@@ -66,7 +66,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     std::unique_ptr<solid::KvStore> store;
     std::unique_ptr<solid::AsyncReader> reader;
     OverlapBarrier barrier;
-    const bool controlled = !disk && mode != solid::ScheduleMode::naive;
+    const bool controlled = !disk && mode != solid::ScheduleMode::naive && !shared;
     if (disk) {
         const auto path = std::filesystem::temp_directory_path() / ("solid-prefetch-graph-" +
             std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
@@ -120,7 +120,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     if (!directory.empty()) std::filesystem::create_directory(directory);
     solid::GgmlPrefetch device(session, backend.get(), directory.empty() ? std::filesystem::path{} : directory / "residency.jsonl",
         mode, directory.empty() ? std::filesystem::path{} : directory / "schedule.jsonl",-1,
-        native?std::make_unique<Events>(geometry.layers):nullptr);
+        native?std::make_unique<Events>(geometry.layers):nullptr,shared);
     std::unique_ptr<ggml_context, decltype(&ggml_free)> context(ggml_init({4 * 1024 * 1024, nullptr, true}), ggml_free);
     auto * q = ggml_new_tensor_3d(context.get(), GGML_TYPE_F32, dimension, query_heads, 1);
     ggml_set_input(q);
@@ -216,6 +216,12 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     }
     device.quiesce(); session.finish();
     require(device.stats().uploads > 0 && session.stats().prefetch.predicted_blocks > 0, "prefetch path was not exercised");
+    if (shared) {
+        require(session.stats().prefetch.host_bytes==0 && device.stats().upload_bytes==0,
+                "shared cache retained host payloads or uploaded historical KV");
+        if (!direct) require(device.stats().shared_host_copy_bytes==0,"shared historical bank was copied");
+        require(device.stats().shared_resident_bytes==device.stats().resident_bytes,"shared buffer allocation accounting");
+    }
     const auto stats = device.schedule_stats();
     require(stats.frames == 12 && stats.tasks == 144, "microtask frames not fully completed");
     require(mode==solid::ScheduleMode::naive ? stats.block_frames==0 : stats.block_frames==12 && stats.block_tasks>12,
@@ -262,8 +268,17 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
 }
 int main(int argc, char ** argv) {
     try {
+        if (argc==2 && std::string(argv[1])=="shared") {
+            for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) {
+                for (bool direct:{false,true}) {
+                    run(false,mode,{},false,false,direct,direct,true);
+                    if (solid::uring_available()) run(true,mode,{},false,false,direct,direct,true);
+                }
+            }
+            std::cout<<"shared SSD destinations, attention leases and private current rows passed\n"; return 0;
+        }
         const auto mode = solid::parse_schedule_mode(argc > 1 ? argv[1] : "naive");
-        bool builder=false,native=false,direct=false,packed=false;
+        bool builder=false,native=false,direct=false,packed=false,shared=false;
         int index=2;
         for (;index<argc && std::string(argv[index]).rfind("--",0)==0;++index) {
             const std::string option=argv[index];
@@ -271,11 +286,12 @@ int main(int argc, char ** argv) {
             else if (option=="--native-events") native=true;
             else if (option=="--direct") direct=true;
             else if (option=="--packed") packed=true;
+            else if (option=="--shared") shared=true;
             else throw std::invalid_argument("unknown graph check option");
         }
         const std::filesystem::path traces = argc > index ? argv[index] : "";
-        run(false, mode, traces, builder,native,direct,packed);
-        if (solid::uring_available()) run(true, mode, traces, builder,native,direct,packed);
+        run(false, mode, traces, builder,native,direct,packed,shared);
+        if (solid::uring_available()) run(true, mode, traces, builder,native,direct,packed,shared);
         std::cout << "multi-layer prefetch, liburing, GQA slot masks and CPU Flash Attention parity passed\n";
         return 0;
     } catch (const std::exception & e) { std::cerr << e.what() << '\n'; return 1; }

@@ -10,12 +10,13 @@ from compare_prefetch import audit_residency
 from schedule_ablation import audit_schedule, audit_block_schedule, MODES, NAMES
 
 with tempfile.TemporaryDirectory(prefix="solid-schedule-audit-") as temporary:
-    for name, mode in list(zip(NAMES,MODES))+[("native-events","overlap+sync_reuse"),("device-input","overlap+sync_reuse"),("device-serial","naive")]:
+    for name, mode in list(zip(NAMES,MODES))+[("native-events","overlap+sync_reuse"),("device-input","overlap+sync_reuse"),("device-serial","naive"),("shared-buffer","overlap+sync_reuse")]:
         directory = Path(temporary) / name
         directory.mkdir()
         flags=["--native-events"] if name=="native-events" else []
         if name=="device-input": flags=["--direct","--packed","--native-events"]
         if name=="device-serial": flags=["--direct","--packed"]
+        if name=="shared-buffer": flags=["--shared","--direct","--packed","--native-events"]
         subprocess.run([sys.argv[1], mode,*flags,str(directory)], check=True, timeout=45)
         for folder in directory.iterdir():
             schedule=folder / "schedule.jsonl"
@@ -24,9 +25,9 @@ with tempfile.TemporaryDirectory(prefix="solid-schedule-audit-") as temporary:
             if observed != expected:
                 raise ValueError(f"schedule trace differs from C++ metrics: {name}/{folder.name}: {observed} != {expected}")
             archives=sum(json.loads(line).get("fence")=="kv_archive_copy_complete" for line in schedule.read_text().splitlines())
-            if archives != (observed["frames"] if name=="device-input" else 0):
+            if archives != (observed["frames"] if name in ("device-input","shared-buffer") else 0):
                 raise ValueError(f"unexpected deferred KV archives: {name}/{folder.name}")
-            residency=audit_residency(folder / "residency.jsonl", 2, 6)
+            residency=audit_residency(folder / "residency.jsonl", 2, 7 if name=="shared-buffer" else 6)
             for key,value in json.loads((folder/"device-stats.json").read_text()).items():
                 if residency.get(key,0)!=value: raise ValueError(f"device row transfer metrics differ: {name}/{folder.name}/{key}")
             blocks=audit_block_schedule(folder/"schedule.blocks.jsonl",mode,folder/"schedule.jsonl")

@@ -121,6 +121,8 @@ def audit_schedule(path, mode, *, blocks=False):
             edges["current_h2d"] = ["kv_projection_to_host", "miss_read_and_reconcile", "history_h2d"]
             if single_layer:
                 edges["next_layer_prefetch"].append(append)
+        if names["next_layer_prefetch"]["fence"] in ("shared_attention_buffer_released", "shared_context_capacity_reached"):
+            edges["next_layer_prefetch"].append("attention_until_boundary")
         for name, task in names.items():
             if {tasks[dep]["name"] for dep in task["deps"]} != set(edges[name]):
                 raise ValueError("recorded schedule dependencies differ from the execution pipeline")

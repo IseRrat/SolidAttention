@@ -44,6 +44,14 @@ std::optional<SlotLease> SlotTable::acquire(const BlockIdentity & id) {
     }
     return {};
 }
+std::optional<SlotLease> SlotTable::acquire_at(const BlockIdentity & id,std::uint32_t index) {
+    if (index>=slots_.size() || index/slots_per_head_!=id.head || find(id)) throw std::invalid_argument("invalid shared slot identity");
+    auto & slot=slots_[index];
+    if (slot.state!=SlotState::free) return {};
+    if (slot.generation==UINT64_MAX) throw std::overflow_error("slot generation exhausted");
+    slot.identity=id; ++slot.generation; slot.producer=true; slot.readers=0; slot.state=SlotState::loading;
+    return lease(index);
+}
 SlotLease SlotTable::refresh(const SlotLease & old, const BlockIdentity & id) {
     if (!matches(old) || slots_[old.slot].state != SlotState::ready || id.layer != old.identity.layer ||
         id.head != old.identity.head || id.block != old.identity.block || id.version <= old.identity.version || find(id)) {
@@ -119,6 +127,16 @@ Prefetcher::~Prefetcher() {
         } catch (...) { std::terminate(); }
     }
 }
+void Prefetcher::bind_shared_blocks(const std::vector<Half *> & addresses,std::shared_ptr<void> owner) {
+    check();
+    if (layer_ || pending_reads() || addresses.size()!=blocks_.size() || !owner ||
+        std::any_of(addresses.begin(),addresses.end(),[](const auto * p) { return !p; })) {
+        throw std::invalid_argument("shared KV binding requires an unused prefetch cache");
+    }
+    const auto elements=static_cast<std::size_t>(store_.geometry().block_tokens)*2*store_.geometry().dimension;
+    for (std::size_t i=0;i<blocks_.size();++i) blocks_[i].bind_shared(addresses[i],elements,owner);
+    stats_.host_bytes=0; // The shared bank is counted by the device transport.
+}
 void Prefetcher::check() const { if (failed_) throw std::runtime_error("prefetch session failed"); }
 std::shared_ptr<const StoreReceipt> Prefetcher::store_full_layer(std::uint32_t layer) {
     check();
@@ -192,7 +210,7 @@ void Prefetcher::pump() {
         const auto next=std::min_element(queued_.begin(),queued_.end(),[](const Job & a,const Job & b) { return a.dispatch.before(b.dispatch); });
         const auto job = *next;
         if (next_id_ >= (std::uint64_t{1} << 63)) throw std::overflow_error("read request identity exhausted");
-        if (!reader_->submit_scheduled(next_id_, store_.native_handle(), reinterpret_cast<unsigned char *>(blocks_[job.lease.slot].data.data()) +
+        if (!reader_->submit_scheduled(next_id_, store_.native_handle(), reinterpret_cast<unsigned char *>(blocks_[job.lease.slot].storage()) +
                              job.segment.buffer_offset, job.segment.bytes, job.segment.file_offset,job.dispatch)) break;
         requests_.emplace(next_id_++, job);
         queued_.erase(next);

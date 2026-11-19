@@ -39,6 +39,13 @@ struct KvBlock {
     std::uint32_t dimension = 0;
     std::uint32_t capacity = 0;
     std::vector<Half> data;
+    struct SharedStorage { Half * address; std::size_t elements; std::shared_ptr<void> owner; };
+    std::shared_ptr<SharedStorage> shared;
+    Half * storage() { return shared ? shared->address : data.data(); }
+    const Half * storage() const { return shared ? shared->address : data.data(); }
+    std::size_t storage_size() const { return shared ? shared->elements : data.size(); }
+    void bind_shared(Half * address, std::size_t elements, std::shared_ptr<void> owner);
+    void clear_storage(std::size_t elements);
     Half * key(std::size_t row);
     Half * value(std::size_t row);
     const Half * key(std::size_t row) const;

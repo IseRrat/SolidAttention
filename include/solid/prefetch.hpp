@@ -23,6 +23,7 @@ public:
     SlotTable(std::uint32_t heads, std::uint32_t slots_per_head);
     std::optional<SlotLease> find(const BlockIdentity & id) const;
     std::optional<SlotLease> acquire(const BlockIdentity & id);
+    std::optional<SlotLease> acquire_at(const BlockIdentity & id, std::uint32_t slot);
     SlotLease refresh(const SlotLease & previous, const BlockIdentity & identity);
     bool complete(const SlotLease & lease);
     bool retire(const SlotLease & lease);
@@ -68,6 +69,7 @@ public:
     Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t slots_per_head,
                std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace = {});
     ~Prefetcher();
+    void bind_shared_blocks(const std::vector<Half *> & addresses, std::shared_ptr<void> owner);
     void begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,

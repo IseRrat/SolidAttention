@@ -122,7 +122,11 @@
 
 5. **统一内存和复制队列**
 
-   SYCL 已为支持共享 USM 的集成 GPU 分配共享 KV bank，主机填充可用槽位。独立复制队列具有事件查询和计算队列依赖。CUDA 历史上传使用独立复制后端。
+   SYCL 已为支持共享 USM 的集成 GPU 分配共享 KV bank，SSD READ 与 dirty 数据转发直接填入该 bank 的历史槽位，attention 使用同一地址。主机释放独立块载荷，历史块安装只登记槽位和完成票据。共享内存的所有权随块视图保留，覆盖原 I/O 完成及排空过程。
+
+   共享槽位在 attention 期间同时持有主机和设备读者。下一层预取依赖 attention 完成，释放读者后复用同一缓冲。每个 KV head 另保留一个当前块，写入当前设备行并复用尾块前缀。独立复制队列处理当前行及其历史缺口，具有事件查询和计算队列依赖。
+
+   CUDA 及独立显存的异步复制路径将主机块直接绑定到上传所用的固定内存 bank，SSD READ 和 dirty 转发直接填充上传源。历史块与尾块前缀上传复用该地址，原复制票据持有源租约，省去普通内存到固定内存的中间复制。固定内存计入复制缓冲占用。
 
    [ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[copy_queue.cpp](../src/sycl/copy_queue.cpp)、[sycl_backend.hpp](../include/solid/sycl_backend.hpp)。
 

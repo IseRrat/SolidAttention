@@ -60,10 +60,21 @@ class GgmlTransport final : public DeviceTransport {
 #endif
     };
 public:
-    GgmlTransport(ggml_backend_t backend, KvGeometry geometry, std::uint32_t per_head, ScheduleMode mode,AttentionEvents * native) :
+    GgmlTransport(ggml_backend_t backend, KvGeometry geometry, std::uint32_t per_head, ScheduleMode mode,AttentionEvents * native,bool share_host_cache) :
         backend_(backend), geometry_(geometry), per_head_(per_head),native_(native) {
         if (!backend || geometry.layout != KvLayout::interleaved) throw std::invalid_argument("invalid GGML prefetch transport");
-        const auto tokens = (static_cast<std::uint64_t>(per_head) * geometry.block_tokens + 31) / 32 * 32;
+        if (share_host_cache) {
+            if (!ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend))) throw std::invalid_argument("explicit shared cache requires a host-addressable backend");
+            shared_=true;
+        }
+#ifdef SOLID_HAVE_SYCL
+        if (ggml_backend_is_sycl(backend) && solid_sycl_shared_kv_supported(backend)) shared_=true;
+#endif
+        if (shared_) {
+            if (per_head_==UINT32_MAX) throw std::overflow_error("shared cache slot count");
+            ++per_head_; // One private current-token block per head.
+        }
+        const auto tokens = (static_cast<std::uint64_t>(per_head_) * geometry.block_tokens + 31) / 32 * 32;
         if (tokens > INT32_MAX || tokens * geometry.heads > static_cast<std::uint64_t>(INT64_MAX) / (2ull * geometry.dimension * sizeof(Half))) {
             throw std::overflow_error("GGML prefetch transport allocation overflow");
         }
@@ -75,7 +86,8 @@ public:
         if (ggml_backend_is_sycl(backend)) {
             sycl_copy_=make_sycl_copy_queue(backend);
             const auto bytes=ggml_backend_buft_get_alloc_size(ggml_backend_get_default_buffer_type(backend), tensor_);
-            buffer_.reset(solid_sycl_alloc_shared_kv(backend, bytes));
+            if (shared_) buffer_.reset(solid_sycl_alloc_shared_kv(backend, bytes),ggml_backend_buffer_free);
+            if (shared_ && !buffer_) throw std::runtime_error("shared KV allocation failed");
             if (buffer_) {
                 auto * memory=ggml_backend_buffer_get_base(buffer_.get());
                 ggml_backend_buffer_set_usage(buffer_.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
@@ -89,11 +101,12 @@ public:
             }
         }
 #endif
-        buffer_.reset(ggml_backend_alloc_ctx_tensors(context_.get(), backend));
+        buffer_.reset(ggml_backend_alloc_ctx_tensors(context_.get(), backend),ggml_backend_buffer_free);
         if (!buffer_) throw std::runtime_error("device cache allocation");
         ggml_backend_buffer_set_usage(buffer_.get(), GGML_BACKEND_BUFFER_USAGE_COMPUTE);
         ggml_backend_buffer_clear(buffer_.get(), 0);
         copy_backend_ = backend_;
+        if (shared_) return;
         if (mode != ScheduleMode::naive) {
             auto * device = ggml_backend_get_device(backend_);
             if (!device) throw std::runtime_error("copy backend requires a registered device");
@@ -109,7 +122,7 @@ public:
             if (!host_type) host_type = ggml_backend_get_default_buffer_type(copy_backend_);
             if (!ggml_backend_buft_is_host(host_type)) throw std::runtime_error("copy staging requires host memory");
             const auto bytes = static_cast<std::size_t>(geometry.heads) * per_head * geometry.block_tokens * 2 * geometry.dimension * sizeof(Half);
-            staging_.reset(ggml_backend_buft_alloc_buffer(host_type, bytes));
+            staging_.reset(ggml_backend_buft_alloc_buffer(host_type, bytes),ggml_backend_buffer_free);
             if (!staging_) throw std::runtime_error("pinned copy staging allocation failed");
             stats_.staging_bytes = ggml_backend_buffer_get_size(staging_.get());
         }
@@ -135,24 +148,24 @@ public:
     std::uint64_t upload(std::uint32_t slot, const KvBlock & block) override {
         if (slot >= geometry_.heads * static_cast<std::uint64_t>(per_head_) || block.layout != KvLayout::interleaved ||
             block.dimension != geometry_.dimension || block.capacity != geometry_.block_tokens ||
-            block.data.size() != static_cast<std::size_t>(geometry_.block_tokens) * 2 * geometry_.dimension) {
+            block.storage_size() != static_cast<std::size_t>(geometry_.block_tokens) * 2 * geometry_.dimension) {
             throw std::invalid_argument("device upload shape");
         }
         if (next_ == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("copy ticket exhausted");
         const auto id = next_++;
         const auto head = slot / per_head_, local = slot % per_head_;
         const auto offset = head * tensor_->nb[2] + local * geometry_.block_tokens * tensor_->nb[1];
-        const auto bytes = block.data.size() * sizeof(Half);
+        const auto bytes = block.storage_size() * sizeof(Half);
         if (shared_) {
+            if (block.storage()!=shared_slot(slot)) throw std::logic_error("shared upload changed the physical slot");
             events_.emplace(id, CopyRecord{});
-            std::memcpy(static_cast<unsigned char *>(tensor_->data)+offset,block.data.data(),bytes);
             return id;
         }
 #ifdef SOLID_HAVE_SYCL
         if (sycl_copy_) {
             auto & record=events_.try_emplace(id).first->second;
             try {
-                const auto * source=stage_host(slot,0,block.data.data(),bytes);
+                const auto * source=stage_host(slot,0,block.storage(),bytes);
                 sycl_copy_->copy(static_cast<unsigned char *>(tensor_->data)+offset,source,bytes);
                 record.sycl=sycl_copy_->fence();
             } catch (...) {
@@ -168,7 +181,7 @@ public:
         try {
             auto & record=events_.try_emplace(id).first->second;
             record.event=event;
-            const auto * source=stage_host(slot,0,block.data.data(),bytes);
+            const auto * source=stage_host(slot,0,block.storage(),bytes);
             begin_copy_interval(record,slot);
             ggml_backend_tensor_set_async(copy_backend_, tensor_, source, offset, bytes);
             record_copy_interval(record.interval,true);
@@ -217,7 +230,7 @@ public:
         const auto version=row+(current.unarchived?0:1);
         if (!current_source_ || current_source_->data!=current.kv.data || slot>=static_cast<std::uint64_t>(geometry_.heads)*per_head_ || prefix>row ||
             (version!=0 && !block) || (block && (block->layout!=KvLayout::interleaved || block->dimension!=geometry_.dimension ||
-            block->capacity!=geometry_.block_tokens || block->data.size()!=static_cast<std::size_t>(geometry_.block_tokens)*2*geometry_.dimension ||
+            block->capacity!=geometry_.block_tokens || block->storage_size()!=static_cast<std::size_t>(geometry_.block_tokens)*2*geometry_.dimension ||
             block->valid_tokens!=version || block->version!=version || block->first_position!=current.position-row))) {
             throw std::invalid_argument("current device transfer snapshot");
         }
@@ -227,7 +240,7 @@ public:
         const auto offset=head*tensor_->nb[2]+local*geometry_.block_tokens*tensor_->nb[1];
         const auto prefix_offset=static_cast<std::size_t>(prefix)*row_bytes;
         const auto prefix_bytes=static_cast<std::size_t>(row-prefix)*row_bytes;
-        const auto * prefix_data=prefix_bytes?block->data.data()+static_cast<std::size_t>(prefix)*2*geometry_.dimension:nullptr;
+        const auto * prefix_data=prefix_bytes?block->storage()+static_cast<std::size_t>(prefix)*2*geometry_.dimension:nullptr;
         const auto * current_row=static_cast<const unsigned char *>(current_source_->data)+head*row_bytes;
 #ifdef SOLID_HAVE_SYCL
         if (sycl_copy_) {
@@ -424,6 +437,20 @@ public:
     ScheduleStats stats() const { return stats_; }
     std::uint64_t resident_bytes() const override { return ggml_backend_buffer_get_size(buffer_.get()); }
     bool shared_memory() const override { return shared_; }
+    bool aliases_host_slots() const override { return shared_; }
+    bool binds_host_slots() const override { return shared_ || staging_!=nullptr; }
+    std::shared_ptr<void> host_storage_owner() const override { return shared_?buffer_:staging_; }
+    Half * host_slot_storage(std::uint32_t slot) const override {
+        if (shared_) return shared_slot(slot);
+        if (!staging_ || slot>=static_cast<std::uint64_t>(geometry_.heads)*per_head_) throw std::out_of_range("pinned KV slot");
+        const auto elements=static_cast<std::size_t>(geometry_.block_tokens)*2*geometry_.dimension;
+        return static_cast<Half *>(ggml_backend_buffer_get_base(staging_.get()))+slot*elements;
+    }
+    Half * shared_slot(std::uint32_t slot) const {
+        if (!shared_ || slot>=static_cast<std::uint64_t>(geometry_.heads)*per_head_) throw std::out_of_range("shared KV slot");
+        const auto offset=(slot/per_head_)*tensor_->nb[2]+(slot%per_head_)*geometry_.block_tokens*tensor_->nb[1];
+        return reinterpret_cast<Half *>(static_cast<unsigned char *>(tensor_->data)+offset);
+    }
     ggml_tensor * tensor() const { return tensor_; }
 private:
     void begin_copy_interval(CopyRecord & record,std::uint32_t slot) {
@@ -444,12 +471,13 @@ private:
         (void) interval; (void) end;
 #endif
     }
-    const void * stage_host(std::uint32_t slot,std::size_t offset,const void * source,std::size_t bytes) {
+    const void * stage_host(std::uint32_t,std::size_t,const void * source,std::size_t bytes) {
         if (!staging_) return source;
-        const auto block_bytes=static_cast<std::size_t>(geometry_.block_tokens)*2*geometry_.dimension*sizeof(Half);
-        auto * target=static_cast<unsigned char *>(ggml_backend_buffer_get_base(staging_.get()))+slot*block_bytes+offset;
-        std::memcpy(target, source, bytes);
-        return target;
+        const auto begin=reinterpret_cast<std::uintptr_t>(ggml_backend_buffer_get_base(staging_.get()));
+        const auto address=reinterpret_cast<std::uintptr_t>(source);
+        const auto size=ggml_backend_buffer_get_size(staging_.get());
+        if (address<begin || address-begin>size || bytes>size-(address-begin)) throw std::logic_error("KV source is outside its pinned I/O bank");
+        return source;
     }
     ggml_tensor row_tensor(const ggml_tensor & source,void * data) const {
         auto row=source; row.type=GGML_TYPE_F16; row.op=GGML_OP_NONE; row.flags=0;
@@ -477,12 +505,12 @@ private:
     std::unique_ptr<SyclCopyQueue> sycl_copy_;
     std::unique_ptr<SyclCopyEvent> archive_sycl_;
 #endif
-    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> staging_{nullptr, ggml_backend_buffer_free};
+    std::shared_ptr<ggml_backend_buffer> staging_;
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> archive_buffer_{nullptr, ggml_backend_buffer_free};
     ggml_backend_event_t archive_event_=nullptr;
     bool archive_pending_=false;
     std::unique_ptr<ggml_context, decltype(&ggml_free)> context_{nullptr, ggml_free};
-    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer_{nullptr, ggml_backend_buffer_free};
+    std::shared_ptr<ggml_backend_buffer> buffer_;
     ggml_tensor * tensor_ = nullptr;
     bool shared_ = false;
     std::map<std::uint64_t, CopyRecord> events_;
@@ -509,7 +537,7 @@ struct LayerWork {
     bool direct = false;
     bool deferred_archive;
     LayerWork(std::uint32_t layer, std::uint64_t position, ScheduleMode mode, ScheduleTrace & trace,
-               std::uint64_t id, const std::array<std::uint64_t, task_count> & estimates, bool archive, bool single_layer) :
+               std::uint64_t id, const std::array<std::uint64_t, task_count> & estimates, bool archive, bool single_layer,bool shared) :
         layer(layer), position(position), dag([&] {
             const bool serial = mode == ScheduleMode::naive;
             std::vector<TaskSpec> specs = {
@@ -533,6 +561,7 @@ struct LayerWork {
                 specs[current_h2d].predecessors={kv_projection,miss_read,history_h2d};
                 if (single_layer) specs[next_prefetch].predecessors.push_back(append);
             }
+            if (shared) specs[next_prefetch].predecessors.push_back(attention);
             for (std::size_t i = 0; i < specs.size(); ++i) specs[i].estimate_ns = estimates[i];
             return specs;
         }(), &trace, id, layer, position, mode), deferred_archive(archive) {}
@@ -557,11 +586,11 @@ struct GgmlPrefetch::Impl {
     std::uint64_t sequence = 0;
     bool quiesced = true;
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
-          const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied) :
+        const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied,bool share_host_cache) :
         session(s), backend(backend), mode(mode), worker(cpu), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
             schedule.parent_path()/(schedule.stem().string()+".blocks"+schedule.extension().string())),
         events(attention_events(s,backend,mode,std::move(supplied))),
-        transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode,events.get()),
+        transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode,events.get(),share_host_cache),
         device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) {
         estimates.fill(1); totals.coordinator_cpu=cpu; totals.completion_backend=events?events->name():"graph_boundaries";
     }
@@ -570,7 +599,7 @@ struct GgmlPrefetch::Impl {
         if (work && work->dag.task(attention).state != TaskState::complete) throw std::logic_error("new layer started before previous attention completion");
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
         work = std::make_shared<LayerWork>(layer, position, mode, trace, ++sequence, estimates,
-            direct && mode!=ScheduleMode::naive, session.geometry().layers==1);
+            direct && mode!=ScheduleMode::naive, session.geometry().layers==1,transport.aliases_host_slots());
         const auto time=trace.now();
         if (projection_ns) {
             work->dag.start(q_ready,time);
@@ -618,13 +647,14 @@ struct GgmlPrefetch::Impl {
         else frame->dag.complete(store_task, trace.now(), "buffered_or_synchronous_store");
     }
     void next_layer(const std::shared_ptr<LayerWork> & current) {
+        if (transport.aliases_host_slots() && current->dag.task(attention).state!=TaskState::complete) return;
         const auto next = current->layer + 1 < session.geometry().layers ? current->layer + 1 : 0;
         const auto position = next ? current->position : current->position + 1;
         current->dag.start(next_prefetch, trace.now());
         if (position<session.geometry().capacity_tokens) {
             begin_prediction(next, position);
-            current->dag.complete(next_prefetch, trace.now());
-        } else current->dag.complete(next_prefetch,trace.now(),"context_capacity_reached");
+            current->dag.complete(next_prefetch, trace.now(),transport.aliases_host_slots()?"shared_attention_buffer_released":"");
+        } else current->dag.complete(next_prefetch,trace.now(),transport.aliases_host_slots()?"shared_context_capacity_reached":"context_capacity_reached");
     }
     void begin_prediction(std::uint32_t layer, std::uint64_t position) {
         session.begin_prefetch(layer, position, {block_read_estimate, block_copy_estimate});
@@ -634,6 +664,7 @@ struct GgmlPrefetch::Impl {
         if (!device.attention_pending()) return;
         if (device.attention_complete(device.attention_epoch())) {
             work->dag.complete(attention, trace.now(), proof, device_ns);
+            if (transport.aliases_host_slots()) next_layer(work);
             if (work->dag.finished()) finish_frame(work);
             session.prefetcher().poll();
             observe_stores();
@@ -693,8 +724,8 @@ struct GgmlPrefetch::Impl {
     }
 };
 GgmlPrefetch::GgmlPrefetch(AttentionSession & session, ggml_backend_t backend, const std::filesystem::path & trace,
-                          ScheduleMode mode, const std::filesystem::path & schedule_trace,int cpu,std::unique_ptr<AttentionEvents> events) :
-    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace,cpu,std::move(events))) {}
+                          ScheduleMode mode, const std::filesystem::path & schedule_trace,int cpu,std::unique_ptr<AttentionEvents> events,bool share_host_cache) :
+    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace,cpu,std::move(events),share_host_cache)) {}
 GgmlPrefetch::~GgmlPrefetch() { if (!impl_->quiesced) { try { quiesce(); } catch (...) {} } }
 ggml_tensor * GgmlPrefetch::tensor() const { return impl_->transport.tensor(); }
 std::uint32_t GgmlPrefetch::tokens_per_head() const { return impl_->device.tokens_per_head(); }
@@ -905,10 +936,10 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
                 work->dag.complete(current_h2d, impl_->trace.now(), "shared_upload_batch");
                 work->dag.start(attention, impl_->trace.now());
             }
-            bool next_started=false;
+            bool next_started=impl_->transport.aliases_host_slots();
             if (work->deferred_archive) {
                 work->dag.start(kv_d2h,impl_->trace.now());
-                if (impl_->session.geometry().layers>1) { impl_->next_layer(work); next_started=true; }
+                if (!next_started && impl_->session.geometry().layers>1) { impl_->next_layer(work); next_started=true; }
                 std::optional<std::uint64_t> archive_ns;
                 const auto kv=impl_->transport.finish_archive(archive_ns);
                 work->dag.complete(kv_d2h,impl_->trace.now(),"kv_archive_copy_complete",archive_ns);

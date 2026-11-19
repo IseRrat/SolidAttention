@@ -128,7 +128,13 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
             else if (is_usm_system)
                 free_aligned_mem_host(dev_ptr);''')
     anchor = 'static bool is_bmg_g31_arch(int device) {\n'
-    sycl = replace_once(sycl, anchor, '''extern "C" ggml_backend_buffer_t solid_sycl_alloc_shared_kv(ggml_backend_t backend, size_t bytes) {
+    sycl = replace_once(sycl, anchor, '''extern "C" bool solid_sycl_shared_kv_supported(ggml_backend_t backend) {
+    if (!ggml_backend_is_sycl(backend)) return false;
+    auto * type = static_cast<ggml_backend_sycl_buffer_type_context *>(ggml_backend_get_default_buffer_type(backend)->context);
+    const auto device=type->stream->get_device();
+    return device.get_info<sycl::info::device::host_unified_memory>() && device.has(sycl::aspect::usm_shared_allocations);
+}
+extern "C" ggml_backend_buffer_t solid_sycl_alloc_shared_kv(ggml_backend_t backend, size_t bytes) {
     if (!ggml_backend_is_sycl(backend) || !bytes) throw std::invalid_argument("invalid SYCL KV buffer request");
     auto * buft = ggml_backend_get_default_buffer_type(backend);
     auto * type = static_cast<ggml_backend_sycl_buffer_type_context *>(buft->context);
