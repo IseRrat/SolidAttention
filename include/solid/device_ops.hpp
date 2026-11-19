@@ -1,6 +1,7 @@
 #pragma once
 
 #include "ggml.h"
+#include "solid/device_timing.hpp"
 #include <cstdint>
 #include <cstring>
 

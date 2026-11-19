@@ -1,7 +1,9 @@
 #pragma once
 
 #include "ggml-backend.h"
+#include <cstdint>
 #include <memory>
+#include <optional>
 
 // Returns null for a device without shared DRAM. An allocation failure on a
 // supported device is reported as an exception.
@@ -15,6 +17,7 @@ public:
     virtual bool ready() const = 0;
     virtual void wait() = 0;
     virtual void wait_on_compute() = 0;
+    virtual std::optional<std::uint64_t> duration() const = 0;
 };
 class SyclCopyQueue {
 public:

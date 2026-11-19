@@ -70,11 +70,11 @@ void BlockStage::copy_started(const BlockIdentity & id) {
     if (aborted_) throw std::logic_error("new upload after block stage abort");
     dag_->start(2*index(id)+1,now());
 }
-void BlockStage::copy_complete(const BlockIdentity & id,const std::string & proof) {
+void BlockStage::copy_complete(const BlockIdentity & id,const std::string & proof,std::optional<std::uint64_t> device_ns) {
     const auto i=index(id);
     if (aborted_) return;
     resident_copies_[i]=proof=="device_resident";
-    dag_->complete(2*i+1,now(),proof);
+    dag_->complete(2*i+1,now(),proof,device_ns);
     const auto join=static_cast<std::uint32_t>(2*blocks_.size());
     if (--copies_remaining_==0) dag_->fence({join},now(),"all_block_copies_complete");
 }
@@ -87,8 +87,8 @@ BlockStageStats BlockStage::stats() const {
     BlockStageStats result; result.tasks=dag_->size(); result.critical_path_ns=dag_->critical_path_ns();
     for (std::uint32_t i=0;i<blocks_.size();++i) {
         const auto read=dag_->task(2*i),copy=dag_->task(2*i+1);
-        if (!observed_reads_[i]) { result.read_ns+=read.end_ns-read.start_ns; ++result.read_samples; }
-        if (!resident_copies_[i]) { result.copy_ns+=copy.end_ns-copy.start_ns; ++result.copy_samples; }
+        if (!observed_reads_[i]) { result.read_ns+=read.duration_ns(); ++result.read_samples; }
+        if (!resident_copies_[i]) { result.copy_ns+=copy.duration_ns(); ++result.copy_samples; }
     }
     return result;
 }

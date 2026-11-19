@@ -120,6 +120,40 @@ void interrupted(bool timing_error) {
     cache.quiesce(); session.finish();
     require(copies.pending.empty() && copies.completed==copies.submitted,"native cancellation left live writers");
 }
+void selection_projection_overlap() {
+    class GatedRanker final : public solid::BlockRanker {
+    public:
+        explicit GatedRanker(std::shared_future<void> release):release(std::move(release)) {}
+        void publish(std::uint32_t,std::uint64_t,std::uint64_t,const std::vector<solid::Half> &) override {}
+        std::vector<std::vector<std::uint64_t>> rank(std::uint32_t,const std::vector<float> &,
+                                                    const solid::BlockCandidates &) override {
+            release.wait();
+            throw std::runtime_error("injected asynchronous selection failure");
+        }
+        solid::RankerStats stats() const override { return {}; }
+        const char * name() const override { return "gated_selection"; }
+    private:
+        std::shared_future<void> release;
+    };
+    solid::AttentionSession session(std::make_unique<solid::MemoryKvStore>(geometry),1,{3,1,1,1},true,4,
+        {},{},std::make_unique<Reader>(),4);
+    seed(session);
+    std::promise<void> release;
+    session.set_ranker(std::make_unique<GatedRanker>(release.get_future().share()));
+    std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
+    solid::GgmlPrefetch cache(session,backend.get(),{},solid::ScheduleMode::overlap);
+    std::vector<float> query(64,.125f),key(64,.25f),value(64,.75f);
+    auto frontier=std::async(std::launch::async,[&] { cache.select_early(0,4,query,false); });
+    const auto returned=frontier.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+    release.set_value();
+    frontier.get();
+    require(returned,"KV projection frontier waited for selection completion");
+    bool preserved=false;
+    try { (void) cache.decode(0,4,{},key,value,false); }
+    catch (const std::exception & error) { preserved=std::string(error.what()).find("injected asynchronous selection failure")!=std::string::npos; }
+    cache.quiesce();
+    require(preserved,"asynchronous selection error was lost at the KV frontier");
+}
 #ifdef __linux__
 struct ReadGate {
     std::atomic<bool> opened{true};
@@ -183,7 +217,7 @@ int main(int argc,char ** argv) {
     try {
         const int repeats=argc==3 && std::string(argv[1])=="--repeat"?std::stoi(argv[2]):1;
         require((argc==1 || (argc==3 && std::string(argv[1])=="--repeat")) && repeats>0 && repeats<=1000,"native check repeat arguments");
-        for (int i=0;i<repeats;++i) { ffn_overlap(); interrupted(false); interrupted(true);
+        for (int i=0;i<repeats;++i) { ffn_overlap(); interrupted(false); interrupted(true); selection_projection_overlap();
 #ifdef __linux__
         query_handoff();
 #endif

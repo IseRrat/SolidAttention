@@ -26,7 +26,7 @@ public:
     void read_started(const BlockIdentity & identity,const std::string & proof={});
     void read_complete(const BlockIdentity & identity,const std::string & proof={});
     void copy_started(const BlockIdentity & identity);
-    void copy_complete(const BlockIdentity & identity,const std::string & proof={});
+    void copy_complete(const BlockIdentity & identity,const std::string & proof={},std::optional<std::uint64_t> device_ns={});
     bool finished() const;
     void abort();
     BlockStageStats stats() const;

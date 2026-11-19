@@ -26,10 +26,12 @@ public:
     bool completion_host_marker() const;
     void select_early(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, bool query_covers_attention);
     std::optional<DeviceMemory> direct_memory() const;
-    void select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool query_covers_attention);
+    void select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool query_covers_attention,
+                             std::optional<std::uint64_t> projection_ns = {});
     std::vector<Half> decode_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys,
                                   std::optional<DeviceQuery> serial_query = {},ggml_tensor * device_source = nullptr);
-    std::vector<Half> decode_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys, ggml_tensor * source);
+    std::vector<Half> decode_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys, ggml_tensor * source,
+                                   std::optional<std::uint64_t> projection_ns = {});
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);
     ScheduleStats schedule_stats() const;
     // The caller keeps the context/backend alive until this has returned.
@@ -38,9 +40,11 @@ public:
 private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
-    void select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device, bool covers);
+    void select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device,
+                     bool covers,std::optional<std::uint64_t> projection_ns = {});
     std::vector<Half> decode_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                   const std::vector<float> & keys, const std::vector<float> & values, bool packed,
-                                  const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * device_source);
+                                  const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * device_source,
+                                  std::optional<std::uint64_t> projection_ns = {});
 };
 } // namespace solid

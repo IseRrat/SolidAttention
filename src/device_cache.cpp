@@ -55,11 +55,15 @@ void DeviceCache::poll_transfers(bool wait) {
         const bool current = slots_.complete(lease);
         if (!current) ++stats_.stale_events;
         it = transfers_.erase(it);
-        if (stage) { try { stage->copy_complete(lease.identity,"copy_ticket_complete"); } catch (...) { if (!error) error=std::current_exception(); } }
+        if (stage) {
+            try { stage->copy_complete(lease.identity,"copy_ticket_complete",transport_.copy_interval()); }
+            catch (...) { if (!error) error=std::current_exception(); }
+        }
         if (current) { try { event("upload_complete", lease); } catch (...) { if (!error) error = std::current_exception(); } }
     }
     if (error) std::rethrow_exception(error);
 }
+void DeviceCache::reap_transfers() { poll_transfers(false); }
 void DeviceCache::wait_transfers() { poll_transfers(true); }
 void DeviceCache::wait_transfers_coalesced() { if (!transfers_.empty()) transport_.wait_batch(); poll_transfers(true); }
 void DeviceCache::retain(const std::vector<BlockIdentity> & identities) {

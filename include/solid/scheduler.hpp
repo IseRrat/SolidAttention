@@ -30,6 +30,7 @@ struct TaskRecord {
     std::uint64_t start_ns = 0, end_ns = 0, latest_start = 0;
     bool critical = false;
     std::optional<std::uint64_t> device_ns{};
+    std::uint64_t duration_ns() const { return device_ns.value_or(end_ns-start_ns); }
 };
 class ScheduleTrace {
 public:

@@ -19,6 +19,7 @@ struct llama_layer;
 struct llm_graph_qkv;
 
 namespace solid {
+struct ProjectionIntervals;
 struct AttentionFrame { std::vector<std::uint64_t> positions; };
 
 class AttentionFailure {
@@ -35,7 +36,8 @@ private:
 class AttentionNode {
 public:
     AttentionNode(AttentionSession & session, std::shared_ptr<AttentionFrame> frame, std::uint32_t layer,
-                  float scale, std::shared_ptr<AttentionFailure> failure = {}, bool gathered = false, class GgmlPrefetch * prefetch = nullptr);
+                  float scale, std::shared_ptr<AttentionFailure> failure = {}, bool gathered = false, class GgmlPrefetch * prefetch = nullptr,
+                  ProjectionIntervals * timing = nullptr);
     ~AttentionNode();
     ggml_tensor * build(ggml_context * context, ggml_tensor * query, ggml_tensor * key, ggml_tensor * value,
                        ggml_tensor * packed_kv = nullptr, ggml_backend_sched * scheduler = nullptr,
@@ -70,6 +72,7 @@ public:
     bool gathered_decode(std::uint64_t position) const;
     bool fused_projection() const;
     const class KvProjection & projection(std::uint32_t layer) const;
+    ProjectionIntervals * projection_intervals(std::uint32_t layer, ggml_backend * backend);
     std::uint64_t projection_buffer_bytes() const;
     std::uint64_t projection_initialization_ns() const;
     std::vector<std::string> projection_weight_types() const;
@@ -88,6 +91,7 @@ private:
 bool adapter_active(const llama_model * model);
 bool graph_depends_on(const ggml_tensor * tensor, const ggml_tensor * ancestor);
 bool adapter_fused_projection(const llama_model * model);
+void adapter_mark_projection(const llm_graph_context & graph, ggml_tensor * projection, int layer, bool query);
 llm_graph_qkv adapter_qkv(const llm_graph_context & graph, const llama_layer & layer, ggml_tensor * input,
                          std::int64_t dimension_q, std::int64_t heads_q, std::int64_t dimension_k,
                          std::int64_t heads_k, std::int64_t dimension_v, std::int64_t heads_v, int layer_id, bool reshape);

@@ -26,6 +26,7 @@ public:
         throw std::logic_error("current device KV transfer is disabled");
     }
     virtual bool complete(std::uint64_t ticket, bool wait) = 0;
+    virtual std::optional<std::uint64_t> copy_interval() const { return {}; }
     // Wait for issued copies; ticket receipts remain valid for complete().
     virtual void drain() = 0;
     virtual void wait_batch() { drain(); }
@@ -49,6 +50,7 @@ public:
                 const std::filesystem::path & trace = {});
     ~DeviceCache();
     void prefetch_ready();
+    void reap_transfers();
     void wait_transfers();
     void wait_transfers_coalesced();
     void stage(const std::vector<SlotLease> & host_leases);

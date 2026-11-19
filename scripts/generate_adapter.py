@@ -21,6 +21,9 @@ def generate(source, destination):
                                   n_embd_head_v, n_head_v, il, reshape);
     }
 ''' + anchor)
+    for label, matrix, is_query in (("Qcur", "wq", "true"), ("Kcur", "wk", "false")):
+        anchor = f"        {label} = build_lora_mm(layer.{matrix}, cur, layer.{matrix}_s);\n"
+        graph = replace_once(graph, anchor, anchor + f"        solid::adapter_mark_projection(*this, {label}, il, {is_query});\n")
     signature = "ggml_tensor * llm_graph_context::build_attn(\n        llm_graph_input_attn_kv * inp,"
     start = graph.index(signature)
     body = graph.index(") const {", start) + len(") const {")
@@ -101,6 +104,19 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
             if (solid_completion) CUDA_CHECK(solid::cuda_attention_end(solid_completion, ctx.stream()));
             break;
         }''')
+    anchor = '                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);'
+    cuda = replace_once(cuda, anchor, '''                if (node->op == GGML_OP_MUL_MAT) {
+                    if (auto * interval = solid::device_timing(node)) interval->record(cuda_ctx->stream(), false);
+                }
+''' + anchor)
+    anchor = 'int ggml_backend_cuda_get_device_count() {\n'
+    cuda = replace_once(cuda, anchor, '''extern "C" void * solid_cuda_queue(ggml_backend_t backend) {
+    auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);
+    ggml_cuda_set_device(ctx->device);
+    return ctx->stream();
+}
+
+''' + anchor)
     sycl = (source.parent / "ggml/src/ggml-sycl/ggml-sycl.cpp").read_text(encoding="utf-8")
     sycl = ('#include "solid/sycl_backend.hpp"\n#include "solid/sycl_flash_decode.hpp"\n'
             '#include "solid/sycl_device_ops.hpp"\n#include <memory>\n#include <stdexcept>\n') + sycl
@@ -167,9 +183,15 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
     sycl = replace_once(sycl, anchor, '''        const ggml_op node_op = node->op;
 
         // SolidAttention publishes a fresh host notification for every launch.
-        if (solid::sycl_masked_decode_supported(node) || solid::device_op(node) != solid::DeviceOp::none) return false;
+        if (solid::sycl_masked_decode_supported(node) || solid::device_op(node) != solid::DeviceOp::none ||
+            (node_op == GGML_OP_MUL_MAT && solid::device_timing(node))) return false;
 
         if (!graph_node_is_in_local_device(device_buft, node))''')
+    anchor = '        const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);'
+    sycl = replace_once(sycl, anchor, '''        if (node->op == GGML_OP_MUL_MAT) {
+            if (auto * interval = solid::device_timing(node)) interval->record(sycl_ctx->stream(), false);
+        }
+''' + anchor)
     destination.mkdir(parents=True, exist_ok=True)
     for name, text in (("llama-graph.cpp", graph), ("llama-context.cpp", context), ("ggml-backend.cpp", backend),
                        ("ggml-cuda.cu", cuda), ("ggml-sycl.cpp", sycl)):

@@ -545,6 +545,7 @@ private:
         const auto heads = geometry_.heads;
         const auto width = geometry_.dimension;
         const auto reps = representatives_;
+        const auto local = local_;
         const auto slot = position % local_;
         const auto block = position / geometry_.block_tokens;
         const auto keys = state.pending_keys.get();
@@ -558,7 +559,7 @@ private:
         queue_.parallel_for(sycl::range<1>(heads), [=](sycl::id<1> id) {
             const auto row = slot * heads + id[0];
             const auto base = id[0] * reps;
-            insert_representative(position, scores[row], keys + row * width, reps, width,
+            insert_representative(position, scores[row] / local, keys + row * width, reps, width,
                                   top_positions + base, top_scores + base, top_keys + base * width);
             if (!complete) return;
             for (std::uint32_t r = 0; r < reps; ++r) {

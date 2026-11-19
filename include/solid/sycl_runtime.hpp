@@ -8,10 +8,11 @@
 
 namespace solid::sycl_runtime {
 
-inline sycl::queue in_order_queue(const sycl::queue & parent) {
+inline sycl::queue in_order_queue(const sycl::queue & parent, bool profiling = false) {
+    const auto properties = profiling ? sycl::property_list(sycl::property::queue::in_order{},sycl::property::queue::enable_profiling{}) :
+                                       sycl::property_list(sycl::property::queue::in_order{});
     return sycl::queue(parent.get_context(), parent.get_device(),
-        [](sycl::exception_list errors) { for (const auto & error : errors) std::rethrow_exception(error); },
-        sycl::property::queue::in_order{});
+        [](sycl::exception_list errors) { for (const auto & error : errors) std::rethrow_exception(error); }, properties);
 }
 
 inline std::size_t product(std::size_t a, std::size_t b) {

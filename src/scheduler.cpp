@@ -186,7 +186,7 @@ std::uint64_t TaskDag::critical_path_ns() const {
     std::uint64_t maximum = 0;
     for (const auto id : order_) {
         for (const auto before : tasks_[id].spec.predecessors) costs[id] = std::max(costs[id], costs[before]);
-        costs[id] = add(costs[id], tasks_[id].end_ns - tasks_[id].start_ns); maximum = std::max(maximum, costs[id]);
+        costs[id] = add(costs[id], tasks_[id].duration_ns()); maximum = std::max(maximum, costs[id]);
     }
     return maximum;
 }

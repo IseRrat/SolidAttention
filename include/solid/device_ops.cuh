@@ -32,7 +32,10 @@ inline cudaError_t cuda_device_op(ggml_tensor * output, cudaStream_t stream) {
     const auto grid = static_cast<unsigned>((count+255)/256 > 65535 ? 65535 : (count+255)/256);
     switch (device_op(output)) {
         case DeviceOp::query_token:
-        case DeviceOp::kv_token: device_ops_detail::query_token<<<1,1,0,stream>>>(static_cast<float *>(output->data)); break;
+        case DeviceOp::kv_token:
+            if (auto * interval=device_timing(output)) interval->record(stream,true);
+            device_ops_detail::query_token<<<1,1,0,stream>>>(static_cast<float *>(output->data));
+            break;
         case DeviceOp::consolidate_kv:
             device_ops_detail::consolidate<<<grid,256,0,stream>>>(static_cast<const char *>(output->src[0]->data),
                 static_cast<const char *>(output->src[1]->data),static_cast<__half *>(output->data),output->src[0]->nb[1],

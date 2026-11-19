@@ -54,7 +54,7 @@
 
 4. **SYCL 评分和选块**
 
-   已写设备代表 bank、窗口更新、定稿、评分和预算归约，接入图内 Q/K 及批量构造。按设备能力使用 FP64 或双 FP32 分量。定稿分数回填的 local 归一化仍需核对。
+   已写设备代表 bank、窗口更新、定稿、评分和预算归约，接入图内 Q/K 及批量构造。按设备能力使用 FP64 或双 FP32 分量。定稿前将累计分数除以 local，与 CPU、CUDA 的代表种子和分数回填使用相同口径。
 
    [block_ranker.cpp](../src/sycl/block_ranker.cpp)。
 
@@ -104,7 +104,7 @@
 
 2. **Q 前沿与提前补读**
 
-   已将设备 Q 就绪标量和 CPU 选择节点接入模型图，选择结果提前提交历史读取，KV 就绪后合并工作集。提供 naive、overlap、overlap+sync_reuse。选择计算与 KV 投影的实际并行关系仍需逐节点核对。
+   已将设备 Q 就绪标量和 CPU 前沿接入模型图。overlap 与 overlap+sync_reuse 的前沿把选择交给持久协调线程后返回，GPU 可继续 KV 投影与交错转换。协调线程完成代表更新、选择和历史补读，KV 就绪处收割其结果。Q 的图依赖保留到消费者结束，选择异常在 KV 前沿传递。任务图把选择和 KV 生成作为 Q 就绪后的两个分支。naive 保留串行路径。
 
    [llama_adapter.cpp](../src/llama_adapter.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)。
 
@@ -128,7 +128,7 @@
 
 6. **设备任务计时**
 
-   本地已写 Q/KV 投影区间、历史块上传及 KV 归档区间回执，DAG 使用设备时长更新成本，调度轨迹核查采用同一口径。相关改动已通过双后端编译与已有 CPU 检查，当前保存在本地。
+   已写 Q/KV 投影区间、历史块上传及 KV 归档区间回执，DAG 使用设备时长更新成本，调度轨迹核查采用同一口径。CUDA 用原生事件记录，SYCL 使用设备支持的时间戳或复制队列 profiling。复制票据完成时收集区间，后继层使用更新后的成本。
 
    [device_timing.hpp](../include/solid/device_timing.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[scheduler.cpp](../src/scheduler.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)。
 
@@ -156,7 +156,7 @@
 
 4. **长输入 Prefill**
 
-   已实现有界 Q/KV tile、因果在线 softmax、历史分块读取、当前设备 KV、设备结果和 decode 代表状态交接，CUDA/SYCL 都有设备实现。本地新增四 query 共享 K/V 面板的 CUDA 修改，构建结果待核实。
+   已实现有界 Q/KV tile、因果在线 softmax、历史分块读取、当前设备 KV、设备结果和 decode 代表状态交接。CUDA 每个 CTA 的四个 warp 处理同一 head 的四个连续 query，共用八行 K/V 共享面板。最大维度 1024 时面板占 32 KiB，包含尾 query、因果边界及非有限分数的统一 barrier 处理。SYCL 使用逐 query head 的分块在线累加。
 
    [tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.cpp](../src/sycl/tiled_prefill.cpp)、[session.cpp](../src/session.cpp)。
 

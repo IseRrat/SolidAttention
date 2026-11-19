@@ -34,47 +34,86 @@ __global__ void initialize(float * weights,float * maximum,float * sum,std::uint
         if (i<rows) { maximum[i]=-CUDART_INF_F; sum[i]=0; }
     }
 }
+// Four warps process four consecutive queries for one query head. Each CTA
+// loads an eight-token K/V panel once, then all four queries reuse that panel.
+// The maximum shared footprint is 32 KiB at dimension 1024.
 template<int Width>
 __global__ void accumulate(const float * query,const __half * kv,float * weights,float * maximum,float * sum,int * error,
-    std::uint64_t first_query,std::uint64_t first_key,std::uint32_t valid,std::uint64_t rows,
+    std::uint64_t first_query,std::uint64_t first_key,std::uint32_t valid,std::uint32_t queries,
     std::uint32_t query_heads,std::uint32_t group,std::uint32_t width,std::size_t token_stride,std::size_t head_stride,float scale) {
+    constexpr unsigned queries_per_cta=4;
+    constexpr unsigned panel_tokens=8;
     constexpr int fragments=(Width+31)/32;
+    __shared__ __half panel[panel_tokens*2*Width];
     const auto lane=threadIdx.x%32;
-    const auto warp=(static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x)/32;
-    const auto warps=static_cast<std::uint64_t>(gridDim.x)*blockDim.x/32;
-    for (auto row=warp;row<rows;row+=warps) {
-        const auto position=first_query+row/query_heads;
-        if (first_key>position) continue;
-        const auto head=(row%query_heads)/group;
-        float q[fragments], output[fragments];
+    const auto warp=threadIdx.x/32;
+    const auto query_groups=(static_cast<std::uint64_t>(queries)+queries_per_cta-1)/queries_per_cta;
+    const auto jobs=query_groups*query_heads;
+    for (auto job=static_cast<std::uint64_t>(blockIdx.x);job<jobs;job+=gridDim.x) {
+        const auto query_head=job%query_heads;
+        const auto query_start=(job/query_heads)*queries_per_cta;
+        const auto query_index=query_start+warp;
+        const bool active=query_index<queries;
+        const auto row=query_index*query_heads+query_head;
+        const auto position=first_query+query_index;
+        const auto last_query=min(query_start+queries_per_cta,static_cast<std::uint64_t>(queries))-1;
+        const auto last_position=first_query+last_query;
+        // This branch is uniform across the whole CTA, including inactive warps.
+        if (first_key>last_position) continue;
+        const auto count=static_cast<std::uint32_t>(min(static_cast<std::uint64_t>(valid),last_position-first_key+1));
+        const auto head=query_head/group;
+        float q[fragments]{}, output[fragments]{};
         for (int r=0;r<fragments;++r) {
             const auto d=lane+32*r;
-            q[r]=d<width?query[row*width+d]:0;
-            output[r]=d<width?weights[row*width+d]:0;
-        }
-        auto m=maximum[row], denominator=sum[row];
-        const auto count=static_cast<std::uint32_t>(min(static_cast<std::uint64_t>(valid),position-first_key+1));
-        for (std::uint32_t token=0;token<count;++token) {
-            const auto base=head*head_stride+token*token_stride;
-            float score=0;
-            for (int r=0;r<fragments;++r) {
-                const auto d=lane+32*r;
-                if (d<width) score=fmaf(q[r],__half2float(kv[base+d]),score);
-            }
-            for (int delta=16;delta;delta/=2) score+=__shfl_down_sync(0xffffffff,score,delta);
-            score=__shfl_sync(0xffffffff,score,0)*scale;
-            if (!isfinite(score)) { if (!lane) atomicExch(error,1); return; }
-            const auto update=online_attention_update(m,denominator,score);
-            m=update.maximum; denominator=update.sum;
-            for (int r=0;r<fragments;++r) {
-                const auto d=lane+32*r;
-                if (d<width) output[r]=output[r]*update.previous_scale+__half2float(kv[base+width+d])*update.weight;
+            if (active && d<width) {
+                q[r]=query[row*width+d];
+                output[r]=weights[row*width+d];
             }
         }
-        if (!lane) { maximum[row]=m; sum[row]=denominator; }
-        for (int r=0;r<fragments;++r) {
-            const auto d=lane+32*r;
-            if (d<width) weights[row*width+d]=output[r];
+        auto m=active?maximum[row]:-CUDART_INF_F;
+        auto denominator=active?sum[row]:0.f;
+        bool finite_row=true;
+        for (std::uint32_t first=0;first<count;first+=panel_tokens) {
+            const auto tokens=min(panel_tokens,count-first);
+            const auto elements=tokens*2*width;
+            for (auto i=threadIdx.x;i<elements;i+=blockDim.x) {
+                const auto token=i/(2*width);
+                const auto offset=i%(2*width);
+                panel[i]=kv[head*head_stride+(first+token)*token_stride+offset];
+            }
+            __syncthreads();
+            for (std::uint32_t token=0;token<tokens;++token) {
+                if (!active || !finite_row || first_key+first+token>position) continue;
+                const auto base=token*2*width;
+                float score=0;
+                for (int r=0;r<fragments;++r) {
+                    const auto d=lane+32*r;
+                    if (d<width) score=fmaf(q[r],__half2float(panel[base+d]),score);
+                }
+                for (int delta=16;delta;delta/=2) score+=__shfl_down_sync(0xffffffff,score,delta);
+                score=__shfl_sync(0xffffffff,score,0)*scale;
+                if (!isfinite(score)) {
+                    if (!lane) atomicExch(error,1);
+                    finite_row=false;
+                    continue;
+                }
+                const auto update=online_attention_update(m,denominator,score);
+                m=update.maximum;
+                denominator=update.sum;
+                for (int r=0;r<fragments;++r) {
+                    const auto d=lane+32*r;
+                    if (d<width) output[r]=output[r]*update.previous_scale+__half2float(panel[base+width+d])*update.weight;
+                }
+            }
+            // Failed or masked query warps still participate in this barrier.
+            __syncthreads();
+        }
+        if (active) {
+            if (!lane) { maximum[row]=m; sum[row]=denominator; }
+            for (int r=0;r<fragments;++r) {
+                const auto d=lane+32*r;
+                if (d<width) weights[row*width+d]=output[r];
+            }
         }
     }
 }
@@ -171,11 +210,11 @@ public:
                 checked(cudaMemcpyAsync(kv_,kv,bytes,cudaMemcpyHostToDevice,stream_),"upload prefill KV tile");
                 checked(cudaEventRecord(copied_,stream_),"record prefill tile upload");
             }
-            const auto rows=static_cast<std::uint64_t>(count_)*qh_;
-            const auto blocks=static_cast<unsigned>(std::min<std::uint64_t>((rows+3)/4,65535));
+            const auto jobs=((static_cast<std::uint64_t>(count_)+3)/4)*qh_;
+            const auto blocks=static_cast<unsigned>(std::min<std::uint64_t>(jobs,65535));
             const auto token_stride=product(2,g_.dimension)*(device?g_.heads:1);
             const auto head_stride=product(2,g_.dimension)*(device?1:tile_);
-#define SOLID_PREFILL_LAUNCH(W) accumulate<W><<<blocks,128,0,stream_>>>(current_query_,reinterpret_cast<const __half *>(device?kv:kv_),weights_,maximum_,sum_,error_device_,first_,first,valid,rows,qh_,qh_/g_.heads,g_.dimension,token_stride,head_stride,scale_)
+#define SOLID_PREFILL_LAUNCH(W) accumulate<W><<<blocks,128,0,stream_>>>(current_query_,reinterpret_cast<const __half *>(device?kv:kv_),weights_,maximum_,sum_,error_device_,first_,first,valid,count_,qh_,qh_/g_.heads,g_.dimension,token_stride,head_stride,scale_)
             if (g_.dimension<=32) { SOLID_PREFILL_LAUNCH(32); }
             else if (g_.dimension<=64) { SOLID_PREFILL_LAUNCH(64); }
             else if (g_.dimension<=128) { SOLID_PREFILL_LAUNCH(128); }

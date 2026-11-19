@@ -9,6 +9,7 @@ inline bool sycl_device_op(sycl::queue & queue, ggml_tensor * output) {
     switch (device_op(output)) {
         case DeviceOp::query_token:
         case DeviceOp::kv_token:
+            if (auto * interval=device_timing(output)) interval->record(&queue,true);
             queue.fill(static_cast<float *>(output->data), 0.0f, 1);
             return true;
         case DeviceOp::release_mask:

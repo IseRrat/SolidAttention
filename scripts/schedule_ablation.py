@@ -17,6 +17,8 @@ NAMES = ("naive", "overlap", "sync-reuse")
 TASKS = {"q_gpu_ready", "q_d2h_ready", "selection", "selection_ready", "kv_projection_to_host",
          "kv_d2h_ready", "miss_read_and_reconcile", "history_h2d", "append_current_kv",
          "append_and_selection", "current_h2d", "attention_until_boundary", "buffered_ssd_store", "next_layer_prefetch"}
+DEVICE_PROOFS = {"attention_until_boundary": "attention_device_event", "q_gpu_ready": "query_device_projection",
+                 "kv_projection_to_host": "kv_device_ready", "kv_d2h_ready": "kv_archive_copy_complete"}
 
 
 def integer(value, positive=False):
@@ -73,8 +75,9 @@ def audit_schedule(path, mode, *, blocks=False):
                 raise ValueError("invalid schedule completion")
             task.update(state="complete", end=now, fence=item["fence"])
             if "device_ns" in item:
-                if blocks or task["name"]!="attention_until_boundary" or item["fence"]!="attention_device_event":
-                    raise ValueError("device interval lacks a matching attention event proof")
+                proof = "copy_ticket_complete" if blocks and task["name"].startswith("block_h2d_") else DEVICE_PROOFS.get(task["name"])
+                if proof is None or item["fence"] != proof:
+                    raise ValueError("device interval lacks a matching completion proof")
                 task["device_ns"]=integer(item["device_ns"])
         else:
             raise ValueError("failed or unknown schedule event")
@@ -85,7 +88,8 @@ def audit_schedule(path, mode, *, blocks=False):
     totals = {"frames": len(frames), "tasks": 0, "critical_path_ns": 0, "miss_projection_overlap_ns": 0,
               "query_reused_fences": 0, "process_reused_fences": 0, "attention_fences": 0, "fallback_fences": 0,"device_event_completions":0,"device_attention_ns":0}
     proofs = {"query_dependency_reuse": "query_reused_fences", "process_synchronize_reuse": "process_reused_fences",
-              "attention_backend_complete": "attention_fences", "explicit_fallback": "fallback_fences", "attention_device_event":"device_event_completions"}
+              "attention_backend_complete": "attention_fences", "explicit_fallback": "fallback_fences",
+              "attention_device_event": "device_event_completions", "attention_device_event_untimed": "device_event_completions"}
     identities = set()
     single_layer = len({frame["identity"][0] for frame in frames.values() if frame["identity"] is not None}) == 1
     for frame in frames.values():
@@ -102,7 +106,7 @@ def audit_schedule(path, mode, *, blocks=False):
         append = "append_and_selection" if serial else "append_current_kv"
         edges = {"q_gpu_ready": [], "q_d2h_ready": ["q_gpu_ready"],
                  selection: [append, "q_d2h_ready"] if serial else ["q_d2h_ready"],
-                 "kv_projection_to_host": [] if serial else [selection],
+                 "kv_projection_to_host": [] if serial else ["q_gpu_ready"],
                  "kv_d2h_ready": ["kv_projection_to_host"], "miss_read_and_reconcile": [selection],
                  "history_h2d": ["miss_read_and_reconcile"] if serial else [selection],
                  append: ["kv_d2h_ready"] if serial else ["kv_d2h_ready", "miss_read_and_reconcile", "history_h2d"],
@@ -128,14 +132,15 @@ def audit_schedule(path, mode, *, blocks=False):
             if not ready: raise ValueError("schedule dependency cycle")
             for key in ready:
                 task = tasks[key]
-                costs[key] = max((costs[dep] for dep in task["deps"]), default=0) + task["end"] - task["start"]
+                duration = task.get("device_ns", task["end"] - task["start"])
+                costs[key] = max((costs[dep] for dep in task["deps"]), default=0) + duration
         totals["tasks"] += len(tasks)
         totals["critical_path_ns"] += max(costs.values())
         miss, kv = names["miss_read_and_reconcile"], names["kv_projection_to_host"]
         totals["miss_projection_overlap_ns"] += max(0, min(miss["end"], kv["end"]) - max(miss["start"], kv["start"]))
         proof = names["attention_until_boundary"]["fence"]
         if proof not in proofs: raise ValueError("attention completion lacks a known proof")
-        if mode != "overlap+sync_reuse" and proof in ("query_dependency_reuse","attention_device_event"):
+        if mode != "overlap+sync_reuse" and proof in ("query_dependency_reuse", "attention_device_event", "attention_device_event_untimed"):
             raise ValueError("query reuse proof in a mode that requires attention completion")
         if proof=="attention_device_event":
             if "device_ns" not in names["attention_until_boundary"]: raise ValueError("native attention completion lacks device timing")
@@ -173,7 +178,7 @@ def audit_block_frames(frames):
             if read["fence"] not in ("original_read_complete", "host_resident", "host_forwarded") or copy["fence"] not in ("copy_ticket_complete", "device_resident"):
                 raise ValueError("block completion lacks an ownership proof")
             copies.append(copy_key)
-            costs.append(read["end"] - read["start"] + copy["end"] - copy["start"])
+            costs.append(read["end"] - read["start"] + copy.get("device_ns", copy["end"] - copy["start"]))
         if (len(tasks) != 2*len(copies)+1 or set(join["deps"]) != set(copies) or join["resource"] != "host" or
                 join["fence"] != ("all_block_copies_complete" if copies else "empty_history")):
             raise ValueError("block join does not cover every H2D completion")

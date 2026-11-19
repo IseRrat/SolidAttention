@@ -17,7 +17,7 @@ def trace(mode):
     names = ["q_gpu_ready", "q_d2h_ready", "selection_ready" if serial else "selection", "kv_projection_to_host",
              "kv_d2h_ready", "miss_read_and_reconcile", "history_h2d", "append_and_selection" if serial else "append_current_kv",
              "current_h2d", "attention_until_boundary", "buffered_ssd_store", "next_layer_prefetch"]
-    deps = [[], [0], [7, 1] if serial else [1], [] if serial else [2], [3], [2], [5] if serial else [2],
+    deps = [[], [0], [7, 1] if serial else [1], [] if serial else [0], [3], [2], [5] if serial else [2],
             [4] if serial else [4, 5, 6], [7, 6] if serial else [7], [8], [7], [8]]
     rows = [dict(event="define", frame=1, task=i, layer=0, position=3, mode=mode, name=name, resource="host",
                  predecessors=deps[i], estimate_ns=1, origin_ns=0, clock="steady_clock_ns") for i, name in enumerate(names)]
