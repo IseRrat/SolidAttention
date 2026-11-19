@@ -76,7 +76,7 @@
 
 2. **正式选择纠错**
 
-   已实现命中块保留、在途请求提升、缺块补读和错误预测回收。尾块版本变化会处理在途旧前缀并补齐缺口。正式纠错优先于预测，selected 优先于 init/local。
+   已实现命中块保留、在途请求提升、缺块补读和错误预测回收。尾块版本变化会处理在途旧前缀并补齐缺口。正式纠错优先于预测；同一前沿内先比较 critical 和 LST，相同时 selected 优先于 init/local。SSD 队列与上传派发使用同一组排序键。
 
    [prefetch.cpp](../src/prefetch.cpp)、[async_reader.hpp](../include/solid/async_reader.hpp)。
 

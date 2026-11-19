@@ -4,14 +4,14 @@
 
 using namespace test_prefetch;
 namespace {
-void dependencies() {
+void dependencies(bool prediction) {
     const solid::BlockIdentity a{0,0,1,1},b{0,0,2,1},c{0,1,3,1};
-    solid::BlockStage stage({{a,solid::ReadPriority::correction_selected,10,2},
-                             {b,solid::ReadPriority::correction_deterministic,2,20},
-                             {c,solid::ReadPriority::correction_selected,10,1}});
+    const auto selected=prediction?solid::ReadPriority::selected:solid::ReadPriority::correction_selected;
+    const auto deterministic=prediction?solid::ReadPriority::deterministic:solid::ReadPriority::correction_deterministic;
+    solid::BlockStage stage({{a,selected,10,2}, {b,deterministic,2,20}, {c,selected,10,1}});
     require(stage.read_order()==std::vector<solid::BlockIdentity>{b,a,c},"block reads ignored critical path/LST");
     require(stage.dispatch(b).critical && stage.dispatch(b).latest_start==0 &&
-            stage.dispatch(a).before(stage.dispatch(c)),"DAG dispatch keys changed order");
+            stage.dispatch(b).before(stage.dispatch(a)) && stage.dispatch(a).before(stage.dispatch(c)),"DAG dispatch keys changed order");
     require(stage.copy_order().empty(),"copy ready before original READ");
     rejects([&] { stage.copy_started(a); }); rejects([&] { stage.read_started({0,0,99,1}); });
     stage.read_started(a); stage.read_complete(a);
@@ -20,6 +20,7 @@ void dependencies() {
     require(!stage.finished(),"join released with incomplete blocks");
     stage.read_complete(c,"host_resident"); stage.read_complete(b,"inflight_at_plan");
     require(stage.copy_order()==std::vector<solid::BlockIdentity>{b,c},"H2D ready queue ignored critical path/LST");
+    require(stage.copy_dispatch(b).before(stage.copy_dispatch(c)),"H2D dispatch category hid a critical copy");
     stage.copy_started(b); stage.copy_started(c);
     stage.copy_complete(c,"device_resident"); require(!stage.finished(),"copy submission satisfied the join");
     stage.copy_complete(b,"copy_ticket_complete");
@@ -90,6 +91,6 @@ void failed_read_after_upload() {
 }
 }
 int main() {
-    try { dependencies(); real_queue(false); real_queue(true); split_segments(); failed_read_after_upload(); std::cout<<"block event DAG, critical/LST dispatch, real queue order and receipts passed\n"; return 0; }
+    try { dependencies(false); dependencies(true); real_queue(false); real_queue(true); split_segments(); failed_read_after_upload(); std::cout<<"block event DAG, critical/LST dispatch, real queue order and receipts passed\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

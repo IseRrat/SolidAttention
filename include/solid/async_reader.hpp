@@ -15,7 +15,8 @@ struct ReadDispatch {
         const bool correction = priority <= ReadPriority::correction_deterministic;
         const bool other_correction = other.priority <= ReadPriority::correction_deterministic;
         if (correction != other_correction) return correction;
-        if (!correction && priority != other.priority) return priority < other.priority;
+        // Within the same frontier, use Algorithm 1's critical/LST order.
+        // Block category only breaks ties; it cannot hide a critical load.
         if (critical!=other.critical) return critical;
         if (latest_start!=other.latest_start) return latest_start<other.latest_start;
         return priority<other.priority;
