@@ -109,7 +109,7 @@ struct AttentionNode::Impl {
             if (source->type != GGML_TYPE_F32 || !ggml_is_contiguous(source)) throw std::logic_error("early query input must be contiguous F32");
             if (self.direct) {
                 if (ggml_nelements(source) != 1 || !self.device_query || !self.device_query->data) throw std::logic_error("device query token or allocation missing");
-                self.prefetch->select_early_device(self.layer, self.frame->positions.front(),
+                self.prefetch->select_early_device_async(self.layer, self.frame->positions.front(),
                     {static_cast<const float *>(self.device_query->data),static_cast<std::size_t>(ggml_nelements(self.device_query)),*self.direct},
                     self.query_proof,self.timing && self.timing->query ? self.timing->query->duration() : std::nullopt);
             } else {

@@ -723,13 +723,19 @@ std::optional<DeviceMemory> GgmlPrefetch::direct_memory() const {
 }
 void GgmlPrefetch::select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool covers,
                                        std::optional<std::uint64_t> projection_ns) {
-    const auto memory = direct_memory();
-    if (!memory || query.memory != *memory) throw std::invalid_argument("device selection backend mismatch");
+    select_impl(layer,position,{},&query,covers,projection_ns,false);
+}
+void GgmlPrefetch::select_early_device_async(std::uint32_t layer,std::uint64_t position,DeviceQuery query,bool covers,
+                                            std::optional<std::uint64_t> projection_ns) {
     select_impl(layer, position, {}, &query, covers,projection_ns);
 }
 void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device,
-                                bool covers,std::optional<std::uint64_t> projection_ns) {
+                                bool covers,std::optional<std::uint64_t> projection_ns,bool asynchronous) {
     if (!early_enabled()) throw std::logic_error("early selection is disabled");
+    if (device) {
+        const auto memory=direct_memory();
+        if (!memory || device->memory!=*memory) throw std::invalid_argument("device selection backend mismatch");
+    }
     if (impl_->events) {
         if (covers) impl_->events->boundary(AttentionProof::query_boundary);
         else impl_->events->stop();
@@ -749,17 +755,25 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
     const auto work = impl_->new_work(layer, position,device!=nullptr,projection_ns);
     work->query = query;
     work->direct = device != nullptr;
+    if (!asynchronous) {
+        work->dag.start(select_task,impl_->trace.now());
+        work->selection=device?impl_->session.select_before_kv_device(layer,position,*device):
+            impl_->session.select_before_kv(layer,position,query);
+        work->dag.complete(select_task,impl_->trace.now());
+    }
     work->dag.start(kv_projection, impl_->trace.now());
-    const auto device_query=device?std::optional<DeviceQuery>{*device}:std::nullopt;
+    const auto device_query=device && asynchronous?std::optional<DeviceQuery>{*device}:std::nullopt;
     ++impl_->totals.worker_jobs;
-    impl_->worker.submit([this, work, device_query] {
+    impl_->worker.submit([this, work, device_query, asynchronous] {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         // Q is producer-complete. The graph retains its device allocation
         // through the KV and mask nodes while selection uses its own queue.
-        work->dag.start(select_task, impl_->trace.now());
-        work->selection=device_query?impl_->session.select_before_kv_device(work->layer,work->position,*device_query):
-            impl_->session.select_before_kv(work->layer,work->position,work->query);
-        work->dag.complete(select_task, impl_->trace.now());
+        if (asynchronous) {
+            work->dag.start(select_task, impl_->trace.now());
+            work->selection=device_query?impl_->session.select_before_kv_device(work->layer,work->position,*device_query):
+                impl_->session.select_before_kv(work->layer,work->position,work->query);
+            work->dag.complete(select_task, impl_->trace.now());
+        }
         work->dag.start(miss_read, impl_->trace.now());
         impl_->device.wait_transfers();
         auto & host = impl_->session.prefetcher();

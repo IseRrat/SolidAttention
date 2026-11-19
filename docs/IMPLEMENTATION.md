@@ -104,7 +104,7 @@
 
 2. **Q 前沿与提前补读**
 
-   已将设备 Q 就绪标量和 CPU 前沿接入模型图。overlap 与 overlap+sync_reuse 的前沿把选择交给持久协调线程后返回，GPU 可继续 KV 投影与交错转换。协调线程完成代表更新、选择和历史补读，KV 就绪处收割其结果。Q 的图依赖保留到消费者结束，选择异常在 KV 前沿传递。任务图把选择和 KV 生成作为 Q 就绪后的两个分支。naive 保留串行路径。
+   已将设备 Q 就绪标量和 CPU 前沿接入模型图。overlap 与 overlap+sync_reuse 的前沿通过异步设备入口把选择交给持久协调线程后返回，GPU 可继续 KV 投影与交错转换。协调线程完成代表更新、选择和历史补读，KV 就绪处收割其结果。异步入口借用的 Q 由图依赖保留至 KV 汇合或排空结束，原同步设备入口在返回前消费 Q。选择异常在 KV 前沿传递。任务图把选择和 KV 生成作为 Q 就绪后的两个分支。naive 保留串行路径。
 
    [llama_adapter.cpp](../src/llama_adapter.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)。
 
