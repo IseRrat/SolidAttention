@@ -74,15 +74,21 @@ KvProjection::KvProjection(const ggml_tensor * key, const ggml_tensor * value,
     std::vector<float> decoded;
     for (std::uint32_t head = 0; head < heads; ++head) for (int kind = 0; kind < 2; ++kind) {
         const auto * source = kind == 0 ? key : value;
-        for (std::uint32_t d = 0; d < dimension; ++d) {
-            const auto source_row = static_cast<std::int64_t>(head) * dimension + d;
-            const auto target_row = (static_cast<std::int64_t>(head) * 2 + kind) * dimension + d;
-            const auto size = ggml_row_size(source->type, source->ne[0]);
-            if (type == source->type) {
-                raw.resize(size);
-                ggml_backend_tensor_get(source, raw.data(), source_row * source->nb[1], size);
-                ggml_backend_tensor_set(impl_->weight, raw.data(), target_row * impl_->weight->nb[1], size);
-            } else {
+        const auto first_source_row=static_cast<std::int64_t>(head)*dimension;
+        const auto first_target_row=(static_cast<std::int64_t>(head)*2+kind)*dimension;
+        if (type==source->type) {
+            // A whole head retains its native row encodings. Bound the host
+            // workspace to one head while batching the backend transfers.
+            const auto row_bytes=ggml_row_size(source->type,source->ne[0]);
+            if (row_bytes>SIZE_MAX/dimension) throw std::overflow_error("fused KV head size overflow");
+            const auto bytes=row_bytes*dimension;
+            raw.resize(bytes);
+            ggml_backend_tensor_get(source,raw.data(),first_source_row*source->nb[1],bytes);
+            ggml_backend_tensor_set(impl_->weight,raw.data(),first_target_row*impl_->weight->nb[1],bytes);
+        } else {
+            for (std::uint32_t d=0;d<dimension;++d) {
+                const auto source_row=first_source_row+d;
+                const auto target_row=first_target_row+d;
                 decode(source, source_row, raw, decoded);
                 ggml_backend_tensor_set(impl_->weight, decoded.data(), target_row * impl_->weight->nb[1], decoded.size() * sizeof(float));
             }

@@ -15,8 +15,8 @@ template<class F> void rejects(F operation) {
     try { operation(); } catch (const std::exception &) { failed = true; }
     require(failed, "invalid CUDA ranking request was accepted");
 }
-void run(int device) {
-    const solid::KvGeometry g{2, 2, 7, 32, 32768, 64};
+void run(int device,std::uint32_t dimension) {
+    const solid::KvGeometry g{2, 2, dimension, 32, 32768, 64};
     constexpr std::uint32_t queries = 6, representatives = 3, budget = 1024, blocks = 513;
     auto ranker = solid::make_cuda_block_ranker(g, queries, representatives, budget, device);
     const auto initial_bytes = ranker->stats().device_bytes;
@@ -97,7 +97,7 @@ int main(int argc, char ** argv) {
     try {
         if (argc > 3) throw std::invalid_argument("unexpected device-check argument");
         const auto device = argc == 3 ? std::stoi(argv[2]) : 0;
-        run(device);
+        for (const auto dimension:{7u,32u,33u,128u}) run(device,dimension);
         test_builder::run_cases([&](auto geometry,auto query_heads,auto budget) {
             return solid::make_cuda_block_ranker(geometry,query_heads,budget.representatives,budget.total,device,budget.local);
         });

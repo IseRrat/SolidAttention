@@ -31,30 +31,46 @@ private:
     bool changed_ = false;
 };
 
-// Each thread scores one (head, candidate), with the same FP64 accumulation
-// order as RepresentativeIndex::score. Q is [query_head, D], K is FP16
-// [logical_block, kv_head, representative, D]. No shared reduction changes
-// the within-score order; FMA contraction is disabled for this target.
+// All lanes supply one product. Lane zero accumulates in dimension order,
+// matching the reference even for cancellation-heavy scores and exact ties.
+__device__ double append_ordered_chunk(double value,double product,unsigned valid) {
+    for (unsigned source=0;source<valid;++source) {
+        const auto term=__shfl_sync(0xffffffff,product,source);
+        if ((threadIdx.x&31)==0) value+=term;
+    }
+    return value;
+}
+
+// One warp scores a (head, candidate). Adjacent lanes load adjacent Q/K
+// dimensions. The representative, GQA and dimension accumulation order is
+// unchanged; FMA contraction is disabled for this target.
 __global__ void score_blocks(const __half * keys, const float * query, const std::uint64_t * ids,
                              double * scores, int * error, std::uint64_t count, std::uint32_t heads,
                              std::uint32_t group, std::uint32_t representatives, std::uint32_t dimension) {
     const auto total = count * heads;
-    for (auto item = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
-         item < total; item += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+    const auto lane=threadIdx.x&31;
+    const auto warp=(static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x)/32;
+    const auto warps=static_cast<std::uint64_t>(gridDim.x)*blockDim.x/32;
+    for (auto item=warp;item<total;item+=warps) {
         const auto head = item / count;
         const auto candidate = item % count;
         const auto base = (ids[candidate] * heads + head) * representatives * dimension;
         double value = 0;
         for (std::uint32_t r = 0; r < representatives; ++r) {
             for (std::uint32_t q = 0; q < group; ++q) {
-                for (std::uint32_t d = 0; d < dimension; ++d) {
-                    value += static_cast<double>(query[(head * group + q) * dimension + d]) *
-                             __half2float(keys[base + r * dimension + d]) / group;
+                for (std::uint32_t first=0;first<dimension;first+=32) {
+                    const auto d=first+lane;
+                    double product=0;
+                    if (d<dimension) product=static_cast<double>(query[(head*group+q)*dimension+d]) *
+                        __half2float(keys[base+r*dimension+d])/group;
+                    value=append_ordered_chunk(value,product,min(32u,dimension-first));
                 }
             }
         }
-        if (!isfinite(value)) { atomicExch(error, 1); value = -CUDART_INF; }
-        scores[item] = value;
+        if (!lane) {
+            if (!isfinite(value)) { atomicExch(error,1); value=-CUDART_INF; }
+            scores[item]=value;
+        }
     }
 }
 
@@ -126,13 +142,23 @@ __global__ void builder_update_scores(const Half * keys, double * scores, const 
                                        std::uint64_t first, std::uint64_t count, std::uint32_t local,
                                        std::uint32_t heads, std::uint32_t width) {
     const auto total = count*heads;
-    for (auto i = static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;
-         i < total; i += static_cast<std::uint64_t>(gridDim.x)*blockDim.x) {
+    const auto lane=threadIdx.x&31;
+    const auto warp=(static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x)/32;
+    const auto warps=static_cast<std::uint64_t>(gridDim.x)*blockDim.x/32;
+    for (auto i=warp;i<total;i+=warps) {
         const auto head = i%heads;
         const auto slot = ((first+i/heads)%local)*heads+head;
-        const auto value = update_representative_score(scores[slot], mean+head*width, keys+slot*width, width, DeviceHalf{});
-        if (!isfinite(value)) atomicExch(error, 1);
-        scores[slot] = value;
+        auto value=lane?0.:scores[slot];
+        for (std::uint32_t first_dimension=0;first_dimension<width;first_dimension+=32) {
+            const auto d=first_dimension+lane;
+            double product=0;
+            if (d<width) product=mean[head*width+d]*DeviceHalf{}(keys[slot*width+d]);
+            value=append_ordered_chunk(value,product,min(32u,width-first_dimension));
+        }
+        if (!lane) {
+            if (!isfinite(value)) atomicExch(error,1);
+            scores[slot]=value;
+        }
     }
 }
 __global__ void builder_finalize(const Half * ring, const double * token_scores, Half * top_keys,
@@ -303,7 +329,7 @@ public:
                 const auto mean_grid = static_cast<unsigned>(std::min<std::uint64_t>((static_cast<std::uint64_t>(geometry_.heads)*geometry_.dimension+255)/256,65535));
                 builder_mean_query<<<mean_grid,256,0,stream_>>>(device ? query : query_, mean_query_, error_device_, geometry_.heads, geometry_.dimension, query_heads_/geometry_.heads);
                 checked(cudaGetLastError(), "launch builder GQA mean");
-                const auto score_grid = static_cast<unsigned>(std::min<std::uint64_t>((pending*geometry_.heads+255)/256,65535));
+                const auto score_grid = static_cast<unsigned>(std::min<std::uint64_t>((pending*geometry_.heads+7)/8,65535));
                 if (pending) {
                     builder_update_scores<<<score_grid,256,0,stream_>>>(state.keys, state.scores, mean_query_, error_device_, position-pending,
                         pending, local_, geometry_.heads, geometry_.dimension);
@@ -392,7 +418,7 @@ public:
                     geometry_.heads,geometry_.dimension,query_heads_/geometry_.heads);
                 checked(cudaGetLastError(),"launch batch GQA mean");
                 if (pending) {
-                    const auto grid=static_cast<unsigned>(std::min<std::uint64_t>((pending*geometry_.heads+255)/256,65535));
+                    const auto grid=static_cast<unsigned>(std::min<std::uint64_t>((pending*geometry_.heads+7)/8,65535));
                     builder_update_scores<<<grid,256,0,stream_>>>(state.keys,state.scores,mean_query_,error_device_,
                         position-pending,pending,local_,geometry_.heads,geometry_.dimension);
                     checked(cudaGetLastError(),"launch batch representative score update");
@@ -483,7 +509,7 @@ public:
             checked(cudaMemcpyAsync(costs_, candidates.tokens.data(), product(count, sizeof(std::uint32_t)), cudaMemcpyHostToDevice, stream_), "upload rank costs");
             checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear rank status");
             checked(cudaMemsetAsync(output_device_, 0xff, bytes, stream_), "clear rank output");
-            const auto grid = static_cast<unsigned>(std::min<std::uint64_t>((count * geometry_.heads + 255) / 256, 65535));
+            const auto grid = static_cast<unsigned>(std::min<std::uint64_t>((count * geometry_.heads + 7) / 8, 65535));
             score_blocks<<<grid, 256, 0, stream_>>>(static_cast<const __half *>(banks_[layer]), device ? query : query_, ids_, scores_, error_device_,
                 count, geometry_.heads, query_heads_ / geometry_.heads, representatives_, geometry_.dimension);
             checked(cudaGetLastError(), "launch block relevance kernel");

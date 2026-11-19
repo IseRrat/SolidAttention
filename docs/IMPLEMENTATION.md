@@ -8,7 +8,7 @@
 
 1. **合并 K/V 投影权重**
 
-   初始化时按 KV head 交错拼接 K/V 权重和 bias，用一次矩阵乘法生成交错结果。相同量化类型保留原始行编码，混合类型转 F32。已记录融合权重的额外分配和初始化耗时。
+   初始化时按 KV head 交错拼接 K/V 权重和 bias，用一次矩阵乘法生成交错结果。相同量化类型保留原始行编码，每个 head 的连续权重行整段读取、写入，主机中转区只持有一份 head 数据。混合类型逐行解码为 F32，再写入融合权重。已记录融合权重的额外分配和初始化耗时。
 
    [projection.cpp](../src/projection.cpp)。
 
@@ -48,7 +48,7 @@
 
 3. **CUDA 代表构造和选块**
 
-   已实现设备代表 bank、pending K 环、窗口分数与部分块 top-R。设备 kernel 覆盖均值、窗口更新、定稿、FP64 块评分和逐 head 预算 top-k。支持设备 Q/K、CPU 状态接管和 prefill 批量代表。块同分按逻辑 ID 排序，选择数量按 token 成本控制。
+   已实现设备代表 bank、pending K 环、窗口分数与部分块 top-R。设备 kernel 覆盖均值、窗口更新、定稿、FP64 块评分和逐 head 预算 top-k。块评分与窗口更新按 warp 分配任务，相邻 lane 读取相邻 Q/K 维度并计算乘积，lane 0 按原维度顺序累计，保留代表、GQA 和维度的累加次序。支持不足 32 维的尾段及 grid-stride 任务分配。设备 Q/K、CPU 状态接管和 prefill 批量代表均使用此路径。块同分按逻辑 ID 排序，选择数量按 token 成本控制。
 
    [block_ranker.cu](../src/cuda/block_ranker.cu)、[block_ranker.hpp](../include/solid/block_ranker.hpp)。
 
