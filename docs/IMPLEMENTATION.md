@@ -1,6 +1,6 @@
 # 实现记录
 
-更新日期为 2026-11-19。按论文模块记录已写入代码的功能，后续修改同步更新对应条目。
+更新日期为 2026-11-20。按论文模块记录已写入代码的功能，后续修改同步更新对应条目。
 
 ## 一、KV Consolidator
 
@@ -114,7 +114,9 @@
 
    已将当前设备行装入 bank，保留原尾块前缀，只复制缺口。安装后 attention 和 D2H 归档分别推进，归档追加后提交聚合回写，多层时可提前派发下一层 SSD 读取。最后一层到达上下文容量末尾时，完成后继预取任务的收尾记录，停止向容量外的位置发起预测，当前 attention、归档及回写照常完成。
 
-   [ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[session.cpp](../src/session.cpp)、[device_cache.cpp](../src/device_cache.cpp)。
+   设备 Q 提前选择入口支持同步、异步调用，并显式指定后续 KV 的归档方式。已下载到主机的 FP16 KV 采用“下载完成→追加→当前行安装”的依赖，进入 FP16 追加函数；设备 KV 采用“当前行安装→下载归档→追加”的依赖，默认模型图使用这一方式。两种入口均保留选择位置、输入类型和归档方式的一致性检查。
+
+   [ggml_prefetch.hpp](../include/solid/ggml_prefetch.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[session.cpp](../src/session.cpp)、[device_cache.cpp](../src/device_cache.cpp)。
 
 4. **Attention 完成通知**
 

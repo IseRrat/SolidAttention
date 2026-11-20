@@ -594,11 +594,11 @@ struct GgmlPrefetch::Impl {
         estimates.fill(1); totals.coordinator_cpu=cpu; totals.completion_backend=events?events->name():"graph_boundaries";
     }
     std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position,bool direct=false,
-                                        std::optional<std::uint64_t> projection_ns={}) {
+                                        std::optional<std::uint64_t> projection_ns={},bool deferred_archive=true) {
         if (work && work->dag.task(attention).state != TaskState::complete) throw std::logic_error("new layer started before previous attention completion");
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
         work = std::make_shared<LayerWork>(layer, position, mode, trace, ++sequence, estimates,
-            direct && mode!=ScheduleMode::naive, session.geometry().layers==1);
+            direct && deferred_archive && mode!=ScheduleMode::naive, session.geometry().layers==1);
         const auto time=trace.now();
         if (projection_ns) {
             work->dag.start(q_ready,time);
@@ -751,15 +751,15 @@ std::optional<DeviceMemory> GgmlPrefetch::direct_memory() const {
     return {};
 }
 void GgmlPrefetch::select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool covers,
-                                       std::optional<std::uint64_t> projection_ns) {
-    select_impl(layer,position,{},&query,covers,projection_ns,false);
+                                       std::optional<std::uint64_t> projection_ns,bool deferred_archive) {
+    select_impl(layer,position,{},&query,covers,projection_ns,false,deferred_archive);
 }
 void GgmlPrefetch::select_early_device_async(std::uint32_t layer,std::uint64_t position,DeviceQuery query,bool covers,
-                                            std::optional<std::uint64_t> projection_ns) {
-    select_impl(layer, position, {}, &query, covers,projection_ns);
+                                            std::optional<std::uint64_t> projection_ns,bool deferred_archive) {
+    select_impl(layer, position, {}, &query, covers,projection_ns,true,deferred_archive);
 }
 void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device,
-                                bool covers,std::optional<std::uint64_t> projection_ns,bool asynchronous) {
+                                bool covers,std::optional<std::uint64_t> projection_ns,bool asynchronous,bool deferred_archive) {
     if (!early_enabled()) throw std::logic_error("early selection is disabled");
     if (device) {
         const auto memory=direct_memory();
@@ -781,7 +781,7 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
         }
     }
     impl_->begin_prediction(layer, position);
-    const auto work = impl_->new_work(layer, position,device!=nullptr,projection_ns);
+    const auto work = impl_->new_work(layer, position,device!=nullptr,projection_ns,deferred_archive);
     work->query = query;
     work->direct = device != nullptr;
     if (!asynchronous) {
@@ -879,7 +879,8 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         if (deferred) impl_->session.stage_device_keys(layer, position, *device);
         else {
             work->dag.start(append, impl_->trace.now());
-            impl_->session.append_after_selection(layer, position, work->query, keys, values, packed);
+            if (half) impl_->session.append_after_selection_half(layer, position, *half, *device);
+            else impl_->session.append_after_selection(layer, position, work->query, keys, values, packed);
             work->dag.complete(append, impl_->trace.now());
         }
     }

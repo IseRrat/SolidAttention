@@ -27,11 +27,13 @@ public:
     void select_early(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, bool query_covers_attention);
     std::optional<DeviceMemory> direct_memory() const;
     void select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool query_covers_attention,
-                             std::optional<std::uint64_t> projection_ns = {});
+                             std::optional<std::uint64_t> projection_ns = {},bool deferred_archive = true);
     // The graph retains Q until the KV frontier or quiesce() has joined the
     // selection worker. The synchronous entry above consumes Q before return.
     void select_early_device_async(std::uint32_t layer,std::uint64_t position,DeviceQuery query,bool query_covers_attention,
-                                   std::optional<std::uint64_t> projection_ns = {});
+                                   std::optional<std::uint64_t> projection_ns = {},bool deferred_archive = true);
+    // Use deferred_archive=false when the later frontier is decode_half().
+    // The device-only decode_device() frontier retains the default DAG.
     std::vector<Half> decode_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys,
                                   std::optional<DeviceQuery> serial_query = {},ggml_tensor * device_source = nullptr);
     std::vector<Half> decode_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys, ggml_tensor * source,
@@ -45,7 +47,7 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     void select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device,
-                     bool covers,std::optional<std::uint64_t> projection_ns = {},bool asynchronous = true);
+                     bool covers,std::optional<std::uint64_t> projection_ns = {},bool asynchronous = true,bool deferred_archive = true);
     std::vector<Half> decode_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                   const std::vector<float> & keys, const std::vector<float> & values, bool packed,
                                   const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * device_source,

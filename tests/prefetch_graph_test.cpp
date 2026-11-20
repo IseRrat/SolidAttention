@@ -18,6 +18,43 @@
 
 using namespace test_prefetch;
 namespace {
+void early_half_frontier(solid::ScheduleMode mode,bool asynchronous) {
+    const solid::KvGeometry geometry{1,1,8,2,8,64,solid::KvLayout::interleaved};
+    const solid::SparseBudget budget{4,1,1,1};
+    std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
+    auto file=std::make_unique<File>();
+    auto reader=std::make_unique<Reader>(file.get());
+    auto store=std::make_unique<solid::FileKvStore>(geometry,std::move(file),2048);
+    auto * archive=store.get();
+    solid::AttentionSession session(std::move(store),1,budget,true,2,{}, {},std::move(reader),4);
+    session.set_ranker(std::make_unique<test_builder::Emulator>(geometry,1,budget,true));
+    std::vector<float> query(8,0.25f),key(8,0.5f),value(8,0.75f);
+    for (int p=0;p<2;++p) (void) session.process(0,p,1,query,key,value,1);
+    session.flush();
+    solid::GgmlPrefetch prefetch(session,backend.get(),{},mode);
+    for (std::uint64_t p=2;p<4;++p) {
+        prefetch.begin_prefetch(0,p);
+        const solid::DeviceQuery q{query.data(),query.size(),solid::DeviceMemory::host_emulator};
+        if (asynchronous) prefetch.select_early_device_async(0,p,q,true,{},false);
+        else prefetch.select_early_device(0,p,q,true,{},false);
+        std::vector<solid::Half> kv(16,solid::to_half(0.5f));
+        std::fill(kv.begin()+8,kv.end(),solid::to_half(0.75f));
+        const auto mask=prefetch.decode_half(0,p,kv,{kv.data(),kv.size(),16,solid::DeviceMemory::host_emulator});
+        require(archive->length(0)==p+1,"early FP16 frontier did not append its KV");
+        solid::KvBlock stored;
+        archive->read(0,0,p/geometry.block_tokens,stored);
+        require(std::equal(kv.begin(),kv.end(),stored.storage()+(p%geometry.block_tokens)*16),
+            "early FP16 frontier archived different KV values");
+        require(std::count(mask.begin(),mask.end(),solid::Half{0})==static_cast<std::ptrdiff_t>(p+1),
+            "early FP16 frontier lost selected rows");
+        // CPU uploads are complete; no attention graph is submitted in this
+        // entry-point regression, so its completion boundary is already safe.
+        prefetch.process_complete();
+    }
+    prefetch.quiesce();
+    require(prefetch.schedule_stats().frames==2,"early FP16 frontier left unfinished microtasks");
+    require(session.stats().decode_kv_download_bytes==64,"early FP16 frontier did not archive both input rows");
+}
 class Events final:public solid::AttentionEvents {
 public:
     explicit Events(std::uint32_t layers):AttentionEvents(layers) {}
@@ -290,6 +327,11 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
 }
 int main(int argc, char ** argv) {
     try {
+        if (argc==2 && std::string(argv[1])=="early-half") {
+            for (auto mode:{solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse})
+                for (bool asynchronous:{false,true}) early_half_frontier(mode,asynchronous);
+            std::cout<<"early FP16 frontier, append and completion passed\n"; return 0;
+        }
         if (argc==2 && std::string(argv[1])=="shared") {
             for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) {
                 for (bool direct:{false,true}) {
