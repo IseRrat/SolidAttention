@@ -407,7 +407,8 @@ std::vector<SlotLease> Prefetcher::resolve(std::uint32_t layer, std::uint64_t po
     return resolve_impl(layer, position, actual, false);
 }
 std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
-                                                const StagePlan & plan, const ReadyBlock & ready, const StageFactory & factory, bool keep_tail) {
+                                                const StagePlan & plan, const ReadyBlock & ready, const StageFactory & factory,
+                                                bool keep_tail, const ReadyBatch & batch) {
     auto past = actual;
     for (auto & head : past) {
         if (!head.positions.empty() && head.positions.back() == position) head.positions.pop_back();
@@ -415,11 +416,12 @@ std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uin
             head.positions.push_back(position-1);
         }
     }
-    return resolve_impl(layer, position, past, true,plan,ready,factory);
+    return resolve_impl(layer, position, past, true,plan,ready,factory,batch);
 }
 std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64_t position,
                                             const std::vector<HeadSelection> & actual, bool historical,
-                                            const StagePlan & plan, const ReadyBlock & ready,const StageFactory & factory) {
+                                            const StagePlan & plan, const ReadyBlock & ready,const StageFactory & factory,
+                                            const ReadyBatch & batch) {
     const auto start = std::chrono::steady_clock::now();
     check();
     const auto & g = store_.geometry();
@@ -511,6 +513,8 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
     std::map<BlockIdentity,std::size_t> result_indices;
     if (stage) for (std::size_t i=0;i<result.size();++i) result_indices.emplace(result[i].identity,i);
     std::size_t remaining=result.size();
+    std::vector<SlotLease> ready_wave;
+    if (batch) ready_wave.reserve(remaining);
     while (remaining) {
         std::vector<std::size_t> candidates;
         if (stage) {
@@ -521,12 +525,17 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
             }
         } else for (std::size_t i=0;i<result.size();++i) candidates.push_back(i);
         for (const auto i:candidates) if (!delivered[i] && slots_.entry(result[i].slot).state!=SlotState::loading) {
+            if (batch) ready_wave.push_back(result[i]);
             if (ready) {
                 slots_.pin(result[i]);
                 try { ready(result[i]); } catch (...) { slots_.unpin(result[i]); throw; }
                 slots_.unpin(result[i]);
             }
             delivered[i]=true; --remaining;
+        }
+        if (!ready_wave.empty()) {
+            batch(ready_wave);
+            ready_wave.clear();
         }
         if (remaining) poll(true);
     }

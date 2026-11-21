@@ -64,6 +64,7 @@ struct StoreReceipt {
 class Prefetcher {
 public:
     using ReadyBlock = std::function<void(const SlotLease &)>;
+    using ReadyBatch = std::function<void(const std::vector<SlotLease> &)>;
     using StagePlan = std::function<void(const std::vector<BlockIdentity> &)>;
     using StageFactory = std::function<std::shared_ptr<BlockStage>(const std::vector<BlockWork> &)>;
     Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t slots_per_head,
@@ -73,7 +74,8 @@ public:
     void begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
-                                         const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {}, bool keep_tail = false);
+                                         const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {},
+                                         bool keep_tail = false, const ReadyBatch & batch = {});
     void remember_selection(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     void poll(bool wait = false);
     const KvBlock & block(const SlotLease & lease) const;
@@ -139,6 +141,7 @@ private:
     void event(const char * name, const SlotLease & lease);
     std::vector<SlotLease> resolve_impl(std::uint32_t layer, std::uint64_t position,
                                        const std::vector<HeadSelection> & actual, bool historical,
-                                       const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {});
+                                       const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {},
+                                       const ReadyBatch & batch = {});
 };
 } // namespace solid

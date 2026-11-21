@@ -195,6 +195,60 @@ public:
         }
         return id;
     }
+    bool batches_uploads() const override {
+#ifdef SOLID_HAVE_CUDA_SELECTION
+        return cuda_device_>=0 && staging_ && !shared_;
+#else
+        return false;
+#endif
+    }
+    std::uint64_t upload_batch(const std::vector<DeviceUpload> & blocks) override {
+        if (!batches_uploads() || blocks.empty()) throw std::logic_error("invalid CUDA KV upload batch");
+        if (next_==UINT64_MAX) throw std::overflow_error("copy ticket exhausted");
+        struct Range { std::size_t offset; std::uintptr_t source; std::size_t bytes; };
+        const auto bytes=static_cast<std::size_t>(geometry_.block_tokens)*2*geometry_.dimension*sizeof(Half);
+        std::vector<Range> ranges;
+        ranges.reserve(blocks.size());
+        for (const auto & copy : blocks) {
+            const auto & block=*copy.block;
+            if (copy.slot>=static_cast<std::uint64_t>(geometry_.heads)*per_head_ || block.layout!=KvLayout::interleaved ||
+                block.dimension!=geometry_.dimension || block.capacity!=geometry_.block_tokens ||
+                block.storage_size()!=bytes/sizeof(Half)) throw std::invalid_argument("batched device upload shape");
+            const auto offset=(copy.slot/per_head_)*tensor_->nb[2]+(copy.slot%per_head_)*geometry_.block_tokens*tensor_->nb[1];
+            const auto * source=stage_host(copy.slot,0,block.storage(),bytes);
+            ranges.push_back({offset,reinterpret_cast<std::uintptr_t>(source),bytes});
+        }
+        std::sort(ranges.begin(),ranges.end(),[](const Range & a,const Range & b) { return a.offset<b.offset; });
+        const auto id=next_++;
+        auto & record=events_.try_emplace(id).first->second;
+        std::uint64_t submitted=0;
+        try {
+            auto * device=ggml_backend_get_device(copy_backend_);
+            record.event=ggml_backend_event_new(device);
+            if (!record.event) throw std::runtime_error("CUDA KV batch completion event allocation failed");
+            if (blocks.size()==1) begin_copy_interval(record,blocks.front().slot);
+            for (std::size_t i=0;i<ranges.size();) {
+                auto range=ranges[i++];
+                while (i<ranges.size() && range.offset+range.bytes==ranges[i].offset &&
+                       range.source+range.bytes==ranges[i].source) {
+                    range.bytes+=ranges[i++].bytes;
+                }
+                ggml_backend_tensor_set_async(copy_backend_,tensor_,reinterpret_cast<const void *>(range.source),range.offset,range.bytes);
+                ++submitted;
+            }
+            record_copy_interval(record.interval,true);
+            ggml_backend_event_record(record.event,copy_backend_);
+        } catch (...) {
+            ggml_backend_synchronize(copy_backend_);
+            if (record.event) ggml_backend_event_free(record.event);
+            events_.erase(id);
+            throw;
+        }
+        ++stats_.historical_upload_batches;
+        stats_.historical_upload_blocks+=blocks.size();
+        stats_.historical_upload_ranges+=submitted;
+        return id;
+    }
     std::optional<DeviceMemory> current_memory() const override {
 #ifdef SOLID_HAVE_CUDA_SELECTION
         if (ggml_backend_is_cuda(backend_)) return DeviceMemory::cuda;
@@ -810,10 +864,7 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
         auto leases = host.resolve_history(work->layer, work->position, work->selection,
             [&](const std::vector<BlockIdentity> & plan) { impl_->device.begin_stage(plan,
                 work->direct?std::optional<CurrentBlock>{CurrentBlock{work->layer,work->position}}:std::optional<CurrentBlock>{}); },
-            [&](const SlotLease & lease) {
-                if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
-                impl_->device.stage_ready(lease,work->blocks);
-            },[&](const std::vector<BlockWork> & plan) {
+            {},[&](const std::vector<BlockWork> & plan) {
                 auto blocks=plan;
                 const auto ready=host.ready();
                 for (auto & block:blocks) {
@@ -822,7 +873,10 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
                 }
                 work->blocks=std::make_shared<BlockStage>(std::move(blocks),&impl_->block_trace,impl_->sequence,work->layer,work->position,impl_->mode);
                 return work->blocks;
-            }, work->deferred_archive);
+            }, work->deferred_archive,[&](const std::vector<SlotLease> & ready) {
+                if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
+                impl_->device.stage_ready_batch(ready,work->blocks);
+            });
         if (work->deferred_archive) work->history = std::move(leases);
         else for (const auto & lease : leases) host.unpin(lease);
         work->dag.complete(miss_read, impl_->trace.now());
@@ -1021,6 +1075,9 @@ ScheduleStats GgmlPrefetch::schedule_stats() const {
     result.backend_drains = transport.backend_drains; result.backend_compute_waits = transport.backend_compute_waits;
     result.batch_groups = transport.batch_groups; result.events_coalesced = transport.events_coalesced;
     result.copy_event_queries=transport.copy_event_queries;
+    result.historical_upload_batches=transport.historical_upload_batches;
+    result.historical_upload_blocks=transport.historical_upload_blocks;
+    result.historical_upload_ranges=transport.historical_upload_ranges;
     return result;
 }
 } // namespace solid

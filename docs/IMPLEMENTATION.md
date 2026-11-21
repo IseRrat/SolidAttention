@@ -132,6 +132,10 @@
 
    CUDA 及独立显存的异步复制路径将主机块直接绑定到上传所用的固定内存 bank，SSD READ 和 dirty 转发直接填充上传源。历史块与尾块前缀上传复用该地址，原复制票据持有源租约，省去普通内存到固定内存的中间复制。固定内存计入复制缓冲占用。
 
+   CUDA 独立复制队列按当前就绪的一批历史块提交上传。新块优先占用与主机缓冲偏移相同的空闲显存槽。源、目标都连续的块通过一次 ggml 异步上传传输，离散区间也共用同批完成事件。命中块保留原槽，同批源和目标租约在完成事件到达后释放。正式选择先提交已就绪的一批，再等待尚未返回的补读。结果记录历史上传的块数、实际连续传输次数和完成事件批次数。
+
+   [device_cache.hpp](../include/solid/device_cache.hpp)、[prefetch.hpp](../include/solid/prefetch.hpp)、[scheduler.hpp](../include/solid/scheduler.hpp)、[device_cache.cpp](../src/device_cache.cpp)、[prefetch.cpp](../src/prefetch.cpp)、[baseline.cpp](../src/baseline.cpp)。批次回归检查覆盖共享完成票据、失败后重试、源缓冲保护和命中槽位复用。[prefetch_test.cpp](../tests/prefetch_test.cpp)、[prefetch_fakes.hpp](../tests/prefetch_fakes.hpp)。
+
    [ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[copy_queue.cpp](../src/sycl/copy_queue.cpp)、[sycl_backend.hpp](../include/solid/sycl_backend.hpp)。
 
 6. **设备任务计时**

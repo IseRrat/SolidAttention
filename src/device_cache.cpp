@@ -66,17 +66,17 @@ void DeviceCache::poll_transfers(bool wait) {
     std::exception_ptr error;
     for (auto it = transfers_.begin(); it != transfers_.end();) {
         if (!transport_.complete(it->ticket, wait)) { ++it; continue; }
-        if (it->host) host_.unpin(*it->host);
-        const auto lease = it->device;
-        const auto stage=it->stage;
-        const bool current = slots_.complete(lease);
-        if (!current) ++stats_.stale_events;
-        it = transfers_.erase(it);
-        if (stage) {
-            try { stage->copy_complete(lease.identity,"copy_ticket_complete",transport_.copy_interval()); }
-            catch (...) { if (!error) error=std::current_exception(); }
+        const auto interval = it->slots.size()==1 ? transport_.copy_interval() : std::optional<std::uint64_t>{};
+        for (const auto & slot : it->slots) {
+            if (slot.host) host_.unpin(*slot.host);
+            const bool current = slots_.complete(slot.device);
+            if (!current) ++stats_.stale_events;
+            try {
+                if (it->stage) it->stage->copy_complete(slot.device.identity,"copy_ticket_complete",interval);
+                if (current) event("upload_complete",slot.device);
+            } catch (...) { if (!error) error=std::current_exception(); }
         }
-        if (current) { try { event("upload_complete", lease); } catch (...) { if (!error) error = std::current_exception(); } }
+        it = transfers_.erase(it);
     }
     if (error) std::rethrow_exception(error);
 }
@@ -119,7 +119,7 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
         if (stage) stage->copy_started(host.identity);
         if (before_upload) before_upload();
         ticket = transport_.upload(device->slot, block);
-        transfers_.push_back({ticket, host, *device,stage});
+        transfers_.push_back({ticket, {{host,*device}},stage});
         ++stats_.uploads;
         const auto bytes = block.storage_size() * sizeof(Half);
         if (!transport_.aliases_host_slots()) {
@@ -131,7 +131,7 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
         // Even allocation/trace errors after upload must retain the host lease
         // until the transport has released every source buffer.
         transport_.drain();
-        if (!transfers_.empty() && transfers_.back().device == *device) transfers_.pop_back();
+        if (ticket && !transfers_.empty() && transfers_.back().ticket == ticket) transfers_.pop_back();
         if (ticket) (void) transport_.complete(ticket, true);
         host_.unpin(host);
         slots_.retire(*device);
@@ -140,6 +140,54 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
         throw;
     }
     return *device;
+}
+void DeviceCache::upload_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage,
+                               const std::function<void()> & before_upload) {
+    Transfer transfer{0,{},stage};
+    transfer.slots.reserve(leases.size());
+    std::vector<DeviceUpload> copies;
+    copies.reserve(leases.size());
+    std::uint64_t bytes=0;
+    try {
+        for (const auto & host : leases) {
+            if (slots_.find(host.identity)) {
+                if (stage) (void) upload(host,stage);
+                continue;
+            }
+            const auto & block=host_.block(host);
+            // Prefer matching offsets in the pinned and device banks so adjacent
+            // blocks can be sent directly with one contiguous transfer.
+            const auto preferred=host.identity.head*slots_.slots_per_head()+host.slot%host_.slots_per_head();
+            auto device=slots_.acquire_at(host.identity,preferred);
+            if (!device) device=slots_.acquire(host.identity);
+            if (!device) throw std::runtime_error("device slot capacity exceeded");
+            transfer.slots.push_back({{},*device});
+            host_.pin(host);
+            transfer.slots.back().host=host;
+            if (stage) stage->copy_started(host.identity);
+            copies.push_back({device->slot,&block});
+            bytes+=block.storage_size()*sizeof(Half);
+        }
+        if (copies.empty()) return;
+        if (before_upload) before_upload();
+        transfer.ticket=transport_.upload_batch(copies);
+        for (const auto & slot : transfer.slots) event("upload",slot.device);
+        transfers_.push_back(std::move(transfer));
+        stats_.uploads+=copies.size();
+        stats_.upload_bytes+=bytes;
+    } catch (...) {
+        if (transfer.ticket) {
+            transport_.drain();
+            (void) transport_.complete(transfer.ticket,true);
+        }
+        for (const auto & slot : transfer.slots) {
+            if (slot.host) host_.unpin(*slot.host);
+            slots_.retire(slot.device);
+            slots_.complete(slot.device);
+        }
+        if (stage) { try { stage->abort(); } catch (...) {} }
+        throw;
+    }
 }
 std::optional<SlotLease> DeviceCache::prefix(const BlockIdentity & identity) const {
     std::optional<SlotLease> best;
@@ -168,7 +216,7 @@ SlotLease DeviceCache::upload_current(const BlockIdentity & identity,const std::
         if (host) { host_.pin(*host); pinned=true; block=&host_.block(*host); }
         if (previous) event("overwrite_available",*previous);
         ticket=transport_.upload_current(device->slot,block,current,retained);
-        transfers_.push_back({ticket,host,*device,{}});
+        transfers_.push_back({ticket,{{host,*device}},{}});
         const auto row_bytes=static_cast<std::uint64_t>(2)*geometry_.dimension*sizeof(Half);
         ++stats_.uploads; ++stats_.current_device_rows; stats_.current_device_bytes+=row_bytes;
         if (transport_.shared_memory()) stats_.shared_host_copy_bytes+=(row-retained)*row_bytes;
@@ -179,7 +227,7 @@ SlotLease DeviceCache::upload_current(const BlockIdentity & identity,const std::
         event("upload",*device,&current,retained,previous?previous->generation:0);
     } catch (...) {
         transport_.drain();
-        if (!transfers_.empty() && transfers_.back().device==*device) transfers_.pop_back();
+        if (ticket && !transfers_.empty() && transfers_.back().ticket==ticket) transfers_.pop_back();
         if (ticket) (void) transport_.complete(ticket,true);
         if (pinned) host_.unpin(*host);
         slots_.retire(*device); slots_.complete(*device);
@@ -194,8 +242,12 @@ void DeviceCache::prefetch_ready(const std::function<void()> & before_upload) {
     std::vector<BlockIdentity> identities;
     for (const auto & lease : ready) identities.push_back(lease.identity);
     // Transfers from an earlier prefetch pass still own both endpoints.
-    for (const auto & transfer : transfers_) identities.push_back(transfer.device.identity);
+    for (const auto & transfer : transfers_) for (const auto & slot : transfer.slots) identities.push_back(slot.device.identity);
     retain(identities);
+    if (transport_.batches_uploads()) {
+        upload_batch(ready,{},before_upload);
+        return;
+    }
     for (const auto & lease : ready) {
         const auto existing=slots_.find(lease.identity);
         if (transport_.aliases_host_slots() && existing && existing->slot%slots_.slots_per_head()==slots_.slots_per_head()-1) continue;
@@ -231,6 +283,15 @@ void DeviceCache::stage_ready(const SlotLease & lease,const std::shared_ptr<Bloc
         return;
     }
     (void) upload(lease,stage);
+}
+void DeviceCache::stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage) {
+    if (!transport_.batches_uploads()) {
+        for (const auto & lease : leases) stage_ready(lease,stage);
+        return;
+    }
+    if (!attention_.empty()) throw std::logic_error("batched upload while attention owns slots");
+    poll_transfers(false);
+    upload_batch(leases,stage);
 }
 std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection, bool deferred_upload,const CurrentDeviceKv * current) {
     if (!attention_.empty()) throw std::logic_error("previous device attention has not completed");

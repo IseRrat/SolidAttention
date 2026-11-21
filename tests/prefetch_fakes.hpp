@@ -88,27 +88,36 @@ public:
 class Transport final : public solid::DeviceTransport {
 public:
     struct Copy { std::uint32_t slot; const std::vector<solid::Half> * source; bool done = false; };
-    std::map<std::uint64_t, Copy> copies;
+    std::map<std::uint64_t, std::vector<Copy>> copies;
     std::map<std::uint32_t, std::vector<solid::Half>> memory;
     std::uint64_t next = 1;
     bool immediate = false;
     bool fail_upload = false;
+    bool batch_uploads = false;
     std::uint64_t upload(std::uint32_t slot, const solid::KvBlock & block) override {
         if (fail_upload) throw std::runtime_error("injected transfer failure");
         const auto id = next++;
-        copies.emplace(id, Copy{slot, &block.data, false});
+        copies.emplace(id, std::vector<Copy>{{slot,&block.data,false}});
+        return id;
+    }
+    bool batches_uploads() const override { return batch_uploads; }
+    std::uint64_t upload_batch(const std::vector<solid::DeviceUpload> & blocks) override {
+        if (fail_upload) throw std::runtime_error("injected transfer failure");
+        const auto id=next++;
+        auto & batch=copies[id];
+        for (const auto & block:blocks) batch.push_back({block.slot,&block.block->data,false});
         return id;
     }
     void write(Copy & copy) { if (!copy.done) { memory[copy.slot] = *copy.source; copy.done = true; } }
     bool complete(std::uint64_t id, bool wait) override {
         auto found = copies.find(id);
         require(found != copies.end(), "unknown fake transfer");
-        if (!found->second.done && !wait && !immediate) return false;
-        write(found->second);
+        if (!found->second.front().done && !wait && !immediate) return false;
+        for (auto & copy:found->second) write(copy);
         copies.erase(found);
         return true;
     }
-    void drain() override { for (auto & pair : copies) write(pair.second); }
+    void drain() override { for (auto & pair : copies) for (auto & copy:pair.second) write(copy); }
     std::uint64_t resident_bytes() const override { return 4096; }
 };
 inline std::vector<solid::Half> token(const solid::KvGeometry & g, std::uint32_t layer, std::uint64_t position) {

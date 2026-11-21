@@ -154,6 +154,38 @@ void deferred_device() {
     require(cache.attention_complete(cache.attention_epoch()), "completed batch left the future attention reader unavailable");
     cache.finish(); host.finish();
 }
+void batched_device() {
+    const solid::KvGeometry g{1, 1, 2, 1, 16, 64, solid::KvLayout::interleaved};
+    solid::MemoryKvStore store(g);
+    fill(store, 6);
+    solid::Prefetcher host(store, {4, 1, 1, 1}, 4, std::make_unique<Reader>());
+    Transport transport;
+    transport.batch_uploads=true;
+    solid::DeviceCache cache(host,g,2,transport);
+    host.begin(0,6);
+    const auto leases=host.resolve_history(0,6,{{{0,1,2,6},{}}},
+        [&](const auto & plan) { cache.begin_stage(plan); },{},{},false,
+        [&](const auto & ready) {
+            transport.fail_upload=true;
+            rejects([&] { cache.stage_ready_batch(ready,{}); });
+            transport.fail_upload=false;
+            cache.stage_ready_batch(ready,{});
+        });
+    require(transport.copies.size()==1 && transport.copies.begin()->second.size()==leases.size() && leases.size()==3,
+            "ready history blocks did not share one completion receipt");
+    require(transport.memory.empty(),"batched upload completed before requested");
+    for (const auto & lease:leases) host.unpin(lease);
+    rejects([&] { host.finish(); });
+    cache.wait_transfers();
+    for (const auto & lease:leases) {
+        const auto device=cache.find(lease.identity);
+        require(device && transport.memory.at(device->slot)==host.block(lease).data,"batch payload or slot identity changed");
+    }
+    cache.stage_ready_batch(leases,{});
+    require(transport.copies.empty() && cache.stats().uploads==leases.size(),"resident blocks were uploaded again");
+    cache.finish();
+    host.finish();
+}
 }
 void selected_first(solid::KvLayout layout,std::size_t capacity) {
     const solid::KvGeometry g{2,2,2,1,32,64,layout};
@@ -257,7 +289,7 @@ void shared_prediction_admission(std::uint32_t slots) {
 int main() {
     try {
         slots(); prefix(); wrong_predictions(); read_error(solid::KvLayout::interleaved);
-        read_error(solid::KvLayout::separate); capacity(); device(); deferred_device();
+        read_error(solid::KvLayout::separate); capacity(); device(); deferred_device(); batched_device();
         for (const auto layout:{solid::KvLayout::separate,solid::KvLayout::interleaved}) for (const auto capacity:{1u,64u}) selected_first(layout,capacity);
         streaming(false); streaming(true);
         shared_prediction_admission(3); shared_prediction_admission(4);

@@ -98,5 +98,6 @@ struct ScheduleStats {
     std::uint64_t fallback_fences = 0, event_waits = 0, batch_waits = 0, stream_waits = 0;
     std::uint64_t staging_bytes = 0;
     std::uint64_t backend_drains = 0, backend_compute_waits = 0, batch_groups = 0, events_coalesced = 0;
+    std::uint64_t historical_upload_batches = 0, historical_upload_blocks = 0, historical_upload_ranges = 0;
 };
 } // namespace solid
