@@ -296,6 +296,9 @@ int main(int argc, char ** argv) {
         const double adapter_ms = milliseconds(adapter_start);
         EvaluationBridge evaluation{adapter.get(), config.attention.profile ? &profile : nullptr};
         if (const auto * directory = std::getenv("SOLID_DIAGNOSTIC_ATTENTION")) {
+            if (config.attention.prefetch && config.attention.schedule != "naive") {
+                throw std::invalid_argument("attention diagnostics require naive prefetch scheduling to retain the captured cache bank");
+            }
             evaluation.diagnostic = directory;
             evaluation.diagnostic_layers = llama_model_n_layer(model.get());
             if (!std::filesystem::create_directory(evaluation.diagnostic)) {
