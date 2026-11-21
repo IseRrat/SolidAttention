@@ -212,9 +212,20 @@ void Prefetcher::pump() {
         const auto next=std::min_element(queued_.begin(),queued_.end(),[](const Job & a,const Job & b) { return a.dispatch.before(b.dispatch); });
         const auto job = *next;
         if (next_id_ >= (std::uint64_t{1} << 63)) throw std::overflow_error("read request identity exhausted");
-        if (!reader_->submit_scheduled(next_id_, store_.native_handle(), reinterpret_cast<unsigned char *>(blocks_[job.lease.slot].storage()) +
-                             job.segment.buffer_offset, job.segment.bytes, job.segment.file_offset,job.dispatch)) break;
-        requests_.emplace(next_id_++, job);
+        auto * destination=reinterpret_cast<unsigned char *>(blocks_[job.lease.slot].storage())+job.segment.buffer_offset;
+        const auto request=requests_.emplace(next_id_,ReadRequest{job,
+            store_.prepare_read(destination,job.segment.bytes,job.segment.file_offset)}).first;
+        try {
+            const auto & io=request->second.read;
+            if (!reader_->submit_scheduled(next_id_,io.fd,io.buffer,io.bytes,io.offset,job.dispatch)) {
+                requests_.erase(request);
+                break;
+            }
+        } catch (...) {
+            requests_.erase(request);
+            throw;
+        }
+        ++next_id_;
         queued_.erase(next);
         const auto & observer=stages_[job.lease.slot];
         if (observer.stage && observer.lease==job.lease) observer.stage->read_started(job.lease.identity);
@@ -315,10 +326,11 @@ void Prefetcher::poll(bool wait) {
         if (complete_store(completion)) { pump(); continue; }
         const auto found = requests_.find(completion.id);
         if (found == requests_.end()) { ++stats_.stale_completions; continue; }
-        const auto job = found->second;
+        const auto job = std::move(found->second);
         requests_.erase(found);
         if (!slots_.matches(job.lease)) { ++stats_.stale_completions; continue; }
         const bool retiring = slots_.entry(job.lease.slot).state == SlotState::retiring;
+        if (!retiring) completion.result=job.read.finish(completion.result);
         if (pending_[job.lease.slot] == 0) throw std::logic_error("duplicate read completion");
         --pending_[job.lease.slot];
         if (!retiring && (completion.result < 0 || static_cast<std::uint64_t>(completion.result) != job.segment.bytes)) {

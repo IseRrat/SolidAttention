@@ -180,6 +180,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
     require(after.direct_decode_queries==16 && after.ranking.device_builder_queries==16 && after.ranking.device_builder_appends==16 &&
         after.ranking.device_rank_queries>0 && after.ranking.query_upload_bytes==before.ranking.query_upload_bytes &&
         after.ranking.builder_key_upload_bytes==before.ranking.builder_key_upload_bytes,"direct decode re-uploaded Q/K or skipped device inputs");
+    require(after.ranking.builder_rank_shared_waits>0,"CUDA decode did not reuse the block ranking wait");
     const auto schedule=cache.schedule_stats();
     if (mode==solid::ScheduleMode::sync_reuse) {
         require(schedule.device_event_completions+schedule.device_boundary_fallbacks==16,
@@ -188,6 +189,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
             "CUDA KV archive did not share the attention completion");
         require(schedule.stream_waits==16 && schedule.batch_waits==0,
             "CUDA decode blocked the host on an attention upload batch");
+        require(after.ranking.builder_compute_appends==16,"CUDA decode waited for representative key append on the host");
     } else if (mode==solid::ScheduleMode::overlap) {
         require(schedule.archive_attention_reuses==0 && schedule.archive_separate_completions==16,
             "CUDA overlap did not retain independent KV archive completions");

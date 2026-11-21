@@ -147,7 +147,7 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     if (j.contains("attention")) {
         const auto & a = j.at("attention");
         const std::set<std::string> allowed = {"storage", "sparse", "gpu_decode", "layout", "fuse_kv_projection", "profile", "block_tokens", "context_budget_tokens",
-            "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "selection_replay",
+            "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "direct_decode_reads", "selection_replay",
             "prefetch", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head", "schedule", "schedule_trace", "selection_trace", "selection_backend", "prefill_backend", "prefill_tile_tokens", "io_cpu", "coordinator_cpu"};
         if (!a.is_object()) throw std::invalid_argument("attention must be an object");
         for (const auto & item : a.items()) if (allowed.count(item.key()) == 0) throw std::invalid_argument("unknown attention key: " + item.key());
@@ -238,6 +238,10 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         target.session_file = a.contains("session_file") ? resolve(base, a.at("session_file").get<std::string>()) :
             result.output.parent_path() / "kv.cache";
         if (a.contains("keep_session_file")) target.keep_session_file = a.at("keep_session_file").get<bool>();
+        if (a.contains("direct_decode_reads")) {
+            target.direct_decode_reads=a.at("direct_decode_reads").get<bool>();
+            if (target.direct_decode_reads && target.in_memory) throw std::invalid_argument("direct decode reads require SSD attention storage");
+        }
     }
     if (result.microbatch_tokens > result.batch_tokens || result.batch_tokens > result.context_tokens ||
         result.max_new_tokens > result.context_tokens) {

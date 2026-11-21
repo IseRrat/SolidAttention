@@ -49,6 +49,10 @@ def variant_config(template, variant, block, budget):
             if key=="prefill_backend" and value not in ("auto","cpu","cuda","sycl"): raise ValueError("unknown prefill backend")
             if key=="prefill_tile_tokens": number(value,1,True)
             attention[key]=value
+    if "direct_decode_reads" in template.get("attention", {}) and attention["storage"] == "ssd":
+        direct = template["attention"]["direct_decode_reads"]
+        if type(direct) is not bool: raise ValueError("direct_decode_reads must be boolean")
+        attention["direct_decode_reads"] = direct
     if sparse:
         selector = template.get("attention", {}).get("selection_backend", "auto")
         if selector not in ("auto", "cpu", "cuda"): raise ValueError("unknown selection backend")

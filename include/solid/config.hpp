@@ -40,6 +40,7 @@ struct AttentionConfig {
     std::filesystem::path session_file;
     std::filesystem::path selection_replay;
     bool keep_session_file = false;
+    bool direct_decode_reads = false;
 };
 
 struct RunConfig {

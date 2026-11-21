@@ -437,6 +437,13 @@ public:
         return false;
 #endif
     }
+    void * cuda_compute_stream() const {
+#ifdef SOLID_HAVE_CUDA_SELECTION
+        return solid_cuda_queue(backend_);
+#else
+        return nullptr;
+#endif
+    }
     void start_archive(const std::vector<std::uint32_t> & slots,std::uint64_t position,ggml_tensor * source=nullptr) {
         if (archive_pending_ || (!source && slots.size()!=geometry_.heads)) throw std::logic_error("invalid KV archive frontier");
         auto * archive_backend=source?backend_:copy_backend_;
@@ -1007,7 +1014,8 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
             if (reuses_sync()) impl_->device.wait_transfers_coalesced(); else impl_->device.wait_transfers();
             work->dag.complete(history_h2d, impl_->trace.now(), "historical_copy_complete");
         }
-        if (deferred) impl_->session.stage_device_keys(layer, position, *device);
+        if (deferred) impl_->session.stage_device_keys(layer,position,*device,
+            work->archive_at_attention?impl_->transport.cuda_compute_stream():nullptr);
         else {
             work->dag.start(append, impl_->trace.now());
             if (half) impl_->session.append_after_selection_half(layer, position, *half, *device);

@@ -49,6 +49,7 @@ public:
     std::uint32_t gather_slots() const;
     std::uint64_t gather_elements() const;
     void flush();
+    void enable_direct_reads();
     void finish();
     SessionStats stats() const;
     const KvGeometry & geometry() const { return store_->geometry(); }
@@ -74,7 +75,7 @@ public:
     std::optional<DeviceMemory> direct_memory() const { return representatives_ && !replay_.is_open() ? representatives_->direct_memory() : std::optional<DeviceMemory>{}; }
     std::vector<HeadSelection> select_before_kv_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query);
     void append_after_selection_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys);
-    void stage_device_keys(std::uint32_t layer, std::uint64_t position, DeviceKeys keys);
+    void stage_device_keys(std::uint32_t layer, std::uint64_t position, DeviceKeys keys,void * compute_stream=nullptr);
     void archive_device_kv(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv);
 private:
     std::unique_ptr<KvStore> store_;

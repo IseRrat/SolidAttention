@@ -27,6 +27,8 @@ struct RankerStats {
     std::uint64_t device_rank_queries = 0, device_builder_queries = 0, device_builder_appends = 0;
     std::uint64_t query_upload_bytes = 0, builder_key_upload_bytes = 0;
     std::uint64_t device_builder_batches = 0;
+    std::uint64_t builder_rank_shared_waits = 0;
+    std::uint64_t builder_compute_appends = 0;
 };
 struct RepresentativeSeed {
     std::uint64_t length = 0;
@@ -75,8 +77,15 @@ public:
     virtual std::optional<BuiltRepresentatives> build_query_device(std::uint32_t, std::uint64_t, DeviceQuery) {
         throw std::logic_error("direct device representative query is disabled");
     }
+    virtual std::optional<BuiltRepresentatives> build_query_for_rank_device(std::uint32_t layer,std::uint64_t position,DeviceQuery query) {
+        return build_query_device(layer,position,query);
+    }
+    virtual void finish_query_for_rank_device() {}
     virtual void build_append_device(std::uint32_t, std::uint64_t, DeviceKeys) {
         throw std::logic_error("direct device representative append is disabled");
+    }
+    virtual void build_append_device_on_compute(std::uint32_t,std::uint64_t,DeviceKeys,void *) {
+        throw std::logic_error("representative append on compute queue is disabled");
     }
     virtual std::vector<BuiltRepresentatives> build_batch_device(std::uint32_t,std::uint64_t,std::uint32_t,DeviceQuery,DeviceKvBatch) {
         throw std::logic_error("device representative batch is disabled");

@@ -424,27 +424,32 @@ std::vector<HeadSelection> AttentionSession::select_before_kv_device(std::uint32
     }
     try {
         const auto start = Clock::now();
-        representatives_->observe_query_device(layer, position, query);
+        representatives_->observe_query_device(layer, position, query,true);
         auto selected = select_blocks(geometry(), budget_, *representatives_, layer, position, query);
+        representatives_->finish_query_for_rank_device();
         stats_.selection_ns += elapsed(start);
         early_ = std::make_pair(layer, position);
         direct_early_ = true;
         record(layer, position, selected);
         for (const auto & head : selected) stats_.selected_tokens += head.positions.size();
         return selected;
-    } catch (...) { failed_ = true; throw; }
+    } catch (...) {
+        failed_ = true;
+        try { representatives_->finish_query_for_rank_device(); } catch (...) {}
+        throw;
+    }
 }
 void AttentionSession::append_after_selection_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys) {
     stage_device_keys(layer, position, keys);
     archive_device_kv(layer, position, kv);
 }
-void AttentionSession::stage_device_keys(std::uint32_t layer, std::uint64_t position, DeviceKeys keys) {
+void AttentionSession::stage_device_keys(std::uint32_t layer, std::uint64_t position, DeviceKeys keys,void * compute_stream) {
     if (failed_ || !early_ || !direct_early_ || device_keys_staged_ || *early_ != std::make_pair(layer, position)) {
         throw std::invalid_argument("device late KV does not match early selection");
     }
     try {
         const auto start = Clock::now();
-        representatives_->append_keys_device(layer, position, keys);
+        representatives_->append_keys_device(layer, position, keys,compute_stream);
         stats_.append_ns += elapsed(start);
         device_keys_staged_ = true;
     } catch (...) { failed_ = true; throw; }
@@ -527,6 +532,9 @@ std::vector<HeadSelection> AttentionSession::select(std::uint32_t layer, std::ui
         }
     }
     return selection;
+}
+void AttentionSession::enable_direct_reads() {
+    store_->enable_direct_reads();
 }
 void AttentionSession::flush() {
     if (failed_) throw std::runtime_error("attention session failed");

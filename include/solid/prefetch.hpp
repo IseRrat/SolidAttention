@@ -95,6 +95,7 @@ public:
     bool pending_stores() const { return !write_queue_.empty(); }
 private:
     struct Job { SlotLease lease; KvReadSegment segment; ReadDispatch dispatch; };
+    struct ReadRequest : Job { KvReadRequest read; };
     struct ReadStage { SlotLease lease; std::shared_ptr<BlockStage> stage; };
     struct Prediction { BlockIdentity identity; ReadDispatch read; ReadDispatch copy; };
     struct WriteBatch {
@@ -111,7 +112,7 @@ private:
     std::vector<ReadStage> stages_;
     std::vector<ReadDispatch> upload_order_;
     std::vector<std::vector<std::vector<std::uint64_t>>> history_;
-    std::map<std::uint64_t, Job> requests_;
+    std::map<std::uint64_t, ReadRequest> requests_;
     std::vector<Job> queued_;
     std::vector<Prediction> predictions_;
     std::unique_ptr<AsyncReader> reader_;

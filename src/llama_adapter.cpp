@@ -473,6 +473,7 @@ void AttentionAdapter::after_process() {
     impl_->session->release_prefill_if_complete();
 }
 void AttentionAdapter::flush() { check(); impl_->session->flush(); }
+void AttentionAdapter::enable_direct_reads() { check(); impl_->session->enable_direct_reads(); }
 void AttentionAdapter::finish() { check(); quiesce(); impl_->session->finish(); }
 SessionStats AttentionAdapter::stats() const { check(); return impl_->session->stats(); }
 SparseBudget AttentionAdapter::budget() const { return impl_->session->budget(); }

@@ -57,8 +57,55 @@ public:
         if (fd_ >= 0) _close(fd_);
 #else
         if (fd_ >= 0) ::close(fd_);
+#ifdef __linux__
+        if (direct_fd_ >= 0) ::close(direct_fd_);
+#endif
 #endif
         if (remove_) { std::error_code error; std::filesystem::remove(path_, error); }
+    }
+    void enable_direct_reads() override {
+#ifdef __linux__
+        if (direct_fd_>=0) return;
+        if (::fdatasync(fd_)!=0) fail("flush KV before enabling direct reads");
+        direct_fd_=::open(path_.c_str(),O_RDONLY | O_CLOEXEC | O_DIRECT);
+        if (direct_fd_<0) fail("open KV file for direct reads");
+#ifdef STATX_DIOALIGN
+        struct statx attributes{};
+        if (::statx(direct_fd_,"",AT_EMPTY_PATH,STATX_DIOALIGN,&attributes)==0 && (attributes.stx_mask&STATX_DIOALIGN)) {
+            if (!attributes.stx_dio_mem_align || !attributes.stx_dio_offset_align) {
+                throw std::runtime_error("KV filesystem does not support direct reads");
+            }
+            address_alignment_=attributes.stx_dio_mem_align;
+            offset_alignment_=attributes.stx_dio_offset_align;
+        }
+#endif
+#else
+        throw std::runtime_error("direct KV reads require Linux");
+#endif
+    }
+    KvReadRequest prepare_read(void * destination,std::size_t bytes,std::uint64_t offset) const override {
+        KvReadRequest result{fd_,destination,bytes,offset,{}};
+#ifdef __linux__
+        if (direct_fd_>=0) {
+            check_offset(offset);
+            if (bytes>static_cast<std::uint64_t>(INT64_MAX)-offset) throw std::overflow_error("direct KV read size");
+            result.fd=direct_fd_;
+            if (offset%offset_alignment_ || bytes%offset_alignment_ ||
+                reinterpret_cast<std::uintptr_t>(destination)%address_alignment_) {
+                result.skip=offset%offset_alignment_;
+                result.offset=offset-result.skip;
+                result.bytes=align_up(bytes+result.skip,offset_alignment_);
+                if (result.bytes>INT_MAX) throw std::overflow_error("aligned KV read size");
+                result.destination=destination;
+                result.logical_bytes=bytes;
+                std::size_t space=result.bytes+address_alignment_-1;
+                result.scratch.reset(new unsigned char[space]);
+                result.buffer=result.scratch.get();
+                if (!std::align(address_alignment_,result.bytes,result.buffer,space)) throw std::logic_error("KV read alignment");
+            }
+        }
+#endif
+        return result;
     }
     std::size_t read_at(void * destination, std::size_t bytes, std::uint64_t offset) override {
         check_offset(offset);
@@ -67,8 +114,10 @@ public:
         int n;
         do { n = _read(fd_, destination, static_cast<unsigned int>(std::min<std::size_t>(bytes, INT_MAX))); } while (n < 0 && errno == EINTR);
 #else
+        auto request=prepare_read(destination,std::min<std::size_t>(bytes,INT_MAX),offset);
         ssize_t n;
-        do { n = ::pread(fd_, destination, std::min<std::size_t>(bytes, INT_MAX), static_cast<off_t>(offset)); } while (n < 0 && errno == EINTR);
+        do { n = ::pread(request.fd,request.buffer,request.bytes,static_cast<off_t>(request.offset)); } while (n < 0 && errno == EINTR);
+        n=request.finish(n);
 #endif
         if (n < 0) fail("read KV file");
         return static_cast<std::size_t>(n);
@@ -97,6 +146,10 @@ public:
     }
 private:
     int fd_ = -1;
+#ifdef __linux__
+    int direct_fd_ = -1;
+    std::size_t address_alignment_ = 4096, offset_alignment_ = 4096;
+#endif
     std::filesystem::path path_;
     bool remove_;
     static void check_offset(std::uint64_t value) {
@@ -109,6 +162,14 @@ private:
     }
 };
 } // namespace
+
+std::int64_t KvReadRequest::finish(std::int64_t transferred) const {
+    if (!scratch || transferred<0) return transferred;
+    const auto read=static_cast<std::uint64_t>(transferred);
+    const auto copied=read>skip?std::min<std::uint64_t>(logical_bytes,read-skip):0;
+    if (copied) std::memcpy(destination,static_cast<const unsigned char *>(buffer)+skip,copied);
+    return static_cast<std::int64_t>(copied);
+}
 
 Half to_half(float value) {
     std::uint32_t bits;

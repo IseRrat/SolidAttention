@@ -5,6 +5,7 @@
 #include <filesystem>
 #include <memory>
 #include <optional>
+#include <stdexcept>
 #include <vector>
 
 namespace solid {
@@ -66,6 +67,17 @@ struct KvReadSegment {
     std::size_t buffer_offset = 0;
     std::size_t bytes = 0;
 };
+struct KvReadRequest {
+    int fd;
+    void * buffer;
+    std::size_t bytes;
+    std::uint64_t offset;
+    std::unique_ptr<unsigned char[]> scratch;
+    void * destination = nullptr;
+    std::size_t skip = 0, logical_bytes = 0;
+
+    std::int64_t finish(std::int64_t transferred) const;
+};
 struct KvWriteSegment {
     std::uint64_t file_offset;
     const Half * source;
@@ -79,6 +91,10 @@ public:
     virtual std::size_t write_at(const void * source, std::size_t bytes, std::uint64_t offset) = 0;
     virtual void resize(std::uint64_t bytes) = 0;
     virtual int native_handle() const { return -1; }
+    virtual void enable_direct_reads() { throw std::logic_error("direct KV reads require a native SSD file"); }
+    virtual KvReadRequest prepare_read(void * destination,std::size_t bytes,std::uint64_t offset) const {
+        return {native_handle(),destination,bytes,offset,{}};
+    }
 };
 
 std::unique_ptr<RandomAccessFile> create_session_file(const std::filesystem::path & path, bool remove_on_close);
@@ -99,6 +115,10 @@ public:
     virtual std::uint64_t resident_bytes() const = 0;
     virtual IoStats io_stats() const { return {}; }
     virtual int native_handle() const { return -1; }
+    virtual void enable_direct_reads() { throw std::logic_error("direct KV reads require SSD storage"); }
+    virtual KvReadRequest prepare_read(void * destination,std::size_t bytes,std::uint64_t offset) const {
+        return {native_handle(),destination,bytes,offset,{}};
+    }
     // Existing rows [0,prefix) are immutable. Only the newly committed suffix
     // requires I/O; dirty suffix rows are forwarded before submission.
     virtual std::vector<KvReadSegment> plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
@@ -141,6 +161,10 @@ public:
     std::vector<KvWriteSegment> begin_write(std::uint32_t layer);
     void complete_write(std::uint32_t layer, bool success);
     int native_handle() const override { return file_->native_handle(); }
+    void enable_direct_reads() override { file_->enable_direct_reads(); }
+    KvReadRequest prepare_read(void * destination,std::size_t bytes,std::uint64_t offset) const override {
+        return file_->prepare_read(destination,bytes,offset);
+    }
     std::vector<KvReadSegment> plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
                                         KvBlock & destination, std::uint32_t prefix = 0) override;
 private:

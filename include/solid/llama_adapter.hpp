@@ -65,6 +65,7 @@ public:
     void check() const;
     void after_process();
     void flush();
+    void enable_direct_reads();
     void finish();
     SessionStats stats() const;
     SparseBudget budget() const;

@@ -326,6 +326,7 @@ int main(int argc, char ** argv) {
         if (adapter) adapter->flush();
         const double prefill_ms = milliseconds(prefill_start);
         const auto prefill_counters = adapter ? counters(adapter->stats(), adapter->device_stats()) : Json::object();
+        if (adapter && config.attention.direct_decode_reads) adapter->enable_direct_reads();
         profile.set_decode();
         std::ofstream logits_file;
         const auto logits_path = config.output.parent_path() / "logits.f32";
@@ -455,6 +456,8 @@ int main(int argc, char ** argv) {
                 {"selection_published_blocks", stats.ranking.published_blocks},
                 {"representative_backend", stats.representative_backend}, {"representative_builder_queries", stats.ranking.builder_queries},
                 {"representative_builder_appends", stats.ranking.builder_appends}, {"representative_builder_blocks", stats.ranking.built_blocks},
+                {"builder_rank_shared_waits",stats.ranking.builder_rank_shared_waits},
+                {"builder_compute_appends",stats.ranking.builder_compute_appends},
                 {"device_rank_queries",stats.ranking.device_rank_queries},{"device_builder_queries",stats.ranking.device_builder_queries},
                 {"device_builder_appends",stats.ranking.device_builder_appends},{"query_upload_bytes",stats.ranking.query_upload_bytes},
                 {"builder_key_upload_bytes",stats.ranking.builder_key_upload_bytes},{"direct_decode_queries",stats.direct_decode_queries},
@@ -469,7 +472,7 @@ int main(int argc, char ** argv) {
                 {"attention_backend", config.attention.gpu_decode ? "ggml_flash_decode+"+stats.prefill_backend : "cpu_streaming_reference"},
                 {"prefill_backend",stats.prefill_backend},{"prefill_backend_requested",config.attention.prefill_backend},
                 {"prefill_query_capacity",stats.prefill.query_capacity},{"prefill_tile_capacity",stats.prefill.tile_capacity},
-                {"io_mode", "buffered"},
+                {"io_mode", config.attention.direct_decode_reads ? "direct_decode_reads" : "buffered"},
                 {"attention_queries", stats.attention_queries}, {"selected_tokens", stats.selected_tokens},
                 {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"kv_buffer_bytes", stats.kv_resident_bytes},
                 {"representative_buffer_bytes", stats.representative_bytes},

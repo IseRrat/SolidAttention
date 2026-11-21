@@ -98,20 +98,25 @@ void RepresentativeIndex::append_keys(std::uint32_t layer, std::uint64_t positio
     query_pending_[layer] = false;
     ++lengths_[layer];
 }
-void RepresentativeIndex::observe_query_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query) {
+void RepresentativeIndex::observe_query_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query,bool will_rank) {
     const auto memory = direct_memory();
     if (!memory || position != lengths_.at(layer) || position >= geometry_.capacity_tokens || query_pending_.at(layer)) {
         throw std::invalid_argument("device representative query state");
     }
     validate_device_query(query, *memory, query_heads_, geometry_.dimension);
-    accept_built(layer, position, ranker_->build_query_device(layer, position, query));
+    accept_built(layer,position,will_rank?ranker_->build_query_for_rank_device(layer,position,query):
+                                       ranker_->build_query_device(layer,position,query));
     query_pending_[layer] = true;
 }
-void RepresentativeIndex::append_keys_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys) {
+void RepresentativeIndex::finish_query_for_rank_device() {
+    if (ranker_) ranker_->finish_query_for_rank_device();
+}
+void RepresentativeIndex::append_keys_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys,void * compute_stream) {
     const auto memory = direct_memory();
     if (!memory || position != lengths_.at(layer) || !query_pending_.at(layer)) throw std::invalid_argument("device representative append state");
     validate_device_keys(keys, *memory, geometry_.heads, geometry_.dimension);
-    ranker_->build_append_device(layer, position, keys);
+    if (compute_stream) ranker_->build_append_device_on_compute(layer,position,keys,compute_stream);
+    else ranker_->build_append_device(layer, position, keys);
     query_pending_[layer] = false;
     ++lengths_[layer];
 }

@@ -22,8 +22,9 @@ public:
                  const std::vector<Half> & keys);
     void observe_query(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query);
     void append_keys(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & keys);
-    void observe_query_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query);
-    void append_keys_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys);
+    void observe_query_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query,bool will_rank=false);
+    void finish_query_for_rank_device();
+    void append_keys_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys,void * compute_stream=nullptr);
     void observe_batch_device(std::uint32_t layer,std::uint64_t first,std::uint32_t tokens,DeviceQuery query,DeviceKvBatch kv);
     std::optional<DeviceMemory> direct_memory() const { return ranker_ && ranker_->builder_window() ? ranker_->direct_memory() : std::optional<DeviceMemory>{}; }
     bool ready(std::uint32_t layer, std::uint64_t block) const;

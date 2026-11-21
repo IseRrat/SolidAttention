@@ -128,6 +128,8 @@
 
    CUDA `overlap+sync_reuse` 的设备 KV 路径允许历史上传在构建掩码和提交当前行时继续执行。计算流统一等待最后一个上传事件，协调线程用 attention 完成回执确认整个上传批次并归还槽位。下一层 SSD 请求可以先排队，暂时被上传占用的页锁定槽位在写入方归还后才接收新数据。调度轨迹核对共同上传依赖，CUDA 回归用例检查计算流等待和主机批次等待的次数。 [device_cache.hpp](../include/solid/device_cache.hpp)、[device_cache.cpp](../src/device_cache.cpp)、[prefetch.hpp](../include/solid/prefetch.hpp)、[prefetch.cpp](../src/prefetch.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)、[cuda_device_input_test.cu](../tests/cuda_device_input_test.cu)。
 
+   CUDA 在已有代表块无需发布的解码步，将代表分数更新与动态选块排入同一条流，等 Top-K 回传时一起检查更新和评分状态。需要发布新代表块或无需动态选块的步，在各自消费点确认更新完成。同步复用路径将当前 key 的追加放进 attention 计算流，共用 attention 回执，归档时验证相同 FP16 数据。结果记录选块等待复用及计算流追加次数。 [block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.hpp](../include/solid/session.hpp)、[session.cpp](../src/session.cpp)、[baseline.cpp](../src/baseline.cpp)。
+
    [attention_events.cpp](../src/attention_events.cpp)、[attention_events.cu](../src/cuda/attention_events.cu)、[cuda_completion.cuh](../include/solid/cuda_completion.cuh)、[attention_events.cpp](../src/sycl/attention_events.cpp)。
 
 5. **统一内存和复制队列**
@@ -183,6 +185,8 @@
    Offload 和 Offload＋Sparse 将选定 KV 直接写入 ggml 的目标缓冲区。同块连续行合并复制，只清零未使用的 KV 尾部，并分别填充各 query head 的有效 mask。纯卸载在关闭选块轨迹时按位置顺序遍历 KV。图回归覆盖分离及交织布局、磁盘读取、密集和稀疏 attention。[session.hpp](../include/solid/session.hpp)、[session.cpp](../src/session.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
 
    CUDA 端到端对照中的 Offload＋Sparse 与 SolidAttention 共用自动预算。输入不足 4096 token 时取输入长度的 25%，达到 4096 token 后固定为 1024。两者使用相同的开头、近期和历史 token 预算分配。[cuda-paper.json](../configs/experiments/cuda-paper.json)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
+
+   SSD 三组支持在解码开始前启用 Linux `O_DIRECT` 读取，预填充结束后先提交现有 KV 数据。对齐的请求直接写入目标缓冲区，未对齐的请求扩展到文件系统要求的边界，并在同步读取或异步回执后复制有效区间。异步取消保留临时缓冲直到原始请求完成。结果记录并核对 I/O 模式。 [kv_store.hpp](../include/solid/kv_store.hpp)、[kv_store.cpp](../src/kv_store.cpp)、[prefetch.hpp](../include/solid/prefetch.hpp)、[prefetch.cpp](../src/prefetch.cpp)、[session.hpp](../include/solid/session.hpp)、[session.cpp](../src/session.cpp)、[llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[config.hpp](../include/solid/config.hpp)、[config.cpp](../src/config.cpp)、[baseline.cpp](../src/baseline.cpp)、[experiments.py](../scripts/experiments.py)、[experiment_common.py](../scripts/experiment_common.py)、[uring_test.cpp](../tests/uring_test.cpp)。
 
    批量运行器识别当前容器的 cgroup 内存和 swap 限额。两个限额均与实验配置一致时，由推理进程继承容器限额，汇总前复核推理进程的实际限额。 [experiment_runtime.py](../scripts/experiment_runtime.py)、[experiments.py](../scripts/experiments.py)。
 
