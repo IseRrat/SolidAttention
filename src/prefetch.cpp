@@ -429,28 +429,40 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
     if (layer_ != layer || position_ != position || actual.size() != g.heads || store_.length(layer) != available) {
         throw std::invalid_argument("prefetch resolve identity mismatch");
     }
-    std::vector<BlockIdentity> needed;
+    std::vector<BlockWork> by_identity;
+    const auto local_first=position+1-std::min<std::uint64_t>(budget_.local,position+1);
     for (std::uint32_t head = 0; head < g.heads; ++head) {
         const auto & positions = actual[head].positions;
         if ((!historical && positions.empty()) || positions.size() > budget_.total || (!positions.empty() && positions.back() >= available) ||
             !std::is_sorted(positions.begin(), positions.end()) || std::adjacent_find(positions.begin(), positions.end()) != positions.end()) {
             throw std::invalid_argument("invalid actual prefetch selection");
         }
-        std::set<std::uint64_t> ids;
-        for (const auto p : positions) ids.insert(p / g.block_tokens);
-        if (ids.size() > slots_.slots_per_head()) throw std::invalid_argument("actual selection exceeds slots_per_head");
-        for (const auto id : ids) needed.push_back({layer, head, id, std::min<std::uint64_t>(g.block_tokens, available - id * g.block_tokens)});
+        const auto first=by_identity.size();
+        for (const auto p : positions) {
+            const auto block=p/g.block_tokens;
+            if (by_identity.size()==first || by_identity.back().identity.block!=block) {
+                by_identity.push_back({{layer,head,block,std::min<std::uint64_t>(g.block_tokens,available-block*g.block_tokens)}});
+            }
+            if (position+1>budget_.total && p>=budget_.initial && p<local_first) {
+                by_identity.back().priority=ReadPriority::correction_selected;
+            }
+        }
+        if (by_identity.size()-first>slots_.slots_per_head()) throw std::invalid_argument("actual selection exceeds slots_per_head");
     }
-    const auto priority=[&](const BlockIdentity & id) {
-        const auto local_first=position+1-std::min<std::uint64_t>(budget_.local,position+1);
-        for (const auto p:actual[id.head].positions) if (position+1>budget_.total && p/g.block_tokens==id.block && p>=budget_.initial && p<local_first) return ReadPriority::correction_selected;
-        return ReadPriority::correction_deterministic;
+    const auto find_block=[&](const BlockIdentity & id) {
+        const BlockIdentity first{id.layer,id.head,id.block,0};
+        return std::lower_bound(by_identity.begin(),by_identity.end(),first,
+            [](const BlockWork & block,const BlockIdentity & identity) { return block.identity<identity; });
     };
-    std::stable_sort(needed.begin(),needed.end(),[&](const BlockIdentity & a,const BlockIdentity & b) { return priority(a)<priority(b); });
+    auto work=by_identity;
+    std::stable_partition(work.begin(),work.end(),[](const BlockWork & item) {
+        return item.priority==ReadPriority::correction_selected;
+    });
+    std::vector<BlockIdentity> needed;
+    needed.reserve(work.size());
+    for (const auto & item:work) needed.push_back(item.identity);
     std::shared_ptr<BlockStage> stage;
     if (factory) {
-        std::vector<BlockWork> work;
-        for (const auto & id:needed) work.push_back({id,priority(id),1,1});
         stage=factory(work);
         if (!stage) throw std::logic_error("empty block stage from factory");
         const auto ordered=stage->read_order();
@@ -459,7 +471,9 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
         if (check_order!=check_needed) throw std::logic_error("block stage changed required membership");
         needed=ordered;
     }
-    const auto dispatch=[&](const BlockIdentity & id) { return stage?stage->dispatch(id):ReadDispatch{priority(id)}; };
+    const auto dispatch=[&](const BlockIdentity & id) {
+        return stage?stage->dispatch(id):ReadDispatch{find_block(id)->priority};
+    };
     // Formal selection owns admission now. It will issue the required blocks
     // with correction keys, rather than filling freed slots with stale guesses.
     predictions_.clear();
@@ -481,9 +495,13 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
     if (plan) plan(needed);
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
         const auto lease = slots_.lease(i);
-        const auto matching_block = [&](const BlockIdentity & id) { return id.layer == lease.identity.layer && id.head == lease.identity.head && id.block == lease.identity.block; };
-        if (slots_.entry(i).state != SlotState::free && slots_.entry(i).state != SlotState::retiring &&
-            std::none_of(needed.begin(), needed.end(), matching_block)) { ++stats_.unused_blocks; retire(lease); }
+        if (slots_.entry(i).state==SlotState::free || slots_.entry(i).state==SlotState::retiring) continue;
+        const auto & id=lease.identity;
+        const auto match=find_block(id);
+        if (match==by_identity.end() || match->identity.layer!=id.layer || match->identity.head!=id.head || match->identity.block!=id.block) {
+            ++stats_.unused_blocks;
+            retire(lease);
+        }
     }
     std::vector<SlotLease> result;
     for (const auto & id : needed) {

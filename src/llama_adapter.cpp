@@ -175,9 +175,8 @@ struct AttentionNode::Impl {
                 if (result.size() != static_cast<std::size_t>(ggml_nelements(destination))) throw std::logic_error("prefetch mask shape");
                 std::memcpy(destination->data, result.data(), result.size() * sizeof(Half));
             } else if (self.gathered) {
-                const auto result = self.session.gather(self.layer, self.frame->positions.front(), inputs[0], inputs[1], inputs[2], self.packed_inputs);
-                if (result.size() != static_cast<std::size_t>(ggml_nelements(destination))) throw std::logic_error("gather output shape");
-                std::memcpy(destination->data, result.data(), result.size() * sizeof(Half));
+                self.session.gather_into(self.layer,self.frame->positions.front(),inputs[0],inputs[1],inputs[2],
+                    static_cast<Half *>(destination->data),static_cast<std::size_t>(ggml_nelements(destination)),self.packed_inputs);
             } else {
                 const auto result = self.session.process(self.layer, self.frame->positions.front(), count, inputs[0], inputs[1], inputs[2], self.scale, self.packed_inputs);
                 if (result.size() != static_cast<std::size_t>(ggml_nelements(destination))) throw std::logic_error("attention output shape");

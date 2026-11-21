@@ -3,6 +3,7 @@
 #include "solid/block_identity.hpp"
 #include "solid/scheduler.hpp"
 #include <map>
+#include <set>
 
 namespace solid {
 struct BlockWork {
@@ -33,6 +34,7 @@ public:
     TaskRecord read_task(const BlockIdentity & identity) const;
     TaskRecord copy_task(const BlockIdentity & identity) const;
 private:
+    using CopyOrder = std::tuple<bool,std::uint64_t,std::uint32_t>;
     std::uint64_t now() const;
     std::uint32_t index(const BlockIdentity & identity) const;
     std::vector<BlockWork> blocks_;
@@ -40,6 +42,8 @@ private:
     std::unique_ptr<TaskDag> dag_;
     ScheduleTrace * trace_;
     std::vector<bool> observed_reads_,resident_copies_;
+    std::vector<CopyOrder> copy_priorities_;
+    std::set<CopyOrder> ready_copies_;
     bool aborted_=false;
     std::size_t copies_remaining_=0;
 };

@@ -100,7 +100,8 @@ def create(spec_path, destination):
         for path in (config_path,bundle_path,Path(config["prompt"])): sources.append({"path":str(path),"sha256":digest(path)})
     rows, suites = [], set()
     for suite in spec["suites"]:
-        if set(suite) != {"name","lengths","variants","blocks","budgets","conditions"}: raise ValueError("invalid suite fields")
+        required = {"name","lengths","variants","blocks","budgets","conditions"}
+        if set(suite) - {"offload_sparse_budgets"} != required: raise ValueError("invalid suite fields")
         suite_name = name(suite["name"])
         if suite_name in suites: raise ValueError("duplicate suite")
         suites.add(suite_name)
@@ -109,6 +110,13 @@ def create(spec_path, destination):
         for length in suite["lengths"]: number(length,1,True)
         for block in suite["blocks"]: number(block,1,True)
         for budget in suite["budgets"]: number(budget,0,True)
+        sparse_budgets = suite.get("offload_sparse_budgets",{})
+        if not isinstance(sparse_budgets,dict) or set(sparse_budgets) - {str(length) for length in suite["lengths"]}:
+            raise ValueError("offload_sparse_budgets must map input lengths in the suite to budgets")
+        if sparse_budgets and ("offload-sparse" not in suite["variants"] or suite["budgets"]!=[0]):
+            raise ValueError("offload_sparse_budgets replaces the automatic budget for offload-sparse")
+        for value in sparse_budgets.values():
+            if value!="full": number(value,1,True)
         for model,(template,bundle) in models.items():
             for length in suite["lengths"]:
                 if len(bundle["token_ids"]) < length: raise ValueError(f"corpus too short for {model}/{length}")
@@ -117,12 +125,16 @@ def create(spec_path, destination):
                         for setting in suite["conditions"]:
                             if setting not in conditions: raise ValueError("unknown suite condition")
                             for variant in suite["variants"]:
-                                config = variant_config(template,variant,block,budget)
-                                config.update(context_tokens=length+spec["max_new_tokens"]-1, max_new_tokens=spec["max_new_tokens"],
+                                capacity = length+spec["max_new_tokens"]-1
+                                selected_budget = sparse_budgets.get(str(length),budget) if variant=="offload-sparse" else budget
+                                if selected_budget=="full": selected_budget=capacity
+                                config = variant_config(template,variant,block,selected_budget)
+                                config.update(context_tokens=capacity, max_new_tokens=spec["max_new_tokens"],
                                               ignore_eos=True, prompt_token_ids=bundle["token_ids"][:length])
-                                if budget > config["context_tokens"]: raise ValueError("budget exceeds context capacity")
+                                if selected_budget > config["context_tokens"]: raise ValueError("budget exceeds context capacity")
                                 if config["batch_tokens"] > config["context_tokens"]: raise ValueError("batch exceeds experiment context")
-                                group = dict(suite=suite_name,model=model,input_tokens=length,block_tokens=block,budget_tokens=budget,condition=setting,variant=variant)
+                                group = dict(suite=suite_name,model=model,input_tokens=length,block_tokens=block,
+                                             budget_tokens=budget,condition=setting,variant=variant)
                                 for warmup,count in ((True,spec["warmups"]),(False,spec["repeats"])):
                                     for repeat in range(count):
                                         rows.append({"group":group,"warmup":warmup,"repeat":repeat,"config_value":copy.deepcopy(config)})

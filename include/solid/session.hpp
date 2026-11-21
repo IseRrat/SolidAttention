@@ -43,6 +43,9 @@ public:
                                const std::vector<float> & values, float scale, bool interleaved_inputs = false);
     std::vector<Half> gather(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                               const std::vector<float> & keys, const std::vector<float> & values, bool interleaved_inputs = false);
+    void gather_into(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
+                     const std::vector<float> & keys, const std::vector<float> & values,
+                     Half * packed, std::size_t elements, bool interleaved_inputs = false);
     std::uint32_t gather_slots() const;
     std::uint64_t gather_elements() const;
     void flush();

@@ -102,6 +102,8 @@
 
    已建立 Q 前沿、选择、KV 生成、补读、历史上传、当前行安装、attention、归档、回写和下一层预取的层图。逐块建立 READ→H2D→汇合依赖，计算 critical/LST，记录开始、完成与同步证明。
 
+   正式选择确认时顺序遍历已选 token，一次生成每块的读取优先级，并用有序块表查询在途及驻留块是否仍被选中。块调度器在读取完成时把该块加入就绪队列，上传开始时移出该块。就绪队列沿用 critical、LST、任务编号顺序。
+
    [scheduler.cpp](../src/scheduler.cpp)、[block_stage.cpp](../src/block_stage.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)。
 
 2. **Q 前沿与提前补读**
@@ -173,6 +175,10 @@
    [tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.cpp](../src/sycl/tiled_prefill.cpp)、[session.cpp](../src/session.cpp)。
 
 5. **运行与结果记录**
+
+   Offload 和 Offload＋Sparse 将选定 KV 直接写入 ggml 的目标缓冲区。同块连续行合并复制，只清零未使用的 KV 尾部，并分别填充各 query head 的有效 mask。纯卸载在关闭选块轨迹时按位置顺序遍历 KV。图回归覆盖分离及交织布局、磁盘读取、密集和稀疏 attention。[session.hpp](../include/solid/session.hpp)、[session.cpp](../src/session.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
+
+   CUDA 对照计划支持按输入长度独立设置 Offload＋Sparse 预算。当前对照配置在 1k、2k 保留完整上下文，4k 起固定为 1024。SolidAttention 使用原有预算规则。计划测试覆盖两条路径的独立配置。[experiments.py](../scripts/experiments.py)、[cuda-paper.json](../configs/experiments/cuda-paper.json)、[test_experiments.py](../tests/test_experiments.py)。
 
    批量运行器识别当前容器的 cgroup 内存和 swap 限额。两个限额均与实验配置一致时，由推理进程继承容器限额，汇总前复核推理进程的实际限额。 [experiment_runtime.py](../scripts/experiment_runtime.py)、[experiments.py](../scripts/experiments.py)。
 

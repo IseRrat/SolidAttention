@@ -57,6 +57,24 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_short_sparse_baseline_budget_does_not_change_solid_budget(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            spec_path,_=fixture(root)
+            spec=common.load(spec_path)
+            suite=spec["suites"][0]
+            suite.update(lengths=[4,8],variants=["offload","offload-sparse","solid"],
+                         offload_sparse_budgets={"4":"full","8":4})
+            write(spec_path,spec)
+            _,plan=experiments.read_plan(experiments.create(spec_path,root/"plan"))
+            for row in plan["jobs"]:
+                group=row["group"]
+                attention=common.load(row["config"])["attention"]
+                if group["variant"]=="offload-sparse":
+                    self.assertEqual(attention["context_budget_tokens"],{4:6,8:4}[group["input_tokens"]])
+                else:
+                    self.assertNotIn("context_budget_tokens",attention)
+
     def test_worker_cpu_settings_are_applied_only_to_prefetch_variants(self):
         template={"attention":{"io_cpu":6,"coordinator_cpu":7}}
         for variant in experiments.VARIANTS:

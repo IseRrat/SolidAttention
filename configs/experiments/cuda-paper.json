@@ -11,7 +11,7 @@
   "seed": 2026,
   "max_new_tokens": 512,
   "suites": [
-    {"name": "end-to-end", "lengths": [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072], "variants": ["offload", "offload-sparse", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-16g"]},
+    {"name": "end-to-end", "lengths": [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072], "variants": ["offload", "offload-sparse", "solid"], "blocks": [32], "budgets": [0], "offload_sparse_budgets": {"1024": "full", "2048": "full", "4096": 1024, "8192": 1024, "16384": 1024, "32768": 1024, "65536": 1024, "131072": 1024}, "conditions": ["cuda-16g"]},
     {"name": "memory", "lengths": [16384, 32768, 65536, 131072], "variants": ["origin", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-16g"]},
     {"name": "in-memory", "lengths": [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072], "variants": ["indram", "indram-sparse", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-16g"]},
     {"name": "prefetch", "lengths": [16384], "variants": ["interleaved", "prefetch"], "blocks": [32], "budgets": [1024], "conditions": ["cuda-16g"]},

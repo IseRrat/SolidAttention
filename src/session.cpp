@@ -277,6 +277,15 @@ std::uint64_t AttentionSession::gather_elements() const {
 }
 std::vector<Half> AttentionSession::gather(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                           const std::vector<float> & keys, const std::vector<float> & values, bool interleaved_inputs) {
+    std::vector<Half> packed(static_cast<std::size_t>(gather_elements()));
+    gather_into(layer,position,query,keys,values,packed.data(),packed.size(),interleaved_inputs);
+    stats_.workspace_peak_bytes=std::max<std::uint64_t>(stats_.workspace_peak_bytes,
+        packed.capacity()*sizeof(Half)+static_cast<std::size_t>(geometry().block_tokens)*2*geometry().dimension*sizeof(Half));
+    return packed;
+}
+void AttentionSession::gather_into(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
+                                   const std::vector<float> & keys, const std::vector<float> & values,
+                                   Half * packed, std::size_t elements, bool interleaved_inputs) {
     if (failed_) throw std::runtime_error("attention session failed");
     const auto & g = geometry();
     if (position < prefill_tokens_ || query.size() != static_cast<std::size_t>(query_heads_) * g.dimension ||
@@ -284,12 +293,13 @@ std::vector<Half> AttentionSession::gather(std::uint32_t layer, std::uint64_t po
         (interleaved_inputs ? !values.empty() : keys.size() != values.size())) {
         throw std::invalid_argument("gather requires one decode query");
     }
+    if (!packed || elements!=gather_elements()) throw std::invalid_argument("gather output shape");
     try {
         append_token(layer, position, query, keys.data(), interleaved_inputs ? nullptr : values.data());
         std::vector<HeadSelection> selection;
         const auto selection_start = Clock::now();
         if (sparse_) selection = select(layer, position, query);
-        else {
+        else if (trace_.is_open()) {
             selection.resize(g.heads);
             for (auto & head : selection) {
                 head.positions.resize(static_cast<std::size_t>(position + 1));
@@ -300,39 +310,57 @@ std::vector<Half> AttentionSession::gather(std::uint32_t layer, std::uint64_t po
         record(layer, position, selection);
         const auto gather_start = Clock::now();
         const auto slots = gather_slots();
-        const auto mask_offset = static_cast<std::size_t>(slots) * 2 * g.heads * g.dimension;
-        std::vector<Half> packed(static_cast<std::size_t>(gather_elements()), 0);
-        std::fill(packed.begin() + mask_offset, packed.end(), Half{0xfc00});
+        const auto head_elements=static_cast<std::size_t>(slots)*g.dimension;
+        const auto plane_elements=head_elements*g.heads;
+        auto * mask=packed+2*plane_elements;
         KvBlock block;
         const auto group = query_heads_ / g.heads;
         for (std::uint32_t head = 0; head < g.heads; ++head) {
-            std::uint64_t loaded = std::numeric_limits<std::uint64_t>::max();
-            const auto & positions = selection[head].positions;
-            if (positions.empty() || positions.size() > slots) throw std::logic_error("invalid gathered selection size");
-            for (std::size_t i = 0; i < positions.size(); ++i) {
-                const auto id = positions[i] / g.block_tokens;
-                if (loaded != id) { store_->read(layer, head, id, block); loaded = id; }
-                const auto row = positions[i] % g.block_tokens;
-                if (g.layout == KvLayout::interleaved) {
-                    const auto head_offset = static_cast<std::size_t>(head) * slots * 2 * g.dimension;
-                    std::copy_n(block.key(row), 2 * g.dimension, packed.data() + head_offset + i * 2 * g.dimension);
-                } else {
-                    const auto head_offset = static_cast<std::size_t>(head) * slots * g.dimension;
-                    std::copy_n(block.key(row), g.dimension, packed.data() + head_offset + i * g.dimension);
-                    std::copy_n(block.value(row), g.dimension, packed.data() + head_offset + static_cast<std::size_t>(g.heads) * slots * g.dimension + i * g.dimension);
+            const auto * positions=sparse_?&selection[head].positions:nullptr;
+            const auto count=positions?positions->size():static_cast<std::size_t>(position+1);
+            if (!count || count>slots) throw std::logic_error("invalid gathered selection size");
+            std::uint64_t loaded=std::numeric_limits<std::uint64_t>::max();
+            for (std::size_t i=0;i<count;) {
+                const auto token=positions?(*positions)[i]:i;
+                const auto id=token/g.block_tokens;
+                if (loaded!=id) { store_->read(layer,head,id,block); loaded=id; }
+                const auto row=token%g.block_tokens;
+                if (row>=block.valid_tokens) throw std::logic_error("selected token is outside the stored KV block");
+                const auto available=std::min<std::size_t>(count-i,block.valid_tokens-row);
+                std::size_t run=available;
+                if (positions) {
+                    run=1;
+                    while (run<available && (*positions)[i+run]==token+run) ++run;
                 }
-                stats_.gather_copy_bytes += 2 * g.dimension * sizeof(Half);
+                const auto width=run*g.dimension;
+                const auto offset=head*head_elements+i*g.dimension;
+                if (g.layout == KvLayout::interleaved) {
+                    std::copy_n(block.key(row),2*width,packed+2*offset);
+                } else {
+                    std::copy_n(block.key(row),width,packed+offset);
+                    std::copy_n(block.value(row),width,packed+plane_elements+offset);
+                }
+                i+=run;
+            }
+            const auto tail=(slots-count)*g.dimension;
+            const auto tail_offset=head*head_elements+count*g.dimension;
+            if (g.layout==KvLayout::interleaved) std::fill_n(packed+2*tail_offset,2*tail,Half{0});
+            else {
+                std::fill_n(packed+tail_offset,tail,Half{0});
+                std::fill_n(packed+plane_elements+tail_offset,tail,Half{0});
             }
             for (std::uint32_t q = head * group; q < (head + 1) * group; ++q) {
-                std::fill_n(packed.data() + mask_offset + q * slots, positions.size(), Half{0});
+                auto * row=mask+static_cast<std::size_t>(q)*slots;
+                std::fill_n(row,count,Half{0});
+                std::fill_n(row+count,slots-count,Half{0xfc00});
             }
-            stats_.selected_tokens += positions.size();
+            stats_.gather_copy_bytes+=2ull*count*g.dimension*sizeof(Half);
+            stats_.selected_tokens+=count;
         }
         stats_.gather_ns += elapsed(gather_start);
         ++stats_.attention_queries;
         stats_.workspace_peak_bytes = std::max<std::uint64_t>(stats_.workspace_peak_bytes,
-            packed.capacity() * sizeof(Half) + static_cast<std::size_t>(g.block_tokens) * 2 * g.dimension * sizeof(Half));
-        return packed;
+            block.storage_size()*sizeof(Half));
     } catch (...) { failed_ = true; throw; }
 }
 Prefetcher & AttentionSession::prefetcher() {

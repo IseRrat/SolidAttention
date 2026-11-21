@@ -10,7 +10,7 @@
 #include <memory>
 #include <stdexcept>
 
-void run(solid::KvLayout layout, bool on_disk, bool packed_inputs) {
+void run(solid::KvLayout layout, bool on_disk, bool packed_inputs, bool sparse) {
         constexpr int dimension = 128, heads = 2, queries = 4;
         solid::KvGeometry geometry{1, heads, dimension, 2, 16, 64, layout};
         solid::SparseBudget budget{4, 1, 1, 1};
@@ -19,8 +19,8 @@ void run(solid::KvLayout layout, bool on_disk, bool packed_inputs) {
             const auto path = std::filesystem::temp_directory_path() / ("solid-gather-" + std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
             store = std::make_unique<solid::FileKvStore>(geometry, solid::create_session_file(path, true), 2048);
         } else store = std::make_unique<solid::MemoryKvStore>(geometry);
-        solid::AttentionSession gathered(std::move(store), queries, budget, true, 6);
-        solid::AttentionSession reference(std::make_unique<solid::MemoryKvStore>(geometry), queries, budget, true, 6);
+        solid::AttentionSession gathered(std::move(store), queries, budget, sparse, 6);
+        solid::AttentionSession reference(std::make_unique<solid::MemoryKvStore>(geometry), queries, budget, sparse, 6);
         std::vector<float> q(queries * dimension), keys(heads * dimension), values(heads * dimension);
         for (int head = 0; head < queries; ++head) q[head * dimension] = head < 2 ? 1.0f : -1.0f;
         const float scale = 1 / std::sqrt(static_cast<float>(dimension));
@@ -86,8 +86,9 @@ void run(solid::KvLayout layout, bool on_disk, bool packed_inputs) {
 int main() {
     try {
         for (auto layout : {solid::KvLayout::separate, solid::KvLayout::interleaved}) {
-            run(layout, false, false);
-            run(layout, true, true);
+            run(layout, false, false, true);
+            run(layout, true, true, true);
+            run(layout, true, false, false);
         }
         std::cout << "FP16 layouts, SSD gather, packed inputs, GQA masks, Flash Attention and failure checks passed\n";
         return 0;

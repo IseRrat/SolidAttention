@@ -19,6 +19,13 @@ BlockStage::BlockStage(std::vector<BlockWork> blocks,ScheduleTrace * trace,std::
     }
     tasks.push_back({"historical_blocks_ready",TaskResource::host,std::move(copies),1});
     dag_=std::make_unique<TaskDag>(std::move(tasks),trace,frame,layer,position,mode);
+    copy_priorities_.reserve(blocks_.size());
+    for (std::uint32_t i=0;i<blocks_.size();++i) {
+        const auto task=dag_->task(2*i+1);
+        // All copy tasks share a resource. Use the DAG's critical/LST order
+        // with the task index as the final tie-break.
+        copy_priorities_.emplace_back(!task.critical,task.latest_start,i);
+    }
     copies_remaining_=blocks_.size();
     if (blocks_.empty()) dag_->fence({0},now(),"empty_history");
 }
@@ -38,11 +45,9 @@ std::vector<BlockIdentity> BlockStage::read_order() const {
     return result;
 }
 std::vector<BlockIdentity> BlockStage::copy_order() const {
-    std::vector<std::uint32_t> candidates;
-    for (std::uint32_t i=0;i<blocks_.size();++i) candidates.push_back(2*i+1);
     std::vector<BlockIdentity> result;
-    if (candidates.empty()) return result;
-    for (const auto task:dag_->ready(candidates)) result.push_back(blocks_[task/2].identity);
+    result.reserve(ready_copies_.size());
+    for (const auto & item:ready_copies_) result.push_back(blocks_[std::get<2>(item)].identity);
     return result;
 }
 ReadDispatch BlockStage::dispatch(const BlockIdentity & id) const {
@@ -65,10 +70,13 @@ void BlockStage::read_complete(const BlockIdentity & id,const std::string & proo
     const auto i=index(id);
     if (aborted_) return;
     read_started(id,proof); dag_->complete(2*i,now(),proof);
+    ready_copies_.insert(copy_priorities_[i]);
 }
 void BlockStage::copy_started(const BlockIdentity & id) {
     if (aborted_) throw std::logic_error("new upload after block stage abort");
-    dag_->start(2*index(id)+1,now());
+    const auto i=index(id);
+    dag_->start(2*i+1,now());
+    ready_copies_.erase(copy_priorities_[i]);
 }
 void BlockStage::copy_complete(const BlockIdentity & id,const std::string & proof,std::optional<std::uint64_t> device_ns) {
     const auto i=index(id);
@@ -79,7 +87,7 @@ void BlockStage::copy_complete(const BlockIdentity & id,const std::string & proo
     if (--copies_remaining_==0) dag_->fence({join},now(),"all_block_copies_complete");
 }
 bool BlockStage::finished() const { return dag_->finished(); }
-void BlockStage::abort() { if (!aborted_) { aborted_=true; dag_->abort(now()); } }
+void BlockStage::abort() { if (!aborted_) { aborted_=true; ready_copies_.clear(); dag_->abort(now()); } }
 TaskRecord BlockStage::read_task(const BlockIdentity & id) const { return dag_->task(2*index(id)); }
 TaskRecord BlockStage::copy_task(const BlockIdentity & id) const { return dag_->task(2*index(id)+1); }
 BlockStageStats BlockStage::stats() const {
