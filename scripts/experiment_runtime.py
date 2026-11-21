@@ -7,6 +7,7 @@ import time
 import uuid
 
 from experiment_common import number
+from run_baseline import cgroup_memory
 from process_lifetime import stop_process
 
 
@@ -35,6 +36,12 @@ def isolated_command(command, settings):
     condition(settings)
     if settings.get("cpus"): command = ["taskset", "--cpu-list", ",".join(map(str,settings["cpus"])), *command]
     if settings.get("memory_max_bytes") is not None:
+        # A container can already supply the exact limits. Its child inherits
+        # them, and audited_job independently checks the runner's cgroup.
+        current = cgroup_memory(pid=os.getpid())
+        if (current.get("memory.max") == str(settings["memory_max_bytes"]) and
+                current.get("memory.swap.max") == str(swap_limit(settings))):
+            return command
         command = ["systemd-run", "--user", "--scope", "--quiet", "--unit=solid-"+uuid.uuid4().hex,
                    "--property=MemoryMax="+str(settings["memory_max_bytes"]),
                    "--property=MemorySwapMax="+str(swap_limit(settings)), *command]

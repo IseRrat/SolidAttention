@@ -170,6 +170,8 @@
 
 5. **运行与结果记录**
 
+   批量运行器识别当前容器的 cgroup 内存和 swap 限额。两个限额均与实验配置一致时，由推理进程继承容器限额，汇总前复核推理进程的实际限额。 [experiment_runtime.py](../scripts/experiment_runtime.py)、[experiments.py](../scripts/experiments.py)。
+
    已写模型和源码哈希、配置检查、固定 token/选择回放、运行监控、数值输出和分项内存/I/O 统计。可通过 `SOLID_DIAGNOSTIC_ATTENTION` 在同步路径和 naive 预取路径导出首个 decode 的逐层 Q、K、V、mask 和 attention 输出，同时记录类型、形状、步幅和所在缓冲；导出发生在完成观察器释放缓存之前，入口限制调度模式以保留导出期间的缓存读者。已写实验矩阵、准确率接口、结果核查及绘图工具。
 
    [baseline.cpp](../src/baseline.cpp)、[config.cpp](../src/config.cpp)、[run_baseline.py](../scripts/run_baseline.py)、[experiments.py](../scripts/experiments.py)、[accuracy.py](../scripts/accuracy.py)、[plot_experiments.py](../scripts/plot_experiments.py)。
