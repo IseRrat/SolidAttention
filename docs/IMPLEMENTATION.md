@@ -170,6 +170,6 @@
 
 5. **运行与结果记录**
 
-   已写模型和源码哈希、配置检查、固定 token/选择回放、运行监控、数值输出和分项内存/I/O 统计。已写实验矩阵、准确率接口、结果核查及绘图工具。
+   已写模型和源码哈希、配置检查、固定 token/选择回放、运行监控、数值输出和分项内存/I/O 统计。可通过 `SOLID_DIAGNOSTIC_ATTENTION` 导出首个 decode 的逐层 Q、K、V、mask 和 attention 输出，同时记录类型、形状、步幅和所在缓冲；导出发生在完成观察器释放缓存之前。已写实验矩阵、准确率接口、结果核查及绘图工具。
 
    [baseline.cpp](../src/baseline.cpp)、[config.cpp](../src/config.cpp)、[run_baseline.py](../scripts/run_baseline.py)、[experiments.py](../scripts/experiments.py)、[accuracy.py](../scripts/accuracy.py)、[plot_experiments.py](../scripts/plot_experiments.py)。

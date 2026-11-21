@@ -12,6 +12,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <fstream>
 #include <iostream>
 #include <iterator>
@@ -134,11 +135,50 @@ struct BackendLifetime {
 struct EvaluationBridge {
     solid::AttentionAdapter * adapter;
     solid::ExecutionProfile * profile;
+    std::filesystem::path diagnostic;
+    std::size_t diagnostic_layers = 0, captured = 0;
+    std::exception_ptr diagnostic_error;
+    void check() const { if (diagnostic_error) std::rethrow_exception(diagnostic_error); }
+    bool wants_diagnostic(const ggml_tensor * tensor) const {
+        return !diagnostic.empty() && captured < diagnostic_layers &&
+            tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[0]->ne[1] == 1;
+    }
+    void capture(ggml_tensor * tensor) {
+        Json tensors = Json::array();
+        const ggml_tensor * values[] = {tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor};
+        const char * labels[] = {"q", "k", "v", "mask", "output"};
+        for (std::size_t i = 0; i < std::size(values); ++i) {
+            const auto * value = values[i];
+            if (!value) continue;
+            const auto filename = std::to_string(captured) + "-" + labels[i] + ".bin";
+            std::vector<unsigned char> bytes(ggml_nbytes(value));
+            ggml_backend_tensor_get(value, bytes.data(), 0, bytes.size());
+            std::ofstream stream(diagnostic / filename, std::ios::binary);
+            stream.write(reinterpret_cast<const char *>(bytes.data()), bytes.size());
+            stream.close();
+            if (!stream) throw std::runtime_error("attention diagnostic write failed");
+            const auto * storage = value->buffer ? value : value->view_src;
+            tensors.push_back({{"label", labels[i]}, {"file", filename}, {"type", ggml_type_name(value->type)},
+                {"buffer", storage && storage->buffer ? ggml_backend_buffer_name(storage->buffer) : "none"},
+                {"ne", {value->ne[0], value->ne[1], value->ne[2], value->ne[3]}},
+                {"nb", {value->nb[0], value->nb[1], value->nb[2], value->nb[3]}}});
+        }
+        std::ofstream metadata(diagnostic / (std::to_string(captured) + ".json"));
+        metadata << tensors.dump(2); metadata.close();
+        if (!metadata) throw std::runtime_error("attention diagnostic metadata write failed");
+        ++captured;
+    }
     static bool evaluate(ggml_tensor * tensor, bool ask, void * userdata) {
         auto & self = *static_cast<EvaluationBridge *>(userdata);
+        const bool diagnostic = self.wants_diagnostic(tensor);
+        // Capture before completion observers can recycle the cache bank.
+        if (!ask && diagnostic) {
+            try { self.capture(tensor); }
+            catch (...) { self.diagnostic_error = std::current_exception(); return false; }
+        }
         const bool a = self.adapter ? self.adapter->observe(tensor, ask) : !ask;
         const bool p = self.profile ? solid::ExecutionProfile::evaluate(tensor, ask, self.profile) : !ask;
-        return ask ? a || p : a && p;
+        return ask ? a || p || diagnostic : a && p;
     }
 };
 struct AdapterContextLifetime {
@@ -255,7 +295,14 @@ int main(int argc, char ** argv) {
         }
         const double adapter_ms = milliseconds(adapter_start);
         EvaluationBridge evaluation{adapter.get(), config.attention.profile ? &profile : nullptr};
-        if (config.attention.profile || config.attention.prefetch) {
+        if (const auto * directory = std::getenv("SOLID_DIAGNOSTIC_ATTENTION")) {
+            evaluation.diagnostic = directory;
+            evaluation.diagnostic_layers = llama_model_n_layer(model.get());
+            if (!std::filesystem::create_directory(evaluation.diagnostic)) {
+                throw std::runtime_error("attention diagnostic requires a new output directory");
+            }
+        }
+        if (config.attention.profile || config.attention.prefetch || !evaluation.diagnostic.empty()) {
             cp.cb_eval = EvaluationBridge::evaluate;
             cp.cb_eval_user_data = &evaluation;
         }
@@ -270,7 +317,7 @@ int main(int argc, char ** argv) {
         for (std::size_t first = 0; first < tokens.size();) {
             const auto count = std::min<std::size_t>(config.batch_tokens, tokens.size() - first);
             submit(ctx.get(), batch.get(), tokens.data() + first, count, static_cast<llama_pos>(first), first + count == tokens.size(), adapter.get());
-            profile.check();
+            profile.check(); evaluation.check();
             first += count;
         }
         if (adapter) adapter->flush();
@@ -301,7 +348,7 @@ int main(int argc, char ** argv) {
                 decode_inputs.push_back(input);
                 submit(ctx.get(), batch.get(), &input, 1,
                        static_cast<llama_pos>(tokens.size() + i - 1), true, adapter.get());
-                profile.check();
+                profile.check(); evaluation.check();
                 process_ms = milliseconds(processing);
             }
             const auto sample_start = Clock::now();
