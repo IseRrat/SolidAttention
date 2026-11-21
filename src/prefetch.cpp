@@ -127,7 +127,7 @@ Prefetcher::~Prefetcher() {
         } catch (...) { std::terminate(); }
     }
 }
-void Prefetcher::bind_shared_blocks(const std::vector<Half *> & addresses,std::shared_ptr<void> owner,bool attention_shared) {
+void Prefetcher::bind_shared_blocks(const std::vector<Half *> & addresses,std::shared_ptr<void> owner,bool defer_prediction_slots) {
     check();
     if (layer_ || pending_reads() || addresses.size()!=blocks_.size() || !owner ||
         std::any_of(addresses.begin(),addresses.end(),[](const auto * p) { return !p; })) {
@@ -135,7 +135,7 @@ void Prefetcher::bind_shared_blocks(const std::vector<Half *> & addresses,std::s
     }
     const auto elements=static_cast<std::size_t>(store_.geometry().block_tokens)*2*store_.geometry().dimension;
     for (std::size_t i=0;i<blocks_.size();++i) blocks_[i].bind_shared(addresses[i],elements,owner);
-    attention_shared_=attention_shared;
+    defer_prediction_slots_=defer_prediction_slots;
     stats_.host_bytes=0; // The shared bank is counted by the device transport.
 }
 void Prefetcher::check() const { if (failed_) throw std::runtime_error("prefetch session failed"); }
@@ -344,7 +344,7 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
     const auto & g = store_.geometry();
     if (layer >= g.layers || position >= g.capacity_tokens || store_.length(layer) != position) throw std::invalid_argument("prefetch begin position mismatch");
     if (layer_ == layer && position_ == position) { poll(); return; }
-    if (!attention_shared_) for (std::uint32_t i = 0; i < slots_.size(); ++i) {
+    if (!defer_prediction_slots_) for (std::uint32_t i = 0; i < slots_.size(); ++i) {
         if (slots_.entry(i).readers) throw std::logic_error("host slots still held by a transfer");
     }
     predictions_.clear();
@@ -391,7 +391,7 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
     std::stable_sort(ordered.begin(), ordered.end(), [](const Prediction & a, const Prediction & b) {
         return a.read.before(b.read);
     });
-    if (attention_shared_) predictions_=std::move(ordered);
+    if (defer_prediction_slots_) predictions_=std::move(ordered);
     else for (const auto & job : ordered) {
         auto lease = slots_.find(job.identity);
         if (!lease) {

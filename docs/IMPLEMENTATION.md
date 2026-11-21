@@ -126,6 +126,8 @@
 
    CUDA 已接入原生事件和图捕获/重放通知；SYCL 已接入结束事件和带 epoch 的独立队列通知。协调线程据此释放旧工作集读者并推进后继上传，后继 Q 与请求边界也具有完成证明。早于后继边界的上传次数，以上传开始派发时的边界状态为准。
 
+   CUDA `overlap+sync_reuse` 的设备 KV 路径允许历史上传在构建掩码和提交当前行时继续执行。计算流统一等待最后一个上传事件，协调线程用 attention 完成回执确认整个上传批次并归还槽位。下一层 SSD 请求可以先排队，暂时被上传占用的页锁定槽位在写入方归还后才接收新数据。调度轨迹核对共同上传依赖，CUDA 回归用例检查计算流等待和主机批次等待的次数。 [device_cache.hpp](../include/solid/device_cache.hpp)、[device_cache.cpp](../src/device_cache.cpp)、[prefetch.hpp](../include/solid/prefetch.hpp)、[prefetch.cpp](../src/prefetch.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)、[cuda_device_input_test.cu](../tests/cuda_device_input_test.cu)。
+
    [attention_events.cpp](../src/attention_events.cpp)、[attention_events.cu](../src/cuda/attention_events.cu)、[cuda_completion.cuh](../include/solid/cuda_completion.cuh)、[attention_events.cpp](../src/sycl/attention_events.cpp)。
 
 5. **统一内存和复制队列**

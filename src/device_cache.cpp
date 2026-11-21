@@ -18,7 +18,7 @@ DeviceCache::DeviceCache(Prefetcher & host, KvGeometry geometry, std::uint32_t q
         for (std::uint32_t head=0;head<geometry.heads;++head) for (std::uint32_t slot=0;slot<host.slots_per_head();++slot) {
             addresses.push_back(transport_.host_slot_storage(head*slots_.slots_per_head()+slot));
         }
-        host_.bind_shared_blocks(addresses,transport_.host_storage_owner(),transport_.aliases_host_slots());
+        host_.bind_shared_blocks(addresses,transport_.host_storage_owner(),transport_.defer_prefetch_slots());
     }
     if (!trace.empty()) {
         if (std::filesystem::exists(trace)) throw std::runtime_error("device trace already exists");
@@ -293,8 +293,12 @@ void DeviceCache::stage_ready_batch(const std::vector<SlotLease> & leases,const 
     poll_transfers(false);
     upload_batch(leases,stage);
 }
-std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection, bool deferred_upload,const CurrentDeviceKv * current) {
+std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
+                                       bool deferred_upload,const CurrentDeviceKv * current,bool keep_history_in_flight) {
     if (!attention_.empty()) throw std::logic_error("previous device attention has not completed");
+    if (keep_history_in_flight && (!deferred_upload || !current || !transport_.defer_prefetch_slots() || transport_.aliases_host_slots())) {
+        throw std::logic_error("in-flight history requires a fenced device copy queue");
+    }
     if (selection.size() != geometry_.heads) throw std::invalid_argument("device selection head count");
     std::vector<std::optional<SlotLease>> current_hosts;
     std::vector<BlockIdentity> actual;
@@ -324,7 +328,8 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
             }
         }
     } else for (const auto & lease:host_leases) actual.push_back(lease.identity);
-    wait_transfers();
+    if (keep_history_in_flight) reap_transfers();
+    else wait_transfers();
     std::vector<BlockIdentity> current_ids;
     if (current) for (std::uint32_t h=0;h<geometry_.heads;++h) {
         const BlockIdentity id{current->layer,h,current->position/geometry_.block_tokens,current->position%geometry_.block_tokens+1};

@@ -420,8 +420,15 @@ public:
         }
 #endif
         if (!events_.empty() && events_.rbegin()->second.event) {
-            ggml_backend_event_wait(backend_, events_.rbegin()->second.event); ++stats_.stream_waits;
+            const auto & last=*events_.rbegin();
+            ggml_backend_event_wait(backend_,last.second.event);
+            compute_dependency_ticket_=last.first;
+            ++stats_.stream_waits;
         }
+    }
+    void acknowledge_compute_dependency() {
+        completed_through_=std::max(completed_through_,compute_dependency_ticket_);
+        compute_dependency_ticket_=0;
     }
     bool can_archive_on_attention_stream() const {
 #ifdef SOLID_HAVE_CUDA_SELECTION
@@ -521,6 +528,7 @@ public:
     bool shared_memory() const override { return shared_; }
     bool aliases_host_slots() const override { return shared_; }
     bool binds_host_slots() const override { return shared_ || staging_!=nullptr; }
+    bool defer_prefetch_slots() const override { return shared_ || can_archive_on_attention_stream(); }
     std::shared_ptr<void> host_storage_owner() const override { return shared_?buffer_:staging_; }
     Half * host_slot_storage(std::uint32_t slot) const override {
         if (shared_) return shared_slot(slot);
@@ -600,6 +608,7 @@ private:
     ggml_tensor * current_source_=nullptr;
     std::uint64_t next_ = 1;
     std::uint64_t completed_through_ = 0;
+    std::uint64_t compute_dependency_ticket_ = 0;
     ScheduleStats stats_;
     AttentionEvents * native_;
 };
@@ -644,6 +653,11 @@ struct LayerWork {
                 if (!shared_archive) specs[kv_d2h].predecessors={current_h2d};
                 specs[append].predecessors={kv_d2h};
                 specs[current_h2d].predecessors={kv_projection,miss_read,history_h2d};
+                if (shared_archive) {
+                    specs[current_h2d].predecessors.pop_back();
+                    specs[attention].predecessors.push_back(history_h2d);
+                    specs[next_prefetch].predecessors={miss_read};
+                }
                 if (single_layer) specs[next_prefetch].predecessors.push_back(append);
             }
             for (std::size_t i = 0; i < specs.size(); ++i) specs[i].estimate_ns = estimates[i];
@@ -755,6 +769,16 @@ struct GgmlPrefetch::Impl {
     }
     void release_attention(const char * proof,std::optional<std::uint64_t> device_ns={},const std::function<void()> & before_upload={}) {
         if (!device.attention_pending()) return;
+        if (work->archive_at_attention) {
+            // No successor upload may be submitted until the attention reader retires.
+            // This receipt also covers the last upload event waited on by compute.
+            transport.acknowledge_compute_dependency();
+            device.reap_transfers();
+            const auto now=trace.now();
+            work->dag.complete(history_h2d,now,"attention_upload_dependency");
+            work->dag.complete(current_h2d,now,"attention_upload_dependency");
+            work->dag.start(attention,now);
+        }
         if (device.attention_complete(device.attention_epoch())) {
             work->dag.complete(attention, trace.now(), proof, device_ns);
             if (work->archive_at_attention) {
@@ -781,7 +805,9 @@ struct GgmlPrefetch::Impl {
         while (!events->stopped()) {
             // Clear notifications before inspecting queues/state. A producer
             // arriving after these checks leaves a counter for the next wait.
-            events->acknowledge(); host.poll(); observe_stores();
+            events->acknowledge();
+            if (current->archive_at_attention && !released) device.reap_transfers();
+            host.poll(); observe_stores();
             if (!released) if (const auto receipt=events->poll(current->layer,epoch)) {
                 const char * proof;
                 if (receipt->proof==AttentionProof::device_signal) {
@@ -977,8 +1003,10 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         work->dag.fence({select_task}, impl_->trace.now(), "serial_selection_complete");
         work->dag.start(miss_read, impl_->trace.now());
     } else {
-        if (reuses_sync()) impl_->device.wait_transfers_coalesced(); else impl_->device.wait_transfers();
-        work->dag.complete(history_h2d, impl_->trace.now(), "historical_copy_complete");
+        if (!work->archive_at_attention) {
+            if (reuses_sync()) impl_->device.wait_transfers_coalesced(); else impl_->device.wait_transfers();
+            work->dag.complete(history_h2d, impl_->trace.now(), "historical_copy_complete");
+        }
         if (deferred) impl_->session.stage_device_keys(layer, position, *device);
         else {
             work->dag.start(append, impl_->trace.now());
@@ -1000,7 +1028,8 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
     try {
         if (source) impl_->transport.bind_current(source,current_kv);
         if (deferred) host.remember_selection(layer, position, work->selection);
-        mask = impl_->device.prepare(work->history, work->selection, reuses_sync(),source?&current_kv:nullptr);
+        mask = impl_->device.prepare(work->history, work->selection, reuses_sync(),source?&current_kv:nullptr,
+                                     work->archive_at_attention);
         impl_->transport.clear_current();
     } catch (...) { impl_->transport.clear_current(); throw; }
     for (const auto & lease : work->history) host.unpin(lease);
@@ -1028,6 +1057,11 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         ++impl_->totals.worker_jobs;
         impl_->worker.submit([this, work,epoch] {
             std::lock_guard<std::mutex> lock(impl_->mutex);
+            if (work->archive_at_attention) {
+                if (impl_->session.geometry().layers>1) impl_->next_layer(work);
+                impl_->progress_after_attention(work,epoch);
+                return;
+            }
             bool store_started = false;
             if (reuses_sync()) {
                 auto & host = impl_->session.prefetcher();
@@ -1043,12 +1077,8 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
             }
             bool next_started=false;
             if (work->deferred_archive) {
-                if (!work->archive_at_attention) work->dag.start(kv_d2h,impl_->trace.now());
+                work->dag.start(kv_d2h,impl_->trace.now());
                 if (impl_->session.geometry().layers>1) { impl_->next_layer(work); next_started=true; }
-                if (work->archive_at_attention) {
-                    impl_->progress_after_attention(work,epoch);
-                    return;
-                }
                 impl_->finish_archive(work);
             }
             // Dispatch the remaining I/O tasks at their shared frontier.

@@ -127,6 +127,12 @@ def audit_schedule(path, mode, *, blocks=False):
                 raise ValueError("shared archive completed before attention")
             edges[append] = ["kv_d2h_ready"]
             edges["current_h2d"] = ["kv_projection_to_host", "miss_read_and_reconcile", "history_h2d"]
+            if archive_proof == SHARED_ARCHIVE_PROOF:
+                edges["current_h2d"].remove("history_h2d")
+                edges["attention_until_boundary"].append("history_h2d")
+                edges["next_layer_prefetch"] = ["miss_read_and_reconcile"]
+                if any(names[name]["fence"] != "attention_upload_dependency" for name in ("history_h2d", "current_h2d")):
+                    raise ValueError("CUDA uploads lack a shared attention completion proof")
             if single_layer:
                 edges["next_layer_prefetch"].append(append)
         if names["next_layer_prefetch"]["fence"] in ("shared_attention_buffer_released", "shared_context_capacity_reached"):

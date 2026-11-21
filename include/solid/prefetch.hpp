@@ -70,7 +70,7 @@ public:
     Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t slots_per_head,
                std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace = {});
     ~Prefetcher();
-    void bind_shared_blocks(const std::vector<Half *> & addresses, std::shared_ptr<void> owner,bool attention_shared=false);
+    void bind_shared_blocks(const std::vector<Half *> & addresses, std::shared_ptr<void> owner,bool defer_prediction_slots=false);
     void begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
@@ -125,7 +125,7 @@ private:
     std::uint64_t next_id_ = 1;
     PrefetchStats stats_;
     bool failed_ = false;
-    bool attention_shared_ = false;
+    bool defer_prediction_slots_ = false;
     void check() const;
     void issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch,bool dispatch_now=true);
     SlotLease load(const BlockIdentity & identity, ReadDispatch dispatch,const std::shared_ptr<BlockStage> & stage = {});

@@ -43,6 +43,7 @@ public:
     virtual bool shared_memory() const { return false; }
     virtual bool aliases_host_slots() const { return false; }
     virtual bool binds_host_slots() const { return aliases_host_slots(); }
+    virtual bool defer_prefetch_slots() const { return aliases_host_slots(); }
     virtual Half * host_slot_storage(std::uint32_t) const { return nullptr; }
     virtual std::shared_ptr<void> host_storage_owner() const { return {}; }
 };
@@ -73,7 +74,8 @@ public:
     void stage_ready(const SlotLease & host_lease,const std::shared_ptr<BlockStage> & stage = {});
     void stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage);
     std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
-                              bool deferred_upload = false,const CurrentDeviceKv * current = nullptr);
+                              bool deferred_upload = false,const CurrentDeviceKv * current = nullptr,
+                              bool keep_history_in_flight = false);
     // Called only after the backend confirms attention completion.
     bool attention_complete(std::uint64_t epoch);
     std::uint64_t attention_epoch() const { return epoch_; }

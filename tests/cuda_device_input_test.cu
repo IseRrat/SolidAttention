@@ -186,6 +186,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
             "CUDA graph replay lost attention completion receipts");
         require(schedule.archive_attention_reuses==16 && schedule.archive_separate_completions==0,
             "CUDA KV archive did not share the attention completion");
+        require(schedule.stream_waits==16 && schedule.batch_waits==0,
+            "CUDA decode blocked the host on an attention upload batch");
     } else if (mode==solid::ScheduleMode::overlap) {
         require(schedule.archive_attention_reuses==0 && schedule.archive_separate_completions==16,
             "CUDA overlap did not retain independent KV archive completions");
