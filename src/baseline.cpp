@@ -536,6 +536,8 @@ int main(int argc, char ** argv) {
                     {"historical_upload_batches",schedule.historical_upload_batches},
                     {"historical_upload_blocks",schedule.historical_upload_blocks},
                     {"historical_upload_ranges",schedule.historical_upload_ranges},
+                    {"archive_attention_reuses",schedule.archive_attention_reuses},
+                    {"archive_separate_completions",schedule.archive_separate_completions},
                     {"backend_compute_waits", schedule.backend_compute_waits}, {"staging_buffer_bytes", schedule.staging_bytes}
                 };
                 const auto schedule_trace = config.output.parent_path() / "schedule.jsonl";

@@ -180,8 +180,16 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
     require(after.direct_decode_queries==16 && after.ranking.device_builder_queries==16 && after.ranking.device_builder_appends==16 &&
         after.ranking.device_rank_queries>0 && after.ranking.query_upload_bytes==before.ranking.query_upload_bytes &&
         after.ranking.builder_key_upload_bytes==before.ranking.builder_key_upload_bytes,"direct decode re-uploaded Q/K or skipped device inputs");
-    if (mode==solid::ScheduleMode::sync_reuse) require(cache.schedule_stats().device_event_completions+cache.schedule_stats().device_boundary_fallbacks==16,
-        "CUDA graph replay lost attention completion receipts");
+    const auto schedule=cache.schedule_stats();
+    if (mode==solid::ScheduleMode::sync_reuse) {
+        require(schedule.device_event_completions+schedule.device_boundary_fallbacks==16,
+            "CUDA graph replay lost attention completion receipts");
+        require(schedule.archive_attention_reuses==16 && schedule.archive_separate_completions==0,
+            "CUDA KV archive did not share the attention completion");
+    } else if (mode==solid::ScheduleMode::overlap) {
+        require(schedule.archive_attention_reuses==0 && schedule.archive_separate_completions==16,
+            "CUDA overlap did not retain independent KV archive completions");
+    }
     ggml_backend_sched_reset(scheduler.get());
 }
 }

@@ -17,8 +17,10 @@ NAMES = ("naive", "overlap", "sync-reuse")
 TASKS = {"q_gpu_ready", "q_d2h_ready", "selection", "selection_ready", "kv_projection_to_host",
          "kv_d2h_ready", "miss_read_and_reconcile", "history_h2d", "append_current_kv",
          "append_and_selection", "current_h2d", "attention_until_boundary", "buffered_ssd_store", "next_layer_prefetch"}
-DEVICE_PROOFS = {"attention_until_boundary": "attention_device_event", "q_gpu_ready": "query_device_projection",
-                 "kv_projection_to_host": "kv_device_ready", "kv_d2h_ready": "kv_archive_copy_complete"}
+SHARED_ARCHIVE_PROOF = "kv_archive_attention_complete"
+DEVICE_PROOFS = {"attention_until_boundary": ("attention_device_event",), "q_gpu_ready": ("query_device_projection",),
+                 "kv_projection_to_host": ("kv_device_ready",),
+                 "kv_d2h_ready": ("kv_archive_copy_complete", SHARED_ARCHIVE_PROOF)}
 
 
 def integer(value, positive=False):
@@ -75,8 +77,8 @@ def audit_schedule(path, mode, *, blocks=False):
                 raise ValueError("invalid schedule completion")
             task.update(state="complete", end=now, fence=item["fence"])
             if "device_ns" in item:
-                proof = "copy_ticket_complete" if blocks and task["name"].startswith("block_h2d_") else DEVICE_PROOFS.get(task["name"])
-                if proof is None or item["fence"] != proof:
+                valid = ("copy_ticket_complete",) if blocks and task["name"].startswith("block_h2d_") else DEVICE_PROOFS.get(task["name"], ())
+                if item["fence"] not in valid:
                     raise ValueError("device interval lacks a matching completion proof")
                 task["device_ns"]=integer(item["device_ns"])
         else:
@@ -113,10 +115,16 @@ def audit_schedule(path, mode, *, blocks=False):
                  "current_h2d": [append, "history_h2d"] if serial else [append],
                  "attention_until_boundary": ["current_h2d"], "buffered_ssd_store": [append],
                  "next_layer_prefetch": ["current_h2d"]}
-        if names["kv_d2h_ready"]["fence"] == "kv_archive_copy_complete":
+        archive_proof = names["kv_d2h_ready"]["fence"]
+        if archive_proof in ("kv_archive_copy_complete", SHARED_ARCHIVE_PROOF):
             if serial or names["kv_projection_to_host"]["fence"] != "kv_device_ready":
                 raise ValueError("device archive lacks its KV production proof")
-            edges["kv_d2h_ready"] = ["current_h2d"]
+            if archive_proof == "kv_archive_copy_complete":
+                edges["kv_d2h_ready"] = ["current_h2d"]
+            elif mode != "overlap+sync_reuse":
+                raise ValueError("shared archive proof outside sync reuse mode")
+            elif names["kv_d2h_ready"]["end"] < names["attention_until_boundary"]["end"]:
+                raise ValueError("shared archive completed before attention")
             edges[append] = ["kv_d2h_ready"]
             edges["current_h2d"] = ["kv_projection_to_host", "miss_read_and_reconcile", "history_h2d"]
             if single_layer:

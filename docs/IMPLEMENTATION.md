@@ -114,11 +114,13 @@
 
 3. **当前行安装与主机归档**
 
-   已将当前设备行装入 bank，保留原尾块前缀，只复制缺口。安装后 attention 和 D2H 归档分别推进，归档追加后提交聚合回写，多层时可提前派发下一层 SSD 读取。最后一层到达上下文容量末尾时，完成后继预取任务的收尾记录，停止向容量外的位置发起预测，当前 attention、归档及回写照常完成。
+   当前设备行装入显存 KV 缓冲区时保留尾块前缀，只复制缺口。CUDA 的 `overlap+sync_reuse` 模式从连续的 FP16 投影一次下载所有 KV 头。下载在 attention 的计算流上排在等待历史 KV 上传之前，可与另一条流上的上传重叠。协调线程收到 attention 完成通知后读取已下载的当前行，将其追加到主机缓冲区，释放上一层显存槽位，推进下一层上传和当前层聚合回写。多层模型的下一层 SSD 读取可提前派发。普通 `overlap` 保留独立的归档完成点。上下文容量末尾照常完成当前 attention、归档和回写。
+
+   实验结果记录共享 attention 完成点和单独确认归档的次数。调度轨迹核对脚本校验共享归档对应的投影依赖。CUDA 回归用例核对两种调度模式的完成次数及 attention 输出。
 
    设备 Q 提前选择入口支持同步、异步调用，并显式指定后续 KV 的归档方式。已下载到主机的 FP16 KV 采用“下载完成→追加→当前行安装”的依赖，进入 FP16 追加函数；设备 KV 采用“当前行安装→下载归档→追加”的依赖，默认模型图使用这一方式。两种入口均保留选择位置、输入类型和归档方式的一致性检查。
 
-   [ggml_prefetch.hpp](../include/solid/ggml_prefetch.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[session.cpp](../src/session.cpp)、[device_cache.cpp](../src/device_cache.cpp)。
+   [ggml_prefetch.hpp](../include/solid/ggml_prefetch.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[session.cpp](../src/session.cpp)、[device_cache.cpp](../src/device_cache.cpp)、[scheduler.hpp](../include/solid/scheduler.hpp)、[baseline.cpp](../src/baseline.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)、[cuda_device_input_test.cu](../tests/cuda_device_input_test.cu)。
 
 4. **Attention 完成通知**
 
