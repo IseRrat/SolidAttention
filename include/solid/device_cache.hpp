@@ -99,7 +99,7 @@ private:
     std::ofstream trace_;
     DeviceCacheStats stats_;
     std::uint64_t epoch_ = 0;
-    void poll_transfers(bool wait);
+    void poll_transfers(bool wait,std::optional<std::uint64_t> through = {});
     void retain(const std::vector<BlockIdentity> & identities);
     SlotLease upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage = {},
                      const std::function<void()> & before_upload = {});

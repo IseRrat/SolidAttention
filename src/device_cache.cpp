@@ -62,10 +62,10 @@ void DeviceCache::event(const char * name, const SlotLease & lease,const Current
     trace_ << "}\n";
     if (!trace_) throw std::runtime_error("device residency trace write failed");
 }
-void DeviceCache::poll_transfers(bool wait) {
+void DeviceCache::poll_transfers(bool wait,std::optional<std::uint64_t> through) {
     std::exception_ptr error;
     for (auto it = transfers_.begin(); it != transfers_.end();) {
-        if (!transport_.complete(it->ticket, wait)) { ++it; continue; }
+        if (!transport_.complete(it->ticket,wait && (!through || it->ticket<=*through))) { ++it; continue; }
         const auto interval = it->slots.size()==1 ? transport_.copy_interval() : std::optional<std::uint64_t>{};
         for (const auto & slot : it->slots) {
             if (slot.host) host_.unpin(*slot.host);
@@ -328,8 +328,19 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
             }
         }
     } else for (const auto & lease:host_leases) actual.push_back(lease.identity);
-    if (keep_history_in_flight) reap_transfers();
-    else wait_transfers();
+    if (keep_history_in_flight) {
+        reap_transfers();
+        // Refreshing a partially uploaded tail changes its slot generation.
+        // Retire only through the last pending tail before refreshing it.
+        auto last_tail=transfers_.end();
+        for (auto it=transfers_.begin();it!=transfers_.end();++it) {
+            if (std::any_of(it->slots.begin(),it->slots.end(),[&](const TransferSlot & slot) {
+                    return slot.device.identity.layer==current->layer &&
+                        slot.device.identity.block==current->position/geometry_.block_tokens;
+                })) last_tail=it;
+        }
+        if (last_tail!=transfers_.end()) poll_transfers(true,last_tail->ticket);
+    } else wait_transfers();
     std::vector<BlockIdentity> current_ids;
     if (current) for (std::uint32_t h=0;h<geometry_.heads;++h) {
         const BlockIdentity id{current->layer,h,current->position/geometry_.block_tokens,current->position%geometry_.block_tokens+1};
