@@ -180,7 +180,7 @@
 
    Offload 和 Offload＋Sparse 将选定 KV 直接写入 ggml 的目标缓冲区。同块连续行合并复制，只清零未使用的 KV 尾部，并分别填充各 query head 的有效 mask。纯卸载在关闭选块轨迹时按位置顺序遍历 KV。图回归覆盖分离及交织布局、磁盘读取、密集和稀疏 attention。[session.hpp](../include/solid/session.hpp)、[session.cpp](../src/session.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
 
-   CUDA 对照计划支持按输入长度独立设置 Offload＋Sparse 预算。当前对照配置在 1k、2k 保留完整上下文，4k 起固定为 1024。SolidAttention 使用原有预算规则。计划测试覆盖两条路径的独立配置。[experiments.py](../scripts/experiments.py)、[cuda-paper.json](../configs/experiments/cuda-paper.json)、[test_experiments.py](../tests/test_experiments.py)。
+   CUDA 端到端对照中的 Offload＋Sparse 与 SolidAttention 共用自动预算。输入不足 4096 token 时取输入长度的 25%，达到 4096 token 后固定为 1024。两者使用相同的开头、近期和历史 token 预算分配。[cuda-paper.json](../configs/experiments/cuda-paper.json)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
 
    批量运行器识别当前容器的 cgroup 内存和 swap 限额。两个限额均与实验配置一致时，由推理进程继承容器限额，汇总前复核推理进程的实际限额。 [experiment_runtime.py](../scripts/experiment_runtime.py)、[experiments.py](../scripts/experiments.py)。
 
