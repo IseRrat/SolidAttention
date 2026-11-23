@@ -727,7 +727,9 @@ public:
             return result;
         }
         const auto count = candidates.blocks.size();
-        const auto stride = static_cast<std::uint32_t>(std::min<std::size_t>(candidates.remaining, count));
+        const auto smallest = *std::min_element(candidates.tokens.begin(), candidates.tokens.end());
+        const auto max_selected = (static_cast<std::uint64_t>(candidates.remaining) + smallest - 1) / smallest;
+        const auto stride = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_selected, count));
         const auto lists = candidates.shared_heads ? 1u : geometry_.heads;
         const auto bytes = product(product(lists, stride), sizeof(std::uint64_t));
         DeviceScope scope(device_);

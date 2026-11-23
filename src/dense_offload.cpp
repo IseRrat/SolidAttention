@@ -4,6 +4,7 @@
 #include "ggml.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
+#include "ggml-cpu.h"
 
 #include <chrono>
 #include <limits>
@@ -17,7 +18,7 @@ struct DenseOffload::Impl {
     std::unique_ptr<ggml_context, decltype(&ggml_free)> context{nullptr, ggml_free};
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer{nullptr, ggml_backend_buffer_free};
     ggml_tensor * bank = nullptr;
-    std::vector<Half> staging;
+    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> staging{nullptr, ggml_backend_buffer_free};
     Half * aligned = nullptr;
     std::unique_ptr<AsyncReader> reader;
     DeviceCacheStats stats;
@@ -44,12 +45,16 @@ struct DenseOffload::Impl {
         constexpr std::size_t alignment = 4096;
         const auto bytes = ggml_nbytes(bank);
         if (bytes > SIZE_MAX - alignment) throw std::overflow_error("dense KV staging size");
-        staging.resize((bytes + alignment) / sizeof(Half));
-        void * pointer = staging.data();
-        auto space = staging.size() * sizeof(Half);
+        auto * device = ggml_backend_get_device(backend);
+        auto * host_type = device ? ggml_backend_dev_host_buffer_type(device) : nullptr;
+        if (!host_type || !ggml_backend_buft_is_host(host_type)) host_type = ggml_backend_cpu_buffer_type();
+        staging.reset(ggml_backend_buft_alloc_buffer(host_type, bytes + alignment));
+        if (!staging) throw std::runtime_error("dense KV staging allocation failed");
+        void * pointer = ggml_backend_buffer_get_base(staging.get());
+        auto space = ggml_backend_buffer_get_size(staging.get());
         aligned = static_cast<Half *>(std::align(alignment, bytes, pointer, space));
         if (!aligned) throw std::logic_error("dense KV staging alignment");
-        stats.staging_bytes = staging.capacity() * sizeof(Half);
+        stats.staging_bytes = ggml_backend_buffer_get_size(staging.get());
         if (uring_available() && ggml_backend_dev_type(ggml_backend_get_device(backend)) != GGML_BACKEND_DEVICE_TYPE_CPU) {
             reader = make_uring_reader(2 * geometry.heads);
         }

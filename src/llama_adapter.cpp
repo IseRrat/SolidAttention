@@ -437,11 +437,12 @@ struct AttentionNode::Impl {
             const auto group = heads / self.session.geometry().heads;
             const auto slots = ggml_nelements(destination->src[0]) / self.session.geometry().heads;
             const auto * markers = static_cast<const Half *>(destination->src[0]->data);
-            for (std::uint32_t q = 0; q < heads; ++q) {
+            for (std::uint32_t kv_head = 0; kv_head < self.session.geometry().heads; ++kv_head) {
+                const auto q = kv_head * group;
                 auto * row = indices + q * local;
                 std::fill_n(row, local, -1);
                 for (std::int64_t i = 0; i < slots; ++i) {
-                    const auto marker = static_cast<std::uint32_t>(from_half(markers[q / group * slots + i]));
+                    const auto marker = static_cast<std::uint32_t>(from_half(markers[kv_head * slots + i]));
                     if (!marker) continue;
                     if (marker <= local - recent || marker > local || row[marker - 1] != -1) {
                         throw std::logic_error("invalid or duplicate InfLLM recent slot");
@@ -452,6 +453,13 @@ struct AttentionNode::Impl {
                     if (row[i] < 0) throw std::logic_error("missing InfLLM recent slot");
                 }
                 std::fill_n(row, local - recent, 0);
+                for (std::uint32_t head = q + 1; head < q + group; ++head) {
+                    auto * target = indices + head * local;
+                    std::fill_n(target, local - recent, 0);
+                    for (std::uint32_t i = local - recent; i < local; ++i) {
+                        target[i] = row[i] + static_cast<std::int32_t>((head - q) * slots);
+                    }
+                }
             }
         } catch (...) {
             self.failure->capture(std::current_exception(), self.layer);

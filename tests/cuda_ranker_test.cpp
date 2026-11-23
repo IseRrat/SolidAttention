@@ -39,7 +39,7 @@ void run(int device,std::uint32_t dimension) {
             candidates.remaining = left;
             for (std::uint64_t block = 0; block < count; ++block) {
                 candidates.blocks.push_back(block);
-                candidates.tokens.push_back(static_cast<std::uint32_t>(block%32+1));
+                candidates.tokens.push_back(mode == 0 ? g.block_tokens : static_cast<std::uint32_t>(block%32+1));
             }
             const auto actual = ranker->rank(mode%2, q, candidates);
             require(actual.size() == g.heads, "CUDA rank head count");
