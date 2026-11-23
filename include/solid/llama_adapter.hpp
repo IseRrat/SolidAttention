@@ -12,6 +12,7 @@ struct llama_model;
 struct llm_graph_context;
 class llm_graph_input_attn_kv;
 struct ggml_context;
+struct ggml_cgraph;
 struct ggml_tensor;
 struct ggml_backend;
 struct ggml_backend_sched;
@@ -20,6 +21,27 @@ struct llm_graph_qkv;
 
 namespace solid {
 struct ProjectionIntervals;
+class InfllmSelectedCache;
+class DenseOffload;
+std::shared_ptr<InfllmSelectedCache> make_infllm_selected_cache(AttentionSession & session, ggml_backend * backend);
+class SparseBaselineLookahead {
+public:
+    static constexpr std::size_t queue_depth = 64;
+    SparseBaselineLookahead(AttentionSession & session, InfllmSelectedCache & workspace, bool use_uring);
+    void begin(std::uint32_t layer, std::uint64_t position);
+    void upload(std::uint32_t layer, std::uint64_t position);
+    void start_writeback(std::uint32_t layer);
+    void completed(std::uint32_t layer, std::uint64_t position);
+    AsyncReader * reader() const { return reader_.get(); }
+    void finish_decode() const;
+    void join() { worker_.join(); }
+private:
+    AttentionSession & session_;
+    InfllmSelectedCache & workspace_;
+    std::unique_ptr<AsyncReader> reader_;
+    std::optional<std::pair<std::uint32_t, std::uint64_t>> frame_;
+    TaskWorker worker_;
+};
 struct AttentionFrame { std::vector<std::uint64_t> positions; };
 
 class AttentionFailure {
@@ -37,11 +59,12 @@ class AttentionNode {
 public:
     AttentionNode(AttentionSession & session, std::shared_ptr<AttentionFrame> frame, std::uint32_t layer,
                   float scale, std::shared_ptr<AttentionFailure> failure = {}, bool gathered = false, class GgmlPrefetch * prefetch = nullptr,
-                  ProjectionIntervals * timing = nullptr);
+                  ProjectionIntervals * timing = nullptr, InfllmSelectedCache * selected_cache = nullptr,
+                  DenseOffload * dense = nullptr, SparseBaselineLookahead * sparse_lookahead = nullptr);
     ~AttentionNode();
     ggml_tensor * build(ggml_context * context, ggml_tensor * query, ggml_tensor * key, ggml_tensor * value,
                        ggml_tensor * packed_kv = nullptr, ggml_backend_sched * scheduler = nullptr,
-                       ggml_backend * decode_backend = nullptr);
+                       ggml_backend * decode_backend = nullptr, ggml_cgraph * graph = nullptr);
     void check() const;
     bool can_reuse(std::uint64_t next_position) const;
     ggml_tensor * host_node() const;
@@ -69,6 +92,7 @@ public:
     void finish();
     SessionStats stats() const;
     SparseBudget budget() const;
+    const std::optional<RelativeRope> & relative_rope() const;
     std::unique_ptr<AttentionNode> node(std::shared_ptr<AttentionFrame> frame, std::uint32_t layer, float scale,
                                       bool gathered = false, ggml_backend * backend = nullptr);
     bool gathered_decode(std::uint64_t position) const;
@@ -81,6 +105,7 @@ public:
     std::uint64_t projection_initialization_ns() const;
     std::vector<std::string> projection_weight_types() const;
     bool prefetch_enabled() const;
+    bool dense_offload_enabled() const;
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);
     bool observe(ggml_tensor * tensor, bool ask) noexcept;
     void quiesce();

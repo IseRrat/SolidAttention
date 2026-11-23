@@ -1,20 +1,20 @@
 {
   "schema_version": 1,
   "models": [
-    {"name": "qwen2.5-7b", "config": "../qwen2.5-7b-q4_k_m.json", "corpus": "../../data/wikitext-2.txt", "tokens": "../../data/wikitext2-qwen.tokens.json"}
+    {"name": "qwen2.5-7b", "config": "../qwen2.5-7b-q4_0.json", "corpus": "../../data/wikitext-2.txt", "tokens": "../../data/wikitext2-qwen-q4_0.tokens.json"}
   ],
   "conditions": [
-    {"name": "cuda-16g", "session_root": "../../results/ssd-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "swap_max_bytes": 0, "cpus": [], "background": null}
+    {"name": "cuda-8g-16g", "session_root": "../../results/ssd-kv", "cache_state": "os-managed", "memory_max_bytes": 17179869184, "cuda_memory_max_mib": 8192, "swap_max_bytes": 0, "cpus": [], "background": null}
   ],
   "repeats": 5,
   "warmups": 1,
   "seed": 2026,
   "max_new_tokens": 512,
   "suites": [
-    {"name": "end-to-end", "lengths": [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072], "variants": ["offload", "offload-sparse", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-16g"]},
-    {"name": "memory", "lengths": [16384, 32768, 65536, 131072], "variants": ["origin", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-16g"]},
-    {"name": "in-memory", "lengths": [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072], "variants": ["indram", "indram-sparse", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-16g"]},
-    {"name": "prefetch", "lengths": [16384], "variants": ["interleaved", "prefetch"], "blocks": [32], "budgets": [1024], "conditions": ["cuda-16g"]},
-    {"name": "sensitivity", "lengths": [16384], "variants": ["solid"], "blocks": [16, 32, 64, 128], "budgets": [1024, 2048, 3072, 4096], "conditions": ["cuda-16g"]}
+    {"name": "end-to-end", "lengths": [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072], "variants": ["offload", "offload-sparse", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-8g-16g"]},
+    {"name": "memory", "lengths": [16384, 32768, 65536, 131072], "variants": ["origin", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-8g-16g"]},
+    {"name": "in-memory", "lengths": [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072], "variants": ["indram", "indram-sparse", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-8g-16g"]},
+    {"name": "prefetch", "lengths": [16384], "variants": ["interleaved", "prefetch"], "blocks": [32], "budgets": [1024], "conditions": ["cuda-8g-16g"]},
+    {"name": "sensitivity", "lengths": [16384], "variants": ["solid"], "blocks": [16, 32, 64, 128], "budgets": [1024, 2048, 3072, 4096], "conditions": ["cuda-8g-16g"]}
   ]
 }

@@ -84,17 +84,28 @@ def audit_run(result_path, source_config=None, source_sha=None):
     if "prompt_token_ids" in effective and result["prompt_token_ids"] != effective["prompt_token_ids"]:
         raise ValueError("result prompt token IDs differ")
     if result.get("kv_dtype", "f16") != effective["kv_dtype"]: raise ValueError("result KV precision differs")
+    weight_dtype = effective.get("kv_projection_weight_dtype")
+    if weight_dtype and result.get("kv_projection_weight_dtype") != weight_dtype:
+        raise ValueError("K/V projection weight precision differs")
     configured = effective.get("attention")
     if bool(configured) != ("attention" in result): raise ValueError("result attention mode differs")
     if configured:
         actual = result["attention"]
-        defaults = {"layout":"separate","fuse_kv_projection":False,"prefetch":False,"schedule":"naive","block_tokens":32,"representative_count":1}
+        defaults = {"layout":"separate","fuse_kv_projection":False,"prefetch":False,"schedule":"naive","block_tokens":32,
+                    "representative_count":1,"infllm_attention":False}
         for key in ("storage","sparse",*defaults):
             if actual.get(key,defaults.get(key)) != configured.get(key,defaults.get(key)): raise ValueError(f"result attention setting differs: {key}")
         for key in ("context_budget_tokens","init_tokens","local_tokens"):
             if key in configured and actual[key] != configured[key]: raise ValueError("result context budget differs")
         expected_io = "direct_decode_reads" if configured.get("direct_decode_reads", False) else "buffered"
         if actual.get("io_mode", "buffered") != expected_io: raise ValueError("result KV I/O mode differs")
+        if configured.get("infllm_attention") and configured.get("prefill_backend") == "cuda":
+            if actual.get("prefill_backend") != "cuda_infllm_batched":
+                raise ValueError("InfLLM result did not execute CUDA sparse prefill")
+        if weight_dtype and actual.get("fuse_kv_projection"):
+            weight_types = actual.get("projection_weight_types", [])
+            if not weight_types or set(weight_types) != {weight_dtype}:
+                raise ValueError("fused K/V projection weight precision differs")
     if result.get("build_info") != run.get("build_info") or result["upstream_commit"] != run["upstream_commit"]:
         raise ValueError("result build provenance differs")
     return result, run, effective

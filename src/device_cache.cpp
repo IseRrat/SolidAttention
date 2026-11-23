@@ -72,7 +72,8 @@ void DeviceCache::poll_transfers(bool wait,std::optional<std::uint64_t> through)
             const bool current = slots_.complete(slot.device);
             if (!current) ++stats_.stale_events;
             try {
-                if (it->stage) it->stage->copy_complete(slot.device.identity,"copy_ticket_complete",interval);
+                const auto & stage = slot.stage ? slot.stage : it->stage;
+                if (stage) stage->copy_complete(slot.device.identity,"copy_ticket_complete",interval);
                 if (current) event("upload_complete",slot.device);
             } catch (...) { if (!error) error=std::current_exception(); }
         }
@@ -104,8 +105,18 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
     }
     if (existing) {
         if (stage) {
-            if (slots_.entry(existing->slot).producer) throw std::logic_error("stage observed device residency before copy completion");
-            stage->copy_started(host.identity); stage->copy_complete(host.identity,"device_resident");
+            stage->copy_started(host.identity);
+            if (slots_.entry(existing->slot).producer) {
+                bool attached = false;
+                for (auto & transfer : transfers_) for (auto & slot : transfer.slots) {
+                    if (slot.device == *existing) {
+                        if (slot.stage) throw std::logic_error("device upload already has a formal consumer");
+                        slot.stage = stage;
+                        attached = true;
+                    }
+                }
+                if (!attached) throw std::logic_error("device upload lost its completion receipt");
+            } else stage->copy_complete(host.identity,"device_resident");
         }
         return *existing;
     }
@@ -265,11 +276,23 @@ void DeviceCache::stage(const std::vector<SlotLease> & host_leases) {
 void DeviceCache::begin_stage(const std::vector<BlockIdentity> & identities,std::optional<CurrentBlock> current) {
     if (!attention_.empty()) throw std::logic_error("streamed stage before previous attention completed");
     if (current && (current->layer>=geometry_.layers || current->position>=geometry_.capacity_tokens)) throw std::invalid_argument("current prefix stage position");
-    wait_transfers();
     auto keep=identities;
-    if (current) for (std::uint32_t head=0;head<geometry_.heads;++head) {
-        const BlockIdentity identity{current->layer,head,current->position/geometry_.block_tokens,current->position%geometry_.block_tokens+1};
-        if (const auto old=prefix(identity)) keep.push_back(old->identity);
+    if (current) for (std::uint32_t i = 0; i < slots_.size(); ++i) {
+        const auto & entry = slots_.entry(i);
+        if (entry.state != SlotState::free && entry.identity.layer == current->layer &&
+            entry.identity.block == current->position / geometry_.block_tokens) keep.push_back(entry.identity);
+    }
+    if (transport_.defer_prefetch_slots() && !transport_.aliases_host_slots()) {
+        reap_transfers();
+        std::optional<std::uint64_t> reuse_ticket;
+        for (const auto & transfer : transfers_) {
+            if (std::any_of(transfer.slots.begin(), transfer.slots.end(), [&](const TransferSlot & slot) {
+                return std::find(keep.begin(), keep.end(), slot.device.identity) == keep.end();
+            })) reuse_ticket = transfer.ticket;
+        }
+        if (reuse_ticket) poll_transfers(true, reuse_ticket);
+    } else {
+        wait_transfers();
     }
     retain(keep);
 }
@@ -294,7 +317,8 @@ void DeviceCache::stage_ready_batch(const std::vector<SlotLease> & leases,const 
     upload_batch(leases,stage);
 }
 std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
-                                       bool deferred_upload,const CurrentDeviceKv * current,bool keep_history_in_flight) {
+                                       bool deferred_upload,const CurrentDeviceKv * current,bool keep_history_in_flight,
+                                       std::uint32_t local_window) {
     if (!attention_.empty()) throw std::logic_error("previous device attention has not completed");
     if (keep_history_in_flight && (!deferred_upload || !current || !transport_.defer_prefetch_slots() || transport_.aliases_host_slots())) {
         throw std::logic_error("in-flight history requires a fenced device copy queue");
@@ -367,6 +391,8 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
     if (!deferred_upload) wait_transfers();
     const auto tokens = tokens_per_head();
     std::vector<Half> mask(static_cast<std::size_t>(tokens) * query_heads_, Half{0xfc00});
+    const auto marker_offset = mask.size();
+    if (local_window) mask.resize(marker_offset + static_cast<std::size_t>(tokens) * geometry_.heads, Half{0});
     const auto group = query_heads_ / geometry_.heads;
     for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
         if (selection[head].positions.empty()) throw std::invalid_argument("empty device attention selection");
@@ -377,6 +403,11 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
             if (found == used.end() || position % geometry_.block_tokens >= found->identity.version) throw std::invalid_argument("device selection has no matching versioned slot");
             const auto row = (found->slot % slots_.slots_per_head()) * geometry_.block_tokens + position % geometry_.block_tokens;
             for (auto q = head * group; q < (head + 1) * group; ++q) mask[static_cast<std::size_t>(q) * tokens + row] = 0;
+            const auto distance = selection[head].positions.back() - position;
+            if (distance < local_window) {
+                mask[marker_offset + static_cast<std::size_t>(head) * tokens + row] =
+                    to_half(static_cast<float>(local_window - distance));
+            }
         }
     }
     if (epoch_ == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("attention epoch exhausted");

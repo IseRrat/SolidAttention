@@ -54,6 +54,7 @@ struct DeviceCacheStats {
     std::uint64_t overwritten_blocks = 0;
     std::uint64_t stale_events = 0;
     std::uint64_t resident_bytes = 0;
+    std::uint64_t staging_bytes = 0;
     std::uint64_t shared_resident_bytes = 0, shared_host_copy_bytes = 0;
     std::uint64_t current_device_rows=0,current_device_bytes=0,current_host_bytes=0;
     std::uint64_t refreshed_tails=0,retained_prefix_bytes=0;
@@ -75,7 +76,7 @@ public:
     void stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage);
     std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
                               bool deferred_upload = false,const CurrentDeviceKv * current = nullptr,
-                              bool keep_history_in_flight = false);
+                              bool keep_history_in_flight = false,std::uint32_t local_window = 0);
     // Called only after the backend confirms attention completion.
     bool attention_complete(std::uint64_t epoch);
     std::uint64_t attention_epoch() const { return epoch_; }
@@ -86,7 +87,11 @@ public:
     DeviceCacheStats stats() const;
     std::optional<SlotLease> find(const BlockIdentity & id) const { return slots_.find(id); }
 private:
-    struct TransferSlot { std::optional<SlotLease> host; SlotLease device; };
+    struct TransferSlot {
+        std::optional<SlotLease> host;
+        SlotLease device;
+        std::shared_ptr<BlockStage> stage = {};
+    };
     struct Transfer { std::uint64_t ticket; std::vector<TransferSlot> slots; std::shared_ptr<BlockStage> stage; };
     Prefetcher & host_;
     KvGeometry geometry_;

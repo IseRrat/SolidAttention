@@ -75,7 +75,7 @@ public:
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
                                          const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {},
-                                         bool keep_tail = false, const ReadyBatch & batch = {});
+                                         bool keep_tail = false, const ReadyBatch & batch = {}, bool admit_before_stage = false);
     void remember_selection(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     void poll(bool wait = false);
     const KvBlock & block(const SlotLease & lease) const;
@@ -129,6 +129,7 @@ private:
     bool defer_prediction_slots_ = false;
     void check() const;
     void issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch,bool dispatch_now=true);
+    void issue_missing(const SlotLease & lease, ReadDispatch dispatch, const std::shared_ptr<BlockStage> & stage, bool dispatch_now);
     SlotLease load(const BlockIdentity & identity, ReadDispatch dispatch,const std::shared_ptr<BlockStage> & stage = {});
     void promote(const SlotLease & lease, ReadDispatch dispatch);
     std::optional<SlotLease> prefix(const BlockIdentity & identity) const;
@@ -143,6 +144,6 @@ private:
     std::vector<SlotLease> resolve_impl(std::uint32_t layer, std::uint64_t position,
                                        const std::vector<HeadSelection> & actual, bool historical,
                                        const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {},
-                                       const ReadyBatch & batch = {});
+                                       const ReadyBatch & batch = {}, bool admit_before_stage = false);
 };
 } // namespace solid

@@ -56,6 +56,33 @@ solid::IoStats run(solid::KvLayout layout) {
     delta.read_bytes -= before.read_bytes;
     return delta;
 }
+
+void contiguous_plane_reads() {
+    const solid::KvGeometry g{1, 2, 4, 3, 13, 64, solid::KvLayout::separate, true};
+    solid::FileKvStore store(g, std::make_unique<File>(), 4 * 2 * 2 * 4 * sizeof(solid::Half));
+    constexpr std::size_t width = 4;
+    for (std::uint64_t p = 0; p < 11; ++p) {
+        std::vector<solid::Half> kv(16);
+        for (std::size_t i = 0; i < kv.size(); ++i) kv[i] = static_cast<solid::Half>(p * 16 + i);
+        store.append_interleaved(0, p, kv);
+    }
+    // Rows 1–7 are committed. Rows 8–10 still live in the write buffer.
+    std::vector<solid::Half> keys(40), values(40), interleaved(80), scratch;
+    const auto before = store.io_stats();
+    store.read_rows(0, 1, 1, 10, keys.data(), values.data(), scratch);
+    require(store.io_stats().read_requests - before.read_requests == 2, "one read per committed plane");
+    require(store.io_stats().read_bytes - before.read_bytes == 7 * 2 * width * sizeof(solid::Half), "dirty rows were read from disk");
+    store.read_rows(0, 1, 1, 10, interleaved.data(), nullptr, scratch);
+    for (std::size_t p = 0; p < 10; ++p) for (std::size_t d = 0; d < width; ++d) {
+        const auto k = (p + 1) * 16 + 8 + d;
+        require(keys[p * width + d] == k && values[p * width + d] == k + width, "contiguous plane row identity");
+        require(interleaved[p * 2 * width + d] == k && interleaved[(p * 2 + 1) * width + d] == k + width,
+                "prefill tile row identity");
+    }
+    solid::KvBlock block;
+    store.read(0, 1, 2, block);
+    require(block.key(2)[0] == keys[7 * width], "block and range views disagree at dirty boundary");
+}
 }
 int main() {
     try {
@@ -63,6 +90,7 @@ int main() {
         require(separate.read_requests == 32 && interleaved.read_requests == 16, "committed block request count");
         require(separate.read_bytes == interleaved.read_bytes && interleaved.read_bytes == 20480, "logical payload byte count");
         require(separate.write_requests == 2 * interleaved.write_requests && separate.write_bytes == interleaved.write_bytes, "write request consolidation");
+        contiguous_plane_reads();
         std::cout << "interleaved payload, aligned offsets, tail and request accounting checks passed\n";
         return 0;
     } catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }

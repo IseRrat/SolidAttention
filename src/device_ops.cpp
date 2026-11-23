@@ -11,6 +11,7 @@ void forward(ggml_tensor * output, int ith, int, void *) {
         case DeviceOp::query_token:
         case DeviceOp::kv_token: *static_cast<float *>(output->data) = 0; break;
         case DeviceOp::release_mask:
+        case DeviceOp::attention_result:
         case DeviceOp::prefill_result:
             if (output->data!=output->src[0]->data) std::memcpy(output->data, output->src[0]->data, ggml_nbytes(output));
             break;
@@ -31,7 +32,7 @@ void forward(ggml_tensor * output, int ith, int, void *) {
 }
 ggml_tensor * make(ggml_context * context, ggml_type type, const std::int64_t * shape, ggml_tensor ** sources,
                    int count, DeviceOp kind, const char * name) {
-    auto * output = kind==DeviceOp::prefill_result?
+    auto * output = kind==DeviceOp::prefill_result || kind==DeviceOp::attention_result?
         ggml_custom_inplace(context,sources[0],sources+1,count-1,forward,1,nullptr):
         ggml_custom_4d(context,type,shape[0],shape[1],shape[2],shape[3],sources,count,forward,1,nullptr);
     const DeviceOpBinding binding{DeviceOpBinding{}.magic,1,kind};
@@ -44,6 +45,10 @@ ggml_tensor * make(ggml_context * context, ggml_type type, const std::int64_t * 
 ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query) {
     const std::int64_t shape[]{1,1,1,1};
     return make(context,GGML_TYPE_F32,shape,&query,1,DeviceOp::query_token,"solid_device_query_token");
+}
+ggml_tensor * device_attention_result(ggml_context * context, ggml_tensor * output, ggml_tensor * receipt, ggml_tensor * kv) {
+    ggml_tensor * sources[]{output, receipt, kv};
+    return make(context, GGML_TYPE_F32, output->ne, sources, kv ? 3 : 2, DeviceOp::attention_result, "solid_device_attention_result");
 }
 ggml_tensor * device_kv_token(ggml_context * context, ggml_tensor * kv) {
     const std::int64_t shape[]{1,1,1,1};

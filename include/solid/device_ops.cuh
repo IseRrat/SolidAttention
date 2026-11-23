@@ -44,6 +44,7 @@ inline cudaError_t cuda_device_op(ggml_tensor * output, cudaStream_t stream) {
             device_ops_detail::copy_mask<<<grid,256,0,stream>>>(static_cast<const std::uint16_t *>(output->src[0]->data),
                 static_cast<std::uint16_t *>(output->data),count); break;
         case DeviceOp::prefill_result:
+        case DeviceOp::attention_result:
             if (output->data==output->src[0]->data) return cudaSuccess;
             device_ops_detail::copy_result<<<grid,256,0,stream>>>(static_cast<const std::uint32_t *>(output->src[0]->data),
                 static_cast<std::uint32_t *>(output->data),count); break;

@@ -155,14 +155,17 @@ public:
     }
     std::vector<std::vector<std::uint64_t>> rank(std::uint32_t layer,const std::vector<float> & query,const solid::BlockCandidates & candidates) override {
         std::vector<std::vector<std::uint64_t>> result(g.heads);
-        for (std::uint32_t h = 0; h < g.heads; ++h) {
+        for (std::uint32_t h = 0; h < (candidates.shared_heads ? 1u : g.heads); ++h) {
             std::vector<std::pair<double,std::size_t>> scores;
             for (std::size_t i = 0; i < candidates.blocks.size(); ++i) {
                 const auto & keys = bank.at({layer,candidates.blocks[i]});
                 double value = 0;
-                for (std::uint32_t r = 0; r < b.representatives; ++r) for (auto q = h*(qh/g.heads); q < (h+1)*(qh/g.heads); ++q) {
+                const auto first = h*(qh/g.heads);
+                const auto last = candidates.shared_heads ? qh : first + qh/g.heads;
+                for (std::uint32_t r = 0; r < b.representatives; ++r) for (auto q = first; q < last; ++q) {
+                    const auto key_head = q / (qh/g.heads);
                     for (std::uint32_t d = 0; d < g.dimension; ++d) value += static_cast<double>(query[q*g.dimension+d])*
-                        solid::from_half(keys[(h*b.representatives+r)*g.dimension+d])/(qh/g.heads);
+                        solid::from_half(keys[(key_head*b.representatives+r)*g.dimension+d])/(qh/g.heads);
                 }
                 scores.emplace_back(value,i);
             }
@@ -175,6 +178,7 @@ public:
                 if (covered >= candidates.remaining) break;
             }
         }
+        if (candidates.shared_heads) for (std::size_t h=1; h<result.size(); ++h) result[h]=result.front();
         ++stats_.calls; return result;
     }
     solid::RankerStats stats() const override { return stats_; }

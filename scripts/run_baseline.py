@@ -135,6 +135,7 @@ def run_monitored(manifest, run_dir, output):
     process = None
     primary = None
     peak_rss = 0
+    peak_file_cache = None
     rss_samples = 0
     with termination_signals(), (run_dir / "stdout.txt").open("wb") as stdout, \
             (run_dir / "stderr.txt").open("wb") as stderr, (run_dir / "memory.jsonl").open("w",encoding="utf-8") as memory:
@@ -148,8 +149,14 @@ def run_monitored(manifest, run_dir, output):
                 sample = process_memory(process.pid)
                 peak_rss = max(peak_rss,sample.get("VmHWM_bytes",sample.get("VmRSS_bytes",0)))
                 if "VmHWM_bytes" in sample or "VmRSS_bytes" in sample: rss_samples += 1
-                memory.write(json.dumps({"seconds":time.monotonic()-start,**sample,"proc_io":process_io(process.pid)})+"\n")
-                manifest["cgroup_last"] = cgroup_memory(process.pid)
+                group = cgroup_memory(process.pid)
+                memory_stats = dict(line.split(maxsplit=1) for line in group.get("memory.stat", "").splitlines())
+                cache_bytes = int(memory_stats["file"]) if "file" in memory_stats else None
+                if cache_bytes is not None:
+                    peak_file_cache = max(peak_file_cache or 0, cache_bytes)
+                memory.write(json.dumps({"seconds":time.monotonic()-start,**sample,"proc_io":process_io(process.pid),
+                                         "cgroup_file_cache_bytes":cache_bytes})+"\n")
+                manifest["cgroup_last"] = group
                 time.sleep(.1)
         except BaseException as error:
             primary = error
@@ -157,6 +164,7 @@ def run_monitored(manifest, run_dir, output):
                 try: stop_process(process,group=True,timeout=5)
                 except BaseException as cleanup_error: manifest["cleanup_error"] = str(cleanup_error)
         manifest["returncode"] = process.returncode if process is not None else None
+        manifest["sampled_peak_cgroup_file_cache_bytes"] = peak_file_cache
         manifest["elapsed_seconds"] = time.monotonic()-start
         manifest["sampled_peak_rss_bytes"] = peak_rss if rss_samples else None
         manifest["rss_samples"] = rss_samples
@@ -250,7 +258,8 @@ def main():
         "system": {"uname": list(platform.uname()), "python": sys.version,
                    "os_release": Path("/etc/os-release").read_text()},
         "environment": {key: os.environ.get(key) for key in
-                        ("CUDA_VISIBLE_DEVICES", "GGML_CUDA_DISABLE_GRAPHS", "OMP_NUM_THREADS")},
+                        ("CUDA_VISIBLE_DEVICES", "CUDA_MPS_PIPE_DIRECTORY", "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT",
+                         "GGML_CUDA_DISABLE_GRAPHS", "OMP_NUM_THREADS")},
         "memory_sample_interval_seconds": 0.1,
         "launcher_sha256": digest(Path(__file__)),
     }

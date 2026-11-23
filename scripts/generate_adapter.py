@@ -13,6 +13,9 @@ def replace_once(text, before, after):
 def generate(source, destination):
     graph = (source / "llama-graph.cpp").read_text(encoding="utf-8")
     graph = '#include "solid/llama_adapter.hpp"\n' + graph
+    # Relative RoPE can leave the upstream position tensor outside the graph.
+    anchor = "void llm_graph_input_pos::set_input(const llama_ubatch * ubatch) {\n    if (ubatch->pos && pos) {"
+    graph = replace_once(graph, anchor, anchor.replace("&& pos)", "&& pos && pos->buffer)"))
     anchor = "llm_graph_input_attn_kv * llm_graph_context::build_attn_inp_kv() const {\n"
     graph = replace_once(graph, anchor, anchor + "    if (solid::adapter_active(&model)) return solid::adapter_input(*this);\n")
     anchor = "    const int64_t n_embd_q = n_embd_head_q * n_head_q;\n"
@@ -104,11 +107,24 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
             if (solid_completion) CUDA_CHECK(solid::cuda_attention_end(solid_completion, ctx.stream()));
             break;
         }''')
+    anchor = '''        case GGML_OP_MUL_MAT:
+            ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
+            break;'''
+    cuda = replace_once(cuda, anchor, '''        case GGML_OP_MUL_MAT: {
+            solid::CompletionPhase phase;
+            auto * completion = solid::stream_completion(dst->op_params, sizeof(dst->op_params), &phase);
+            if (completion && phase == solid::CompletionPhase::begin) CUDA_CHECK(solid::cuda_attention_begin(completion, ctx.stream()));
+            ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
+            if (completion && phase == solid::CompletionPhase::end) CUDA_CHECK(solid::cuda_attention_end(completion, ctx.stream()));
+            break;
+        }''')
     anchor = '                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);'
     cuda = replace_once(cuda, anchor, '''                if (node->op == GGML_OP_MUL_MAT) {
                     if (auto * interval = solid::device_timing(node)) interval->record(cuda_ctx->stream(), false);
                 }
-''' + anchor)
+                const bool solid_attention_boundary = node->op == GGML_OP_MUL_MAT &&
+                    solid::stream_completion(node->op_params, sizeof(node->op_params));
+                int nodes_to_skip = solid_attention_boundary ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);''')
     anchor = 'int ggml_backend_cuda_get_device_count() {\n'
     cuda = replace_once(cuda, anchor, '''extern "C" void * solid_cuda_queue(ggml_backend_t backend) {
     auto * ctx = static_cast<ggml_backend_cuda_context *>(backend->context);

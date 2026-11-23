@@ -14,6 +14,7 @@ inline bool sycl_device_op(sycl::queue & queue, ggml_tensor * output) {
             return true;
         case DeviceOp::release_mask:
         case DeviceOp::prefill_result:
+        case DeviceOp::attention_result:
             if (output->data != output->src[0]->data) queue.memcpy(output->data, output->src[0]->data, ggml_nbytes(output));
             return true;
         case DeviceOp::consolidate_kv: {

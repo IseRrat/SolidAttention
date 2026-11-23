@@ -940,7 +940,8 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
             work->dag.complete(select_task, impl_->trace.now());
         }
         work->dag.start(miss_read, impl_->trace.now());
-        impl_->device.wait_transfers();
+        const bool admit_before_stage = work->archive_at_attention && !impl_->transport.aliases_host_slots();
+        if (!admit_before_stage) impl_->device.wait_transfers();
         auto & host = impl_->session.prefetcher();
         bool copying=false;
         auto leases = host.resolve_history(work->layer, work->position, work->selection,
@@ -958,7 +959,7 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
             }, work->deferred_archive,[&](const std::vector<SlotLease> & ready) {
                 if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
                 impl_->device.stage_ready_batch(ready,work->blocks);
-            });
+            }, admit_before_stage);
         if (work->deferred_archive) work->history = std::move(leases);
         else for (const auto & lease : leases) host.unpin(lease);
         work->dag.complete(miss_read, impl_->trace.now());
@@ -1037,7 +1038,8 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         if (source) impl_->transport.bind_current(source,current_kv);
         if (deferred) host.remember_selection(layer, position, work->selection);
         mask = impl_->device.prepare(work->history, work->selection, reuses_sync(),source?&current_kv:nullptr,
-                                     work->archive_at_attention);
+                                     work->archive_at_attention,
+                                     impl_->session.budget().infllm_attention ? impl_->session.budget().local : 0);
         impl_->transport.clear_current();
     } catch (...) { impl_->transport.clear_current(); throw; }
     for (const auto & lease : work->history) host.unpin(lease);

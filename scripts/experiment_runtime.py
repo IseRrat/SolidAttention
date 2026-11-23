@@ -12,7 +12,8 @@ from process_lifetime import stop_process
 
 
 def condition(value):
-    allowed = {"name", "session_root", "cache_state", "memory_max_bytes", "swap_max_bytes", "cpus", "background"}
+    allowed = {"name", "session_root", "cache_state", "memory_max_bytes", "swap_max_bytes",
+               "cuda_memory_max_mib", "cpus", "background"}
     if set(value)-allowed: raise ValueError("unknown experiment condition field")
     if value["cache_state"] not in ("os-managed", "warm", "externally-prepared-cold"):
         raise ValueError("cache_state must describe the externally controlled page cache")
@@ -20,6 +21,8 @@ def condition(value):
         if value.get(key) is not None: number(value[key], integer=True, minimum=1 if key == "memory_max_bytes" else 0)
     if value.get("swap_max_bytes") is not None and value.get("memory_max_bytes") is None:
         raise ValueError("swap_max_bytes requires memory_max_bytes")
+    if value.get("cuda_memory_max_mib") is not None:
+        number(value["cuda_memory_max_mib"], minimum=1, integer=True)
     cpus = value.get("cpus", [])
     if not isinstance(cpus, list) or len(cpus) != len(set(cpus)): raise ValueError("CPU affinity must contain unique CPU IDs")
     for cpu in cpus: number(cpu, integer=True)
@@ -34,6 +37,16 @@ def condition(value):
 
 def isolated_command(command, settings):
     condition(settings)
+    limit = cuda_memory_limit(settings)
+    if limit:
+        pipe = os.environ.get("CUDA_MPS_PIPE_DIRECTORY")
+        if not pipe:
+            raise ValueError("CUDA memory limit requires a private NVIDIA MPS server")
+        mps = subprocess.run(["nvidia-cuda-mps-control"], input="get_server_list\n",
+                             text=True, capture_output=True, timeout=5, check=True)
+        if len(mps.stdout.split()) != 1 or not mps.stdout.strip().isdigit():
+            raise ValueError("expected exactly one active NVIDIA MPS server")
+        command = ["env", f"CUDA_MPS_PINNED_DEVICE_MEM_LIMIT={limit}", *command]
     if settings.get("cpus"): command = ["taskset", "--cpu-list", ",".join(map(str,settings["cpus"])), *command]
     if settings.get("memory_max_bytes") is not None:
         # A container can already supply the exact limits. Its child inherits
@@ -46,6 +59,13 @@ def isolated_command(command, settings):
                    "--property=MemoryMax="+str(settings["memory_max_bytes"]),
                    "--property=MemorySwapMax="+str(swap_limit(settings)), *command]
     return command
+
+
+def cuda_memory_limit(settings):
+    mib = settings.get("cuda_memory_max_mib")
+    if mib is None:
+        return None
+    return f"0={mib // 1024}G" if mib % 1024 == 0 else f"0={mib}M"
 
 
 def swap_limit(settings):

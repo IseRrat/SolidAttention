@@ -15,7 +15,7 @@ import time
 
 from experiment_common import (absolute_config, audit_run, check_hash, digest, distribution, load,
                                model_hashes, number, run_metrics, token_ids, atomic_json)
-from experiment_runtime import Background, condition, fio_command, fio_observations, isolated_command, swap_limit
+from experiment_runtime import Background, condition, cuda_memory_limit, fio_command, fio_observations, isolated_command, swap_limit
 from process_lifetime import stop_process, termination_signals
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -37,18 +37,26 @@ def variant_config(template, variant, block, budget):
         if variant == "indram": config["kv_on_gpu"] = False
         return config
     sparse = variant != "offload"
+    infllm = sparse and template.get("attention", {}).get("infllm_attention", False)
     interleaved = variant in ("interleaved", "prefetch", "overlap", "solid")
     prefetch = variant in ("prefetch", "overlap", "solid")
     attention = {"storage": "memory" if variant == "indram-sparse" else "ssd", "sparse": sparse,
                  "layout": "interleaved" if interleaved else "separate", "fuse_kv_projection": interleaved,
                  "block_tokens": block, "representative_count": 1, "write_buffer_bytes_per_layer": 32768,
                  "selection_trace": False, "profile": False, "keep_session_file": False, "prefetch": prefetch}
+    if infllm:
+        attention["infllm_attention"] = True
+        attention["representative_count"] = number(template["attention"].get("representative_count", 4), 1, True)
     for key in ("prefill_backend","prefill_tile_tokens"):
         if key in template.get("attention",{}):
             value=template["attention"][key]
             if key=="prefill_backend" and value not in ("auto","cpu","cuda","sycl"): raise ValueError("unknown prefill backend")
             if key=="prefill_tile_tokens": number(value,1,True)
             attention[key]=value
+    if infllm:
+        if attention.get("prefill_backend", "auto") not in ("auto", "cuda"):
+            raise ValueError("InfLLM experiment prefill requires CUDA")
+        attention["prefill_backend"] = "cuda"
     if "direct_decode_reads" in template.get("attention", {}) and attention["storage"] == "ssd":
         direct = template["attention"]["direct_decode_reads"]
         if type(direct) is not bool: raise ValueError("direct_decode_reads must be boolean")
@@ -119,6 +127,8 @@ def create(spec_path, destination):
             raise ValueError("offload_sparse_budgets must map input lengths in the suite to budgets")
         if sparse_budgets and ("offload-sparse" not in suite["variants"] or suite["budgets"]!=[0]):
             raise ValueError("offload_sparse_budgets replaces the automatic budget for offload-sparse")
+        if sparse_budgets and "solid" in suite["variants"]:
+            raise ValueError("offload-sparse and solid must use the same budget in a comparison suite")
         for value in sparse_budgets.values():
             if value!="full": number(value,1,True)
         for model,(template,bundle) in models.items():
@@ -192,6 +202,9 @@ def audited_job(row, settings, attempt, runner_sha=None):
     if settings.get("memory_max_bytes") is not None and (
             group.get("memory.max") != str(settings["memory_max_bytes"]) or group.get("memory.swap.max") != str(swap_limit(settings))):
         raise ValueError("observed cgroup limits differ from the experiment condition")
+    limit = cuda_memory_limit(settings)
+    if limit and run.get("environment", {}).get("CUDA_MPS_PINNED_DEVICE_MEM_LIMIT") != limit:
+        raise ValueError("runner CUDA MPS limit differs from the experiment condition")
     reads = None
     if settings.get("background"):
         observations = fio_observations(Path(attempt)/"fio.json")
@@ -301,6 +314,7 @@ def collect(plan_path, destination):
             item["manifest_sha256"] = digest(result_path.parent/"manifest.json")
             item["result_sha256"] = digest(result_path)
             item["sampled_peak_rss_bytes"] = run.get("sampled_peak_rss_bytes")
+            item["sampled_peak_cgroup_file_cache_bytes"] = run.get("sampled_peak_cgroup_file_cache_bytes")
             item["cgroup_end"] = group
             if reads is not None: item["fio_observed_reads"] = reads
         elif "manifest_sha256" in record:

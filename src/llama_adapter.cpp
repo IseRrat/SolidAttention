@@ -2,11 +2,14 @@
 #include "solid/projection.hpp"
 #include "solid/ggml_prefetch.hpp"
 #include "solid/device_ops.hpp"
+#include "solid/dense_offload.hpp"
 #include "solid/thread_affinity.hpp"
 #include "llama-model.h"
 #include "llama-batch.h"
 #include "llama-graph.h"
 #include "ggml-backend.h"
+#include "ggml-alloc.h"
+#include "ggml-cpu.h"
 #ifdef SOLID_HAVE_CUDA_SELECTION
 #include "ggml-cuda.h"
 #endif
@@ -16,6 +19,7 @@
 #endif
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -61,6 +65,238 @@ struct PrefillOutput {
     ~PrefillOutput() { session.release_prefill_graph_output(bytes); }
 };
 }
+class InfllmSelectedCache {
+public:
+    InfllmSelectedCache(AttentionSession & session, ggml_backend_t backend) : session_(session), backend_(backend) {
+        const auto & geometry = session.geometry();
+        const auto budget = session.budget();
+        const auto block = geometry.block_tokens;
+        const auto block_count = [block](std::uint64_t tokens) { return (tokens + block - 1) / block; };
+        const auto history = budget.total - budget.initial - budget.local;
+        const auto groups = block_count(history) + block_count(budget.initial) +
+            block_count(budget.local) + 2;
+        const auto blocks = std::min(groups, geometry.blocks_per_head() + 1);
+        if (blocks * block > INT32_MAX) throw std::overflow_error("InfLLM cache row index");
+        rows_ = static_cast<std::uint32_t>(blocks * block);
+        width_ = static_cast<std::size_t>(geometry.heads) * geometry.dimension;
+        entries_.resize(blocks);
+        context_.reset(ggml_init({ggml_tensor_overhead() + 1024, nullptr, true}));
+        if (!context_) throw std::runtime_error("InfLLM cache metadata allocation failed");
+        bank_ = ggml_new_tensor_4d(context_.get(), GGML_TYPE_F16, geometry.dimension, rows_, geometry.heads, 2);
+        ggml_set_name(bank_, "infllm_selected_kv_cache");
+        buffer_.reset(ggml_backend_alloc_ctx_tensors(context_.get(), backend));
+        if (!buffer_) throw std::runtime_error("InfLLM cache allocation failed");
+        ggml_backend_buffer_clear(buffer_.get(), 0);
+        stats_.resident_bytes = ggml_backend_buffer_get_size(buffer_.get());
+        auto * device = ggml_backend_get_device(backend);
+        auto * host_type = device ? ggml_backend_dev_host_buffer_type(device) : nullptr;
+        if (!host_type || !ggml_backend_buft_is_host(host_type)) host_type = ggml_backend_cpu_buffer_type();
+        staging_buffer_.reset(ggml_backend_buft_alloc_buffer(host_type, ggml_nbytes(bank_)));
+        if (!staging_buffer_) throw std::runtime_error("InfLLM read buffer allocation failed");
+        staging_ = static_cast<Half *>(ggml_backend_buffer_get_base(staging_buffer_.get()));
+        stats_.staging_bytes = ggml_backend_buffer_get_size(staging_buffer_.get());
+    }
+    ggml_backend_t backend() const { return backend_; }
+    DeviceCacheStats stats() const { return stats_; }
+    ggml_tensor * plane(ggml_context * context, bool values) const {
+        return ggml_view_3d(context, bank_, bank_->ne[0], rows_, bank_->ne[2], bank_->nb[1], bank_->nb[2],
+                            values ? bank_->nb[3] : 0);
+    }
+    void prefetch_fixed(std::uint32_t layer, std::uint64_t position, AsyncReader * reader, std::size_t depth) {
+        begin_frame(layer, position);
+        const auto budget = session_.budget();
+        std::vector<std::uint64_t> positions;
+        const auto initial = position + 1 <= budget.total ? position : budget.initial;
+        const auto recent = position + 1 <= budget.total ? position : budget.recent_start(session_.geometry(), position);
+        for (std::uint64_t p = 0; p < initial; ++p) positions.push_back(p);
+        for (auto p = recent; p < position; ++p) positions.push_back(p);
+        prepared_ = plan(position, positions, false);
+        read(layer, prepared_, reader, depth);
+    }
+    void upload_fixed() {
+        upload(prepared_);
+        prepared_.clear();
+    }
+    void load(std::uint32_t layer, std::uint64_t position, const std::vector<std::uint64_t> & selected,
+              Half * metadata, std::uint32_t slots, const float * key, const float * value,
+              AsyncReader * reader = nullptr, std::size_t depth = 64) {
+        if (selected.empty() || selected.size() > slots) throw std::logic_error("InfLLM cache selection size");
+        begin_frame(layer, position);
+        using Clock = std::chrono::steady_clock;
+        const auto start = Clock::now();
+        const auto & geometry = session_.geometry();
+        const auto budget = session_.budget();
+        indices_.resize(slots);
+        const auto loads = plan(position, selected, true);
+        read(layer, loads, reader, depth, position, key, value);
+        upload(loads);
+        std::fill(indices_.begin() + selected.size(), indices_.end(), indices_.front());
+        std::memcpy(metadata, indices_.data(), static_cast<std::size_t>(slots) * sizeof(std::int32_t));
+        auto * mask = metadata + 2 * slots;
+        for (std::uint32_t head = 0; head < session_.query_heads(); ++head) {
+            std::fill_n(mask + head * slots, selected.size(), Half{0});
+            std::fill_n(mask + head * slots + selected.size(), slots - selected.size(), Half{0xfc00});
+        }
+        auto * markers = mask + static_cast<std::size_t>(slots) * session_.query_heads();
+        for (std::uint32_t head = 0; head < geometry.heads; ++head) {
+            auto * row = markers + head * slots;
+            std::fill_n(row, slots, Half{0});
+            for (std::size_t i = 0; i < selected.size(); ++i) {
+                const auto distance = position - selected[i];
+                if (distance < budget.local) row[i] = to_half(static_cast<float>(budget.local - distance));
+            }
+        }
+        session_.account_cached_gather(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
+    }
+private:
+    struct Entry { std::uint64_t first = 0, last = 0; std::uint32_t valid = 0; bool used = false; };
+    struct Load { std::uint64_t first; std::uint32_t row, count; };
+    std::optional<std::pair<std::uint32_t, std::uint64_t>> frame_;
+    void begin_frame(std::uint32_t layer, std::uint64_t position) {
+        const auto frame = std::make_pair(layer, position);
+        if (frame_ == frame) return;
+        if (!prepared_.empty()) throw std::logic_error("sparse workspace still holds a pending upload");
+        std::fill(entries_.begin(), entries_.end(), Entry{});
+        frame_ = frame;
+    }
+    std::vector<Load> plan(std::uint64_t position, const std::vector<std::uint64_t> & selected, bool map_indices) {
+        const auto & geometry = session_.geometry();
+        const auto budget = session_.budget();
+        const auto block = geometry.block_tokens;
+        const auto block_start = [&](std::uint64_t token) {
+            const std::uint64_t origin = token < budget.initial ? 0 : budget.initial;
+            return origin + (token - origin) / block * block;
+        };
+        for (auto & entry : entries_) {
+            const auto it = std::lower_bound(selected.begin(), selected.end(), entry.first);
+            if (entry.used && it != selected.end() && block_start(*it) == entry.first) entry.last = position;
+        }
+        std::vector<Load> loads;
+        for (std::size_t i = 0; i < selected.size();) {
+            const auto first = block_start(selected[i]);
+            auto end = i + 1;
+            while (end < selected.size() && block_start(selected[end]) == first) ++end;
+            auto entry = std::find_if(entries_.begin(), entries_.end(), [&](const auto & e) { return e.used && e.first == first; });
+            if (entry == entries_.end()) {
+                entry = std::min_element(entries_.begin(), entries_.end(), [](const auto & a, const auto & b) {
+                    return a.used != b.used ? !a.used : a.last < b.last;
+                });
+                if (entry->used && entry->last == position) throw std::logic_error("InfLLM cache cannot fit selected blocks");
+                if (entry->used) ++stats_.overwritten_blocks;
+                *entry = {first, position, 0, true};
+            }
+            const auto row = static_cast<std::uint32_t>(entry - entries_.begin()) * block;
+            const auto required = static_cast<std::uint32_t>(selected[end - 1] - first + 1);
+            if (entry->valid >= required) {
+                if (map_indices) ++stats_.reused_blocks;
+            }
+            else {
+                const Load missing{first + entry->valid, row + entry->valid, required - entry->valid};
+                if (!loads.empty() && loads.back().first + loads.back().count == missing.first &&
+                    loads.back().row + loads.back().count == missing.row) loads.back().count += missing.count;
+                else loads.push_back(missing);
+                entry->valid = required;
+            }
+            if (map_indices) for (; i < end; ++i) indices_[i] = static_cast<std::int32_t>(row + selected[i] - first);
+            i = end;
+        }
+        return loads;
+    }
+    void read(std::uint32_t layer, const std::vector<Load> & loads, AsyncReader * reader, std::size_t depth,
+              std::uint64_t position = 0, const float * key = nullptr, const float * value = nullptr) {
+        const auto & geometry = session_.geometry();
+        const auto dim = geometry.dimension;
+        std::vector<KvRowRange> ranges;
+        for (const auto & load : loads) {
+            const bool has_current = key && load.first + load.count - 1 == position;
+            const auto history = load.count - static_cast<std::uint32_t>(has_current);
+            for (std::uint32_t h = 0; h < geometry.heads; ++h) {
+                auto * keys = staging_ + static_cast<std::size_t>(h) * rows_ * dim + load.row * dim;
+                auto * values = keys + static_cast<std::size_t>(geometry.heads) * rows_ * dim;
+                if (history) ranges.push_back({h, load.first, history, keys, values});
+                if (has_current) for (std::uint32_t d = 0; d < dim; ++d) {
+                    const auto source = static_cast<std::size_t>(h) * dim + d;
+                    const auto target = static_cast<std::size_t>(history) * dim + d;
+                    keys[target] = to_half(key[source]);
+                    values[target] = to_half(value[source]);
+                }
+            }
+        }
+        session_.read_decode_rows(layer, ranges, reader, depth);
+    }
+    void upload(const std::vector<Load> & loads) {
+        const auto & geometry = session_.geometry();
+        const auto dim = geometry.dimension;
+        if (loads.empty()) return;
+        auto ranges = loads;
+        std::sort(ranges.begin(), ranges.end(), [](const auto & a, const auto & b) { return a.row < b.row; });
+        std::vector<Load> transfers;
+        for (const auto & range : ranges) {
+            if (!transfers.empty() && transfers.back().row + transfers.back().count == range.row) {
+                transfers.back().count += range.count;
+            } else transfers.push_back(range);
+        }
+        try {
+            for (const auto & range : transfers) {
+                const auto bytes = static_cast<std::size_t>(range.count) * dim * sizeof(Half);
+                for (int plane = 0; plane < 2; ++plane) for (std::uint32_t h = 0; h < geometry.heads; ++h) {
+                    const auto offset = plane * bank_->nb[3] + h * bank_->nb[2] + range.row * bank_->nb[1];
+                    ggml_backend_tensor_set_async(backend_, bank_, reinterpret_cast<const char *>(staging_) + offset, offset, bytes);
+                    ++stats_.uploads;
+                    stats_.upload_bytes += bytes;
+                }
+            }
+            // One receipt protects the read buffer for reuse by the next SSD job.
+            ggml_backend_synchronize(backend_);
+        } catch (...) {
+            ggml_backend_synchronize(backend_);
+            throw;
+        }
+    }
+    AttentionSession & session_;
+    ggml_backend_t backend_;
+    std::unique_ptr<ggml_context, decltype(&ggml_free)> context_{nullptr, ggml_free};
+    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer_{nullptr, ggml_backend_buffer_free};
+    ggml_tensor * bank_ = nullptr;
+    std::size_t width_ = 0;
+    std::uint32_t rows_ = 0;
+    std::vector<Entry> entries_;
+    std::vector<std::int32_t> indices_;
+    std::vector<Load> prepared_;
+    std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> staging_buffer_{nullptr, ggml_backend_buffer_free};
+    Half * staging_ = nullptr;
+    DeviceCacheStats stats_;
+};
+std::shared_ptr<InfllmSelectedCache> make_infllm_selected_cache(AttentionSession & session, ggml_backend * backend) {
+    if (!backend || !session.relative_rope() || session.prefetch_enabled() || session.geometry().layout != KvLayout::separate) {
+        throw std::invalid_argument("InfLLM selected cache requires separate K/V and a decode backend");
+    }
+    return std::make_shared<InfllmSelectedCache>(session,backend);
+}
+SparseBaselineLookahead::SparseBaselineLookahead(AttentionSession & session, InfllmSelectedCache & workspace, bool use_uring) :
+    session_(session), workspace_(workspace), reader_(use_uring ? make_uring_reader(queue_depth) : nullptr) {}
+void SparseBaselineLookahead::begin(std::uint32_t layer, std::uint64_t position) {
+    if (frame_ || layer >= session_.geometry().layers) throw std::logic_error("invalid sparse prefetch frontier");
+    worker_.submit([this, layer, position] { workspace_.prefetch_fixed(layer, position, reader_.get(), queue_depth); });
+    frame_ = std::make_pair(layer, position);
+}
+void SparseBaselineLookahead::upload(std::uint32_t layer, std::uint64_t position) {
+    if (frame_ != std::make_optional(std::make_pair(layer, position))) throw std::logic_error("sparse prefetch layer or position mismatch");
+    const auto start = std::chrono::steady_clock::now();
+    worker_.join();
+    session_.account_sparse_prefetch(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    workspace_.upload_fixed();
+    frame_.reset();
+}
+void SparseBaselineLookahead::completed(std::uint32_t layer, std::uint64_t position) {
+    if (layer + 1 < session_.geometry().layers) begin(layer + 1, position);
+}
+void SparseBaselineLookahead::start_writeback(std::uint32_t layer) {
+    if (session_.layer_write_ready(layer)) worker_.submit([this, layer] { session_.flush_ready_layer(layer); });
+}
+void SparseBaselineLookahead::finish_decode() const {
+    if (frame_) throw std::logic_error("sparse decode left a layer in flight");
+}
 void AttentionFailure::capture(std::exception_ptr error, std::uint32_t layer, std::uint64_t position) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!error_) { error_ = std::move(error); layer_ = layer; position_ = position; }
@@ -83,10 +319,15 @@ struct AttentionNode::Impl {
     bool gathered;
     GgmlPrefetch * prefetch;
     ProjectionIntervals * timing = nullptr;
+    InfllmSelectedCache * selected_cache = nullptr;
+    DenseOffload * dense = nullptr;
+    SparseBaselineLookahead * sparse_lookahead = nullptr;
     bool packed_inputs = false;
     std::optional<DeviceMemory> direct = {};
+    std::optional<DeviceMemory> selected_device = {};
     ggml_tensor * device_query = nullptr;
     ggml_tensor * device_kv = nullptr;
+    ggml_tensor * device_scores = nullptr;
     std::unique_ptr<PrefillOutput> prefill_output = {};
     ggml_tensor * host = nullptr;
     ggml_tensor * early = nullptr;
@@ -97,6 +338,125 @@ struct AttentionNode::Impl {
         if (ith) return;
         std::memcpy(destination->data,destination->src[0]->data,ggml_nbytes(destination));
         auto * token=static_cast<StreamCompletionToken *>(userdata); token->notify(token->userdata);
+    }
+    static void key_positions(ggml_tensor * destination, int ith, int, void *) {
+        if (ith) return;
+        const auto * markers = static_cast<const Half *>(destination->src[0]->data);
+        auto * positions = static_cast<std::int32_t *>(destination->data);
+        for (std::int64_t i = 0; i < ggml_nelements(destination); ++i) {
+            positions[i] = std::max(0, static_cast<int>(from_half(markers[i])) - 1);
+        }
+    }
+    static void cache_indices(ggml_tensor * destination, int ith, int, void *) {
+        if (ith) return;
+        const auto bytes = static_cast<std::size_t>(destination->ne[0]) * sizeof(std::int32_t);
+        for (std::int64_t h = 0; h < destination->ne[1]; ++h) {
+            std::memcpy(static_cast<char *>(destination->data) + h * bytes, destination->src[0]->data, bytes);
+        }
+    }
+    static void dense_history(ggml_tensor * destination, int ith, int, void * userdata) {
+        if (ith) return;
+        auto & self = *static_cast<Impl *>(userdata);
+        auto & index = *static_cast<std::int32_t *>(destination->data);
+        index = 0;
+        try {
+            self.failure->check();
+            const auto position = self.frame->positions.at(0);
+            self.dense->upload_history(self.layer, position);
+            index = static_cast<std::int32_t>(position);
+        } catch (...) { self.failure->capture(std::current_exception(), self.layer); }
+    }
+    static void sparse_history(ggml_tensor * destination, int ith, int, void * userdata) {
+        if (ith) return;
+        auto & self = *static_cast<Impl *>(userdata);
+        *static_cast<std::int32_t *>(destination->data) = 0;
+        try {
+            self.failure->check();
+            self.sparse_lookahead->upload(self.layer, self.frame->positions.at(0));
+        } catch (...) { self.failure->capture(std::current_exception(), self.layer); }
+    }
+    static void dense_archive(ggml_tensor * destination, int ith, int, void * userdata) {
+        if (ith) return;
+        auto & self = *static_cast<Impl *>(userdata);
+        auto * mask = static_cast<Half *>(destination->data);
+        const auto slots = static_cast<std::size_t>(ggml_nelements(destination));
+        std::fill_n(mask, slots, Half{0xfc00});
+        mask[0] = 0;
+        try {
+            self.failure->check();
+            const auto position = self.frame->positions.at(0);
+            self.dense->archive(self.layer, position, static_cast<const float *>(destination->src[1]->data),
+                               static_cast<const float *>(destination->src[2]->data));
+            std::fill_n(mask, position + 1, Half{0});
+        } catch (...) { self.failure->capture(std::current_exception(), self.layer); }
+    }
+    static void receive_attention(ggml_tensor * destination, int ith, int, void * userdata) {
+        if (ith) return;
+        auto & self = *static_cast<Impl *>(userdata);
+        try {
+            self.failure->check();
+            const auto position = self.frame->positions.at(0);
+            if (self.session.device_probabilities()) {
+                if (!self.device_kv || !self.device_scores) throw std::logic_error("device probability inputs missing");
+                if (self.prefetch) self.prefetch->completed(self.epoch);
+                self.session.observe_device_probabilities(self.layer, position,
+                    {static_cast<const Half *>(self.device_kv->data), static_cast<std::size_t>(ggml_nelements(self.device_kv)), DeviceMemory::cuda},
+                    {static_cast<const float *>(self.device_scores->data), static_cast<std::size_t>(ggml_nelements(self.device_scores)), DeviceMemory::cuda});
+                if (self.sparse_lookahead) self.sparse_lookahead->completed(self.layer, position);
+                *static_cast<float *>(destination->data) = 0;
+                return;
+            }
+            const auto local = self.session.budget().local;
+            const auto recent = std::min<std::uint64_t>(position + 1, local);
+            const auto * probability = destination->src[0];
+            const auto * p = static_cast<const float *>(probability->data);
+            const auto heads = self.session.query_heads();
+            std::vector<float> scores(static_cast<std::size_t>(heads) * recent);
+            for (std::uint32_t q = 0; q < heads; ++q) {
+                std::copy_n(p + q * local + local - recent, recent, scores.data() + q * recent);
+            }
+            if (self.prefetch) self.prefetch->completed(self.epoch);
+            self.session.observe_probabilities(self.layer, position, scores);
+            if (self.sparse_lookahead) self.sparse_lookahead->completed(self.layer, position);
+            *static_cast<float *>(destination->data) = 0;
+        } catch (...) {
+            self.failure->capture(std::current_exception(), self.layer, self.frame->positions.empty() ? 0 : self.frame->positions.front());
+            std::fill_n(static_cast<float *>(destination->data), ggml_nelements(destination), 0.f);
+        }
+    }
+    static void recent_indices(ggml_tensor * destination, int ith, int, void * userdata) {
+        if (ith) return;
+        auto & self = *static_cast<Impl *>(userdata);
+        auto * indices = static_cast<std::int32_t *>(destination->data);
+        std::fill_n(indices, ggml_nelements(destination), 0);
+        try {
+            self.failure->check();
+            const auto local = self.session.budget().local;
+            const auto recent = std::min<std::uint64_t>(self.frame->positions.at(0) + 1, local);
+            const auto heads = self.session.query_heads();
+            const auto group = heads / self.session.geometry().heads;
+            const auto slots = ggml_nelements(destination->src[0]) / self.session.geometry().heads;
+            const auto * markers = static_cast<const Half *>(destination->src[0]->data);
+            for (std::uint32_t q = 0; q < heads; ++q) {
+                auto * row = indices + q * local;
+                std::fill_n(row, local, -1);
+                for (std::int64_t i = 0; i < slots; ++i) {
+                    const auto marker = static_cast<std::uint32_t>(from_half(markers[q / group * slots + i]));
+                    if (!marker) continue;
+                    if (marker <= local - recent || marker > local || row[marker - 1] != -1) {
+                        throw std::logic_error("invalid or duplicate InfLLM recent slot");
+                    }
+                    row[marker - 1] = static_cast<std::int32_t>(q * slots + i);
+                }
+                for (std::uint32_t i = local - recent; i < local; ++i) {
+                    if (row[i] < 0) throw std::logic_error("missing InfLLM recent slot");
+                }
+                std::fill_n(row, local - recent, 0);
+            }
+        } catch (...) {
+            self.failure->capture(std::current_exception(), self.layer);
+            std::fill_n(indices, ggml_nelements(destination), 0);
+        }
     }
     static void select_query(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith != 0) return;
@@ -133,6 +493,7 @@ struct AttentionNode::Impl {
             std::vector<float> inputs[3];
             const bool early = self.early != nullptr;
             for (int source = 0; !self.direct && source < (self.packed_inputs ? 2 : 3) - (early ? 1 : 0); ++source) {
+                if (self.selected_device && source == 0) continue;
                 const auto * tensor = destination->src[source];
                 if (tensor->type != GGML_TYPE_F32 || !ggml_is_contiguous(tensor)) throw std::logic_error("attention inputs must be contiguous F32");
                 inputs[source].resize(static_cast<std::size_t>(ggml_nelements(tensor)));
@@ -174,6 +535,21 @@ struct AttentionNode::Impl {
                 self.epoch = self.prefetch->attention_epoch();
                 if (result.size() != static_cast<std::size_t>(ggml_nelements(destination))) throw std::logic_error("prefetch mask shape");
                 std::memcpy(destination->data, result.data(), result.size() * sizeof(Half));
+            } else if (self.selected_cache) {
+                const auto position = self.frame->positions.front();
+                const auto after_append = [&] {
+                    if (self.sparse_lookahead) self.sparse_lookahead->start_writeback(self.layer);
+                };
+                const auto selected = self.selected_device ?
+                    self.session.select_decode_device(self.layer, position,
+                        {static_cast<const float *>(self.device_query->data), static_cast<std::size_t>(ggml_nelements(self.device_query)),
+                         *self.selected_device}, inputs[1], inputs[2], after_append) :
+                    self.session.select_decode(self.layer, position, inputs[0], inputs[1], inputs[2], false, after_append);
+                if (self.sparse_lookahead) self.sparse_lookahead->join();
+                self.selected_cache->load(self.layer, position, selected.front().positions,
+                                          static_cast<Half *>(destination->data), self.session.gather_slots(),
+                                          inputs[1].data(), inputs[2].data(),
+                                          self.sparse_lookahead ? self.sparse_lookahead->reader() : nullptr);
             } else if (self.gathered) {
                 self.session.gather_into(self.layer,self.frame->positions.front(),inputs[0],inputs[1],inputs[2],
                     static_cast<Half *>(destination->data),static_cast<std::size_t>(ggml_nelements(destination)),self.packed_inputs);
@@ -193,12 +569,23 @@ struct AttentionNode::Impl {
                 auto * data = static_cast<Half *>(destination->data);
                 std::fill_n(data, ggml_nelements(destination), Half{0xfc00});
                 for (std::uint32_t h = 0; h < self.session.query_heads(); ++h) data[h * self.prefetch->tokens_per_head()] = 0;
+                if (self.session.relative_rope()) {
+                    std::fill_n(data + static_cast<std::size_t>(self.prefetch->tokens_per_head()) * self.session.query_heads(),
+                                static_cast<std::size_t>(self.prefetch->tokens_per_head()) * self.session.geometry().heads, Half{0});
+                }
+            } else if (self.selected_cache) {
+                auto * data = static_cast<Half *>(destination->data);
+                const auto slots = self.session.gather_slots();
+                std::fill_n(data, ggml_nelements(destination), Half{0});
+                for (std::uint32_t head = 0; head < self.session.query_heads(); ++head) {
+                    std::fill_n(data + (2 + head) * slots + 1, slots - 1, Half{0xfc00});
+                }
             } else if (self.gathered) {
                 auto * data = static_cast<Half *>(destination->data);
                 std::fill_n(data, ggml_nelements(destination), Half{0});
                 const auto slots = self.session.gather_slots();
                 const auto mask = static_cast<std::size_t>(slots) * 2 * self.session.geometry().heads * self.session.geometry().dimension;
-                std::fill(data + mask, data + ggml_nelements(destination), Half{0xfc00});
+                std::fill_n(data + mask, static_cast<std::size_t>(slots) * self.session.query_heads(), Half{0xfc00});
                 for (std::uint32_t head = 0; head < self.session.query_heads(); ++head) data[mask + head * slots] = 0;
             } else {
                 if (self.prefill_output) ggml_backend_buffer_clear(self.prefill_output->buffer.get(),0);
@@ -209,14 +596,17 @@ struct AttentionNode::Impl {
 };
 AttentionNode::AttentionNode(AttentionSession & session, std::shared_ptr<AttentionFrame> frame,
                             std::uint32_t layer, float scale, std::shared_ptr<AttentionFailure> failure, bool gathered, GgmlPrefetch * prefetch,
-                            ProjectionIntervals * timing) :
+                            ProjectionIntervals * timing, InfllmSelectedCache * selected_cache, DenseOffload * dense,
+                            SparseBaselineLookahead * sparse_lookahead) :
     impl_(std::make_unique<Impl>(Impl{session, std::move(frame), layer, scale,
-                                    failure ? std::move(failure) : std::make_shared<AttentionFailure>(), gathered, prefetch, timing})) {
+                                    failure ? std::move(failure) : std::make_shared<AttentionFailure>(), gathered, prefetch, timing,
+                                    selected_cache, dense, sparse_lookahead})) {
     if (prefetch && !gathered) throw std::invalid_argument("prefetch node requires decode attention");
 }
 AttentionNode::~AttentionNode() = default;
 ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, ggml_tensor * key, ggml_tensor * value,
-                                  ggml_tensor * packed_kv, ggml_backend_sched * scheduler, ggml_backend * decode_backend) {
+                                  ggml_tensor * packed_kv, ggml_backend_sched * scheduler, ggml_backend * decode_backend,
+                                  ggml_cgraph * graph) {
     const auto & g = impl_->session.geometry();
     if (!std::isfinite(impl_->scale) || impl_->scale <= 0) throw std::invalid_argument("invalid attention scale");
     if (impl_->gathered && impl_->session.gather_elements() > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) / sizeof(Half)) {
@@ -246,13 +636,65 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         if (scheduler && decode_backend) ggml_backend_sched_set_tensor_backend(scheduler,tensor,decode_backend);
         return tensor;
     };
-    ggml_tensor * inputs[] = {query, packed_kv ? packed_kv : key, packed_kv ? nullptr : value};
+    if (impl_->dense) {
+        if (!impl_->gathered || query->ne[2] != 1 || packed_kv || !graph) throw std::logic_error("invalid dense offload graph");
+        const auto contiguous_f32 = [&](ggml_tensor * input) {
+            if (input->type != GGML_TYPE_F32) input = on_device(ggml_cast(context, input, GGML_TYPE_F32));
+            return ggml_is_contiguous(input) ? input : on_device(ggml_cont(context, input));
+        };
+        auto * archived_key = contiguous_f32(key);
+        auto * archived_value = contiguous_f32(value);
+        auto * current_key = ggml_permute(context, archived_key, 0, 2, 1, 3);
+        auto * current_value = ggml_permute(context, archived_value, 0, 2, 1, 3);
+        auto * history = ggml_custom_4d(context, GGML_TYPE_I32, 1, 1, 1, 1, nullptr, 0, Impl::dense_history, 1, impl_.get());
+        ggml_set_name(history, "offload_dense_history_upload");
+        if (scheduler) ggml_backend_sched_set_tensor_backend(scheduler, history,
+            ggml_backend_sched_get_backend(scheduler, ggml_backend_sched_get_n_backends(scheduler) - 1));
+        auto * index = on_device(ggml_dup(context, history));
+        ggml_tensor * archive_inputs[]{index, archived_key, archived_value};
+        const auto slots = impl_->session.gather_slots();
+        auto * mask = ggml_custom_4d(context, GGML_TYPE_F16, slots, 1, 1, 1, archive_inputs, 3, Impl::dense_archive, 1, impl_.get());
+        ggml_set_name(mask, "offload_dense_archive");
+        impl_->host = mask;
+        // The worker is reading while projections run. The uploaded index
+        // splits history upload from the current K/V download to the archive.
+        ggml_build_forward_expand(graph, query);
+        ggml_build_forward_expand(graph, archived_key);
+        ggml_build_forward_expand(graph, archived_value);
+        ggml_build_forward_expand(graph, mask);
+        auto * q = ggml_permute(context, contiguous_f32(query), 0, 2, 1, 3);
+        auto * keys = on_device(ggml_set_rows(context, impl_->dense->plane(context, false), current_key, index));
+        auto * values = on_device(ggml_set_rows(context, impl_->dense->plane(context, true), current_value, index));
+        auto * flash = on_device(ggml_flash_attn_ext(context, q, keys, values, mask, impl_->scale, 0, 0));
+        ggml_prec_set_acc(flash, GGML_PREC_F32);
+        ggml_set_name(flash, "offload_dense_flash_attention");
+        return ggml_reshape_2d(context, flash, g.dimension * impl_->session.query_heads(), 1);
+    }
+    ggml_tensor * inputs[] = {query, packed_kv ? packed_kv : key, packed_kv ? nullptr : value, nullptr};
     for (int i = 0; i < (impl_->direct ? 1 : (packed_kv ? 2 : 3)); ++i) {
         auto & input = inputs[i];
         if (input->type != GGML_TYPE_F32) input = ggml_cast(context, input, GGML_TYPE_F32);
         input = ggml_cont(context, input);
     }
     int input_count = packed_kv ? 2 : 3;
+    if (impl_->selected_cache && impl_->session.direct_memory()) {
+        const auto memory = impl_->session.direct_memory();
+        bool matches = false;
+#ifdef SOLID_HAVE_CUDA_SELECTION
+        matches = *memory == DeviceMemory::cuda && decode_backend && ggml_backend_is_cuda(decode_backend);
+#endif
+#ifdef SOLID_HAVE_SYCL
+        matches = matches || (*memory == DeviceMemory::sycl && decode_backend && ggml_backend_is_sycl(decode_backend));
+#endif
+        if (matches) {
+            impl_->selected_device = memory;
+            impl_->device_query = on_device(inputs[0]);
+            inputs[0] = on_device(device_query_token(context, impl_->device_query));
+            if (impl_->session.device_probabilities()) {
+                impl_->device_kv = on_device(device_consolidate_kv(context, inputs[1], inputs[2], impl_->device_query, inputs[0]));
+            }
+        }
+    }
     if (impl_->direct) {
         impl_->device_query = on_device(inputs[0]);
         auto * token = on_device(device_query_token(context,impl_->device_query));
@@ -280,8 +722,19 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         if (packed_kv) { inputs[0] = inputs[1]; inputs[1] = impl_->early; input_count = 2; }
         else { inputs[0] = inputs[1]; inputs[1] = inputs[2]; inputs[2] = impl_->early; input_count = 3; }
     }
+    if (impl_->sparse_lookahead) {
+        if (!graph || !impl_->selected_cache || packed_kv) throw std::logic_error("invalid sparse baseline graph");
+        auto * history = ggml_custom_4d(context, GGML_TYPE_I32, 1, 1, 1, 1, nullptr, 0, Impl::sparse_history, 1, impl_.get());
+        ggml_set_name(history, "offload_sparse_fixed_upload");
+        if (scheduler) ggml_backend_sched_set_tensor_backend(scheduler, history,
+            ggml_backend_sched_get_backend(scheduler, ggml_backend_sched_get_n_backends(scheduler) - 1));
+        inputs[input_count++] = on_device(ggml_dup(context, history));
+        for (int i = 0; i < input_count; ++i) ggml_build_forward_expand(graph, inputs[i]);
+    }
     if (impl_->gathered && query->ne[2] != 1) throw std::invalid_argument("gathered attention requires one decode token");
-    const auto elements = impl_->prefetch ? static_cast<std::uint64_t>(impl_->prefetch->tokens_per_head()) * impl_->session.query_heads() :
+    const auto elements = impl_->selected_cache ? static_cast<std::uint64_t>(impl_->session.gather_slots()) *
+        (2 + impl_->session.query_heads() + g.heads) : impl_->prefetch ? static_cast<std::uint64_t>(impl_->prefetch->tokens_per_head()) *
+        (impl_->session.query_heads() + (impl_->session.relative_rope() ? g.heads : 0)) :
                                           impl_->session.gather_elements();
     auto * result = ggml_custom_4d(context, impl_->gathered ? GGML_TYPE_F16 : GGML_TYPE_F32,
                                    impl_->prefill_output?1:(impl_->gathered ? static_cast<int64_t>(elements) : query->ne[0] * query->ne[1]),
@@ -289,6 +742,60 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
                                    inputs, input_count, Impl::compute, 1, impl_.get());
     ggml_set_name(result, "solid_sync_attention");
     impl_->host = result;
+    const auto infllm_attention = [&](ggml_tensor * q, ggml_tensor * keys, ggml_tensor * values,
+                                      ggml_tensor * mask, std::size_t marker_offset) {
+        const auto slots = keys->ne[1];
+        const auto & rope = *impl_->session.relative_rope();
+        auto * markers = ggml_view_1d(context, impl_->host, slots * g.heads, marker_offset);
+        auto * positions = ggml_custom_4d(context, GGML_TYPE_I32, slots * g.heads, 1, 1, 1,
+                                        &markers, 1, Impl::key_positions, 1, impl_.get());
+        ggml_set_name(positions, "solid_infllm_key_positions");
+        auto * rows = on_device(ggml_cont(context, keys));
+        rows = ggml_reshape_3d(context, rows, g.dimension, 1, slots * g.heads);
+        rows = on_device(ggml_rope_ext(context, rows, positions, nullptr, rope.dimensions,
+            rope.split_halves ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL, 0, rope.base, 1, 0, 1, 0, 0));
+        rows = ggml_reshape_3d(context, rows, g.dimension, slots, g.heads);
+        auto * logits = on_device(ggml_mul_mat(context, rows, q));
+        ggml_prec_set_acc(logits, GGML_PREC_F32);
+        auto * probabilities = on_device(ggml_soft_max_ext(context, logits, mask, impl_->scale, 0));
+        auto * transposed_values = on_device(ggml_cont(context, ggml_transpose(context, values)));
+        auto * output = on_device(ggml_mul_mat(context, transposed_values, probabilities));
+        ggml_prec_set_acc(output, GGML_PREC_F32);
+        if (impl_->prefetch) {
+            if (auto * token = impl_->prefetch->completion_token(impl_->layer)) {
+                if (impl_->prefetch->completion_host_marker()) {
+                    auto * source = output;
+                    output = ggml_custom_4d(context, GGML_TYPE_F32, source->ne[0], source->ne[1], source->ne[2], source->ne[3],
+                        &source, 1, Impl::publish_completion, 1, token);
+                    ggml_set_name(output, "solid_infllm_completion_emulator");
+                }
+#ifdef SOLID_HAVE_CUDA_SELECTION
+                else if (decode_backend && ggml_backend_is_cuda(decode_backend)) {
+                    static_assert(stream_completion_offset + sizeof(StreamCompletionBinding) <= GGML_MAX_OP_PARAMS);
+                    bind_stream_completion(logits->op_params, sizeof(logits->op_params), token, CompletionPhase::begin);
+                    bind_stream_completion(output->op_params, sizeof(output->op_params), token, CompletionPhase::end);
+                }
+#endif
+            }
+        }
+        auto * indices = ggml_custom_4d(context, GGML_TYPE_I32, impl_->session.budget().local * impl_->session.query_heads(),
+            1, 1, 1, &markers, 1, Impl::recent_indices, 1, impl_.get());
+        ggml_set_name(indices, "solid_infllm_recent_indices");
+        auto * compact = on_device(ggml_get_rows(context, ggml_reshape_2d(context, probabilities, 1, slots * impl_->session.query_heads()), indices));
+        ggml_set_name(compact, "solid_infllm_recent_scores");
+        if (impl_->session.device_probabilities()) {
+            impl_->device_scores = compact;
+            compact = on_device(device_query_token(context, on_device(ggml_cont(context, compact))));
+        }
+        output = on_device(ggml_cont(context, ggml_reshape_2d(context, output, g.dimension * impl_->session.query_heads(), 1)));
+        auto * ready = on_device(device_query_token(context, output));
+        ggml_tensor * receipt_inputs[]{compact, ready};
+        auto * received = ggml_custom_4d(context, GGML_TYPE_F32, 1, 1, 1, 1,
+            receipt_inputs, 2, Impl::receive_attention, 1, impl_.get());
+        ggml_set_name(received, "solid_infllm_attention_receipt");
+        return on_device(device_attention_result(context, output, received,
+            impl_->session.device_probabilities() ? impl_->device_kv : nullptr));
+    };
     if (impl_->prefill_output) {
         result=on_device(device_prefill_result(context,impl_->prefill_output->tensor,result,impl_->device_query,impl_->device_kv));
     } else if (impl_->prefetch) {
@@ -302,6 +809,9 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         auto * mask = ggml_view_3d(context, result, slots, 1, impl_->session.query_heads(), slots * sizeof(Half), slots * sizeof(Half), 0);
         auto * q = query->type == GGML_TYPE_F32 ? query : ggml_cast(context, query, GGML_TYPE_F32);
         q = ggml_permute(context, q, 0, 2, 1, 3);
+        if (impl_->session.relative_rope()) {
+            return infllm_attention(q, keys, values, mask, static_cast<std::size_t>(slots) * impl_->session.query_heads() * sizeof(Half));
+        }
         result = ggml_flash_attn_ext(context, q, keys, values, mask, impl_->scale, 0, 0);
         ggml_prec_set_acc(result, GGML_PREC_F32);
         ggml_set_name(result, "solid_prefetched_flash_attention");
@@ -319,6 +829,20 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
             }
         }
         result = ggml_reshape_2d(context, result, g.dimension * impl_->session.query_heads(), 1);
+    } else if (impl_->selected_cache) {
+        const auto slots = impl_->session.gather_slots();
+        auto * indices = ggml_custom_4d(context, GGML_TYPE_I32, slots, g.heads, 1, 1, &result, 1, Impl::cache_indices, 1, nullptr);
+        ggml_set_name(indices, "infllm_selected_kv_indices");
+        const auto gather = [&](bool values) {
+            auto * rows = on_device(ggml_get_rows(context, impl_->selected_cache->plane(context, values), indices));
+            rows = on_device(ggml_cast(context, rows, GGML_TYPE_F16));
+            return rows;
+        };
+        const auto mask_offset = static_cast<std::size_t>(slots) * sizeof(std::int32_t);
+        auto * mask = ggml_view_3d(context, result, slots, 1, impl_->session.query_heads(), slots * sizeof(Half), slots * sizeof(Half), mask_offset);
+        auto * q = query->type == GGML_TYPE_F32 ? query : ggml_cast(context, query, GGML_TYPE_F32);
+        return infllm_attention(ggml_permute(context, q, 0, 2, 1, 3), gather(false), gather(true), mask,
+            mask_offset + static_cast<std::size_t>(slots) * impl_->session.query_heads() * sizeof(Half));
     } else if (impl_->gathered) {
         if (g.layout == KvLayout::interleaved && scheduler && decode_backend) {
             result = ggml_dup(context, result);
@@ -336,6 +860,10 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         auto * mask = ggml_view_3d(context, result, slots, 1, impl_->session.query_heads(), slots * sizeof(Half), slots * sizeof(Half), mask_offset);
         auto * q = query->type == GGML_TYPE_F32 ? query : ggml_cast(context, query, GGML_TYPE_F32);
         q = ggml_permute(context, q, 0, 2, 1, 3);
+        if (impl_->session.relative_rope()) {
+            return infllm_attention(q, keys, values, mask,
+                mask_offset + static_cast<std::size_t>(slots) * impl_->session.query_heads() * sizeof(Half));
+        }
         result = ggml_flash_attn_ext(context, q, keys, values, mask, impl_->scale, 0, 0);
         ggml_prec_set_acc(result, GGML_PREC_F32);
 #ifdef SOLID_HAVE_SYCL
@@ -376,6 +904,11 @@ struct AttentionAdapter::Impl {
     bool gpu_decode;
     std::uint64_t prefill_tokens;
     std::vector<std::unique_ptr<KvProjection>> projections;
+    std::shared_ptr<InfllmSelectedCache> infllm_workspace;
+    std::unique_ptr<SparseBaselineLookahead> sparse_lookahead;
+    bool sparse_lookahead_enabled = false;
+    std::unique_ptr<DenseOffload> dense;
+    bool dense_enabled = false;
     std::vector<std::optional<ProjectionIntervals>> timing;
     std::filesystem::path residency_trace;
     std::filesystem::path schedule_trace;
@@ -401,7 +934,13 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     }
     KvGeometry geometry{hp.n_layer(), hp.n_head_kv(), hp.n_embd_head_k(), options.block_tokens, capacity, 4096,
                         options.interleaved ? KvLayout::interleaved : KvLayout::separate};
+    geometry.contiguous_planes = !options.in_memory && !options.interleaved;
+    impl_->dense_enabled = options.gpu_decode && !options.sparse && !options.fuse_kv_projection && geometry.contiguous_planes;
     impl_->timing.resize(geometry.layers);
+    if (options.infllm_attention && !options.in_memory && !options.prefetch && !options.interleaved &&
+        !options.fuse_kv_projection && options.selection_replay.empty()) {
+        impl_->sparse_lookahead_enabled = true;
+    }
     for (std::uint32_t layer = 0; layer < hp.n_layer(); ++layer) {
         if (hp.n_head(layer) != hp.n_head() || hp.n_head_kv(layer) != hp.n_head_kv() ||
             hp.n_embd_head_k(layer) != geometry.dimension || hp.n_embd_head_v(layer) != geometry.dimension) {
@@ -430,6 +969,21 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
         budget.local = deterministic - budget.initial;
     }
     budget.representatives = options.representative_count;
+    budget.shared_heads = options.sparse;
+    budget.infllm_attention = options.infllm_attention;
+    std::optional<RelativeRope> rope;
+    if (budget.infllm_attention) {
+        const auto type = llama_model_rope_type(model);
+        if ((type != LLAMA_ROPE_TYPE_NORM && type != LLAMA_ROPE_TYPE_NEOX) || hp.use_kq_norm) {
+            throw std::invalid_argument("InfLLM requires standard text RoPE and raw Q/K projections");
+        }
+        rope = RelativeRope{hp.n_rot(), hp.rope_freq_base_train, type == LLAMA_ROPE_TYPE_NEOX};
+        for (std::uint32_t layer = 0; layer < geometry.layers; ++layer) {
+        if (model->dev_layer(layer) != model->dev_layer(0)) impl_->dense_enabled = false;
+        if (model->dev_layer(layer) != model->dev_layer(0)) impl_->sparse_lookahead_enabled = false;
+            if (hp.n_rot(layer) != rope->dimensions) throw std::invalid_argument("InfLLM requires uniform rotary dimensions");
+        }
+    }
     if (!options.sparse) { budget.total = capacity; budget.initial = 0; budget.local = capacity; }
     std::unique_ptr<KvStore> store;
     if (options.in_memory) store = std::make_unique<MemoryKvStore>(geometry);
@@ -444,18 +998,19 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     impl_->selection_backend = options.selection_backend;
     impl_->configure_ranker = options.sparse && options.gpu_decode && options.selection_replay.empty() && options.selection_backend != "cpu";
     impl_->prefill_backend=options.prefill_backend;
-    impl_->configure_prefill=options.gpu_decode && options.prefill_backend!="cpu";
+    if (budget.infllm_attention && options.gpu_decode && impl_->prefill_backend == "auto") impl_->prefill_backend = "cuda";
+    impl_->configure_prefill = options.gpu_decode && impl_->prefill_backend != "cpu";
     impl_->prefill_queries=std::min(prefill_queries,capacity);
     impl_->prefill_tile_tokens=options.prefill_tile_tokens;
     if (options.prefetch) impl_->placement=std::make_unique<WorkerPlacement>(options.io_cpu,options.coordinator_cpu);
-    const auto slots=options.prefetch_slots_per_head ? options.prefetch_slots_per_head : std::min<std::uint64_t>(geometry.blocks_per_head(),
-        (static_cast<std::uint64_t>(budget.total)+geometry.block_tokens-1)/geometry.block_tokens+3);
+    budget.validate(geometry);
+    const auto slots = options.prefetch_slots_per_head ? options.prefetch_slots_per_head : budget.cache_slots(geometry);
     const auto admission=std::max<std::uint64_t>(options.prefetch_queue_depth,static_cast<std::uint64_t>(geometry.heads)*slots*2);
     if (options.prefetch && admission>16384) throw std::invalid_argument("prefetch worker admission exceeds 16384 requests");
     impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens,
         options.selection_trace ? trace : std::filesystem::path{},
         options.selection_replay, options.prefetch ? make_threaded_uring_reader(options.prefetch_queue_depth,impl_->placement->io_cpu(),static_cast<std::uint32_t>(admission)) : nullptr,
-        options.prefetch_slots_per_head, options.prefetch_trace ? trace.parent_path() / "prefetch.jsonl" : std::filesystem::path{});
+        options.prefetch_slots_per_head, options.prefetch_trace ? trace.parent_path() / "prefetch.jsonl" : std::filesystem::path{}, rope);
     if (options.prefetch_trace) impl_->residency_trace = trace.parent_path() / "residency.jsonl";
     impl_->schedule = parse_schedule_mode(options.schedule);
     if (options.schedule_trace) impl_->schedule_trace = trace.parent_path() / "schedule.jsonl";
@@ -468,7 +1023,11 @@ AttentionAdapter::~AttentionAdapter() {
 }
 void AttentionAdapter::check() const { impl_->failure->check(); }
 void AttentionAdapter::after_process() {
-    try { if (impl_->device) impl_->device->process_complete(); } catch (...) { impl_->failure->capture(std::current_exception()); }
+    try {
+        if (impl_->device) impl_->device->process_complete();
+        if (impl_->dense) impl_->dense->finish_decode();
+        if (impl_->sparse_lookahead) impl_->sparse_lookahead->finish_decode();
+    } catch (...) { impl_->failure->capture(std::current_exception()); }
     check();
     impl_->session->release_prefill_if_complete();
 }
@@ -477,6 +1036,7 @@ void AttentionAdapter::enable_direct_reads() { check(); impl_->session->enable_d
 void AttentionAdapter::finish() { check(); quiesce(); impl_->session->finish(); }
 SessionStats AttentionAdapter::stats() const { check(); return impl_->session->stats(); }
 SparseBudget AttentionAdapter::budget() const { return impl_->session->budget(); }
+const std::optional<RelativeRope> & AttentionAdapter::relative_rope() const { return impl_->session->relative_rope(); }
 std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionFrame> frame, std::uint32_t layer, float scale,
                                                     bool gathered, ggml_backend_t backend) {
     if (impl_->configure_prefill) {
@@ -487,8 +1047,14 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
             auto * registry=ggml_backend_cuda_reg();
             for (std::size_t ordinal=0;ordinal<ggml_backend_reg_dev_count(registry);++ordinal) {
                 if (ggml_backend_reg_dev_get(registry,ordinal)!=ggml_backend_get_device(backend)) continue;
+                const auto budget = impl_->session->budget();
+                const auto queries = budget.infllm_attention ? std::min(impl_->prefill_queries, infllm_prefill_chunk_tokens)
+                                                             : impl_->prefill_queries;
+                const auto sparse_tile = std::min<std::uint64_t>(impl_->session->geometry().capacity_tokens,
+                    static_cast<std::uint64_t>(budget.total) + queries - 1);
                 impl_->session->set_prefill(make_cuda_tiled_prefill(impl_->session->geometry(),impl_->session->query_heads(),
-                    impl_->prefill_queries,impl_->prefill_tile_tokens,static_cast<int>(ordinal)));
+                    queries, budget.infllm_attention ? static_cast<std::uint32_t>(sparse_tile) : impl_->prefill_tile_tokens, static_cast<int>(ordinal),
+                    budget.infllm_attention ? budget.local : 0));
                 configured=true; break;
             }
         }
@@ -512,8 +1078,16 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
             auto * registry = ggml_backend_cuda_reg();
             for (std::size_t ordinal = 0; ordinal < ggml_backend_reg_dev_count(registry); ++ordinal) {
                 if (ggml_backend_reg_dev_get(registry, ordinal) != ggml_backend_get_device(backend)) continue;
-                impl_->session->set_ranker(make_cuda_block_ranker(impl_->session->geometry(), impl_->session->query_heads(),
-                    impl_->session->budget().representatives, impl_->session->budget().total, static_cast<int>(ordinal), impl_->session->budget().local));
+                const auto budget = impl_->session->budget();
+                auto ranker = make_cuda_block_ranker(impl_->session->representative_geometry(), impl_->session->query_heads(),
+                    budget.infllm_attention ? 1 : budget.representatives, budget.total, static_cast<int>(ordinal),
+                    budget.infllm_attention ? 0 : budget.local, impl_->session->geometry().heads);
+                if (budget.infllm_attention && (impl_->prefill_backend == "cuda" || impl_->prefill_backend == "auto")) {
+                    if (!ranker->configure_probability_builder(budget.initial, budget.local, budget.representatives)) {
+                        throw std::runtime_error("CUDA probability representative builder unavailable");
+                    }
+                }
+                impl_->session->set_ranker(std::move(ranker));
                 configured = true;
                 break;
             }
@@ -522,8 +1096,9 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
 #ifdef SOLID_HAVE_SYCL
         if ((selector == "auto" || selector == "sycl") && backend && ggml_backend_is_sycl(backend)) {
             const auto budget = impl_->session->budget();
-            impl_->session->set_ranker(make_sycl_block_ranker(impl_->session->geometry(), impl_->session->query_heads(),
-                budget.representatives, budget.total, solid_sycl_queue(backend), budget.local));
+            impl_->session->set_ranker(make_sycl_block_ranker(impl_->session->representative_geometry(), impl_->session->query_heads(),
+                budget.infllm_attention ? 1 : budget.representatives, budget.total, solid_sycl_queue(backend),
+                budget.infllm_attention ? 0 : budget.local, impl_->session->geometry().heads));
             configured = true;
         }
 #endif
@@ -539,17 +1114,43 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
             impl_->prefetch_backend = backend;
         } else if (impl_->prefetch_backend != backend) throw std::logic_error("prefetch decode backend changed");
     }
+    InfllmSelectedCache * selected_cache = nullptr;
+    if (gathered && backend && impl_->sparse_lookahead_enabled &&
+        ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+        auto & cache = impl_->infllm_workspace;
+        if (!cache) cache = make_infllm_selected_cache(*impl_->session, backend);
+        if (cache->backend() != backend) throw std::logic_error("InfLLM cache backend changed");
+        selected_cache = cache.get();
+        if (!impl_->sparse_lookahead) {
+            impl_->sparse_lookahead = std::make_unique<SparseBaselineLookahead>(*impl_->session, *cache, uring_available());
+        }
+    }
+    if (gathered && impl_->dense_enabled && !impl_->dense) {
+        impl_->dense = std::make_unique<DenseOffload>(*impl_->session, backend);
+    }
     return std::make_unique<AttentionNode>(*impl_->session, std::move(frame), layer, scale, impl_->failure, gathered,
                                           gathered ? impl_->device.get() : nullptr,
-                                          gathered ? projection_intervals(layer,backend) : nullptr);
+                                          gathered ? projection_intervals(layer,backend) : nullptr, selected_cache,
+                                          gathered ? impl_->dense.get() : nullptr,
+                                          gathered ? impl_->sparse_lookahead.get() : nullptr);
 }
 bool AttentionAdapter::prefetch_enabled() const { return impl_->session->prefetch_enabled(); }
+bool AttentionAdapter::dense_offload_enabled() const { return impl_->dense_enabled; }
 void AttentionAdapter::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
     check();
-    if (impl_->device) impl_->device->begin_prefetch(layer, position);
+    if (impl_->dense && gathered_decode(position)) impl_->dense->begin(position);
+    else if (impl_->sparse_lookahead && gathered_decode(position)) impl_->sparse_lookahead->begin(layer, position);
+    else if (impl_->device) impl_->device->begin_prefetch(layer, position);
     else impl_->session->begin_prefetch(layer, position);
 }
 bool AttentionAdapter::observe(ggml_tensor * tensor, bool ask) noexcept {
+    if (impl_->dense && tensor->op == GGML_OP_FLASH_ATTN_EXT &&
+        std::strcmp(ggml_get_name(tensor), "offload_dense_flash_attention") == 0) {
+        if (ask) return true;
+        try { check(); impl_->dense->attention_complete(); }
+        catch (...) { impl_->failure->capture(std::current_exception()); return false; }
+        return true;
+    }
     const bool normal = tensor->op == GGML_OP_FLASH_ATTN_EXT && std::strcmp(ggml_get_name(tensor), "solid_prefetched_flash_attention") == 0;
     const bool reused = tensor->op == GGML_OP_FLASH_ATTN_EXT && std::strcmp(ggml_get_name(tensor), "solid_prefetched_flash_attention_reuse") == 0;
     const bool ours = normal || reused;
@@ -559,9 +1160,22 @@ bool AttentionAdapter::observe(ggml_tensor * tensor, bool ask) noexcept {
     catch (...) { impl_->failure->capture(std::current_exception()); return false; }
     return true;
 }
-void AttentionAdapter::quiesce() { if (impl_->device) impl_->device->quiesce(); }
-DeviceCacheStats AttentionAdapter::device_stats() const { return impl_->device ? impl_->device->stats() : DeviceCacheStats{}; }
-ScheduleStats AttentionAdapter::schedule_stats() const { return impl_->device ? impl_->device->schedule_stats() : ScheduleStats{}; }
+void AttentionAdapter::quiesce() {
+    if (impl_->device) impl_->device->quiesce();
+    if (impl_->dense) impl_->dense->join();
+    if (impl_->sparse_lookahead) impl_->sparse_lookahead->join();
+}
+DeviceCacheStats AttentionAdapter::device_stats() const {
+    if (impl_->device) return impl_->device->stats();
+    if (impl_->dense) return impl_->dense->stats();
+    return impl_->infllm_workspace ? impl_->infllm_workspace->stats() : DeviceCacheStats{};
+}
+ScheduleStats AttentionAdapter::schedule_stats() const {
+    if (impl_->device) return impl_->device->schedule_stats();
+    ScheduleStats result;
+    result.staging_bytes = device_stats().staging_bytes;
+    return result;
+}
 std::vector<int> AttentionAdapter::inference_cpus() const { return impl_->placement ? impl_->placement->inference_cpus() : std::vector<int>{}; }
 bool AttentionAdapter::gathered_decode(std::uint64_t position) const { return impl_->gpu_decode && position >= impl_->prefill_tokens; }
 bool AttentionAdapter::fused_projection() const { return !impl_->projections.empty(); }
@@ -635,6 +1249,10 @@ public:
             }
             frame->positions[i] = static_cast<std::uint64_t>(batch->pos[i]);
         }
+        if (retrieval_positions) {
+            const std::vector<std::int32_t> angles(batch->n_tokens, static_cast<std::int32_t>(adapter.budget().local - 1));
+            ggml_backend_tensor_set(retrieval_positions, angles.data(), 0, angles.size() * sizeof(std::int32_t));
+        }
         if (batch->n_tokens == 1) adapter.begin_prefetch(0, frame->positions.front());
     }
     bool can_reuse(const llm_graph_params & params) override {
@@ -652,6 +1270,7 @@ public:
     std::shared_ptr<AttentionFrame> frame;
     std::vector<std::unique_ptr<AttentionNode>> nodes;
     std::unordered_map<int, ggml_tensor *> projected_kv;
+    ggml_tensor * retrieval_positions = nullptr;
 };
 bool adapter_active(const llama_model * model) { return lookup(model) != nullptr; }
 bool graph_depends_on(const ggml_tensor * tensor, const ggml_tensor * ancestor) {
@@ -719,12 +1338,25 @@ ggml_tensor * adapter_attention(const llm_graph_context & graph, llm_graph_input
     const bool gathered = query->ne[2] == 1 && graph.ubatch.pos && graph.ubatch.pos[0] >= 0 &&
         custom->adapter.gathered_decode(static_cast<std::uint64_t>(graph.ubatch.pos[0]));
     ggml_tensor * packed = nullptr;
+    const auto & rope = custom->adapter.relative_rope();
+    if (rope) {
+        if (query->op != GGML_OP_ROPE || key->op != GGML_OP_ROPE) {
+            throw std::logic_error("InfLLM requires raw Q/K before the model RoPE operation");
+        }
+        if (!custom->retrieval_positions) {
+            custom->retrieval_positions = ggml_new_tensor_1d(graph.ctx0, GGML_TYPE_I32, query->ne[2]);
+            ggml_set_input(custom->retrieval_positions);
+        }
+        query = ggml_rope_ext(graph.ctx0, query->src[0], custom->retrieval_positions, nullptr, rope->dimensions,
+            rope->split_halves ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL, 0, rope->base, 1, 0, 1, 0, 0);
+        key = key->src[0];
+    }
     if (custom->adapter.fused_projection()) {
-        packed = KvProjection::update_key(graph.ctx0, custom->projected_kv.at(layer), key);
+        packed = rope ? custom->projected_kv.at(layer) : KvProjection::update_key(graph.ctx0, custom->projected_kv.at(layer), key);
     }
     auto * device=layer_backend(graph,layer);
     auto node = custom->adapter.node(custom->frame, static_cast<std::uint32_t>(layer), scale, gathered, device);
-    auto * result = node->build(graph.ctx0, query, key, value, packed, graph.sched, device);
+    auto * result = node->build(graph.ctx0, query, key, value, packed, graph.sched, device, graph.gf);
     if (node->selection_node()) {
         if (!custom->nodes.empty() && custom->nodes.back()->attention_node()) {
             const auto * previous = custom->nodes.back()->attention_node();
@@ -738,6 +1370,9 @@ ggml_tensor * adapter_attention(const llm_graph_context & graph, llm_graph_input
         if (layer + 1 == static_cast<int>(graph.hparams.n_layer())) node->defer_completion();
     }
     ggml_backend_sched_set_tensor_backend(graph.sched, node->host_node(), graph.backend_cpu);
+    // The prefetched bank is populated by the host frontier. Expand it before
+    // visiting matrix inputs that copy K/V out of the bank.
+    if (rope && gathered && custom->adapter.prefetch_enabled()) ggml_build_forward_expand(graph.gf, node->host_node());
     custom->nodes.push_back(std::move(node));
     return result;
 }

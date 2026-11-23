@@ -16,6 +16,7 @@ struct AttentionConfig {
     bool enabled = false;
     bool in_memory = false;
     bool sparse = false;
+    bool infllm_attention = false;
     bool gpu_decode = true;
     bool interleaved = false;
     bool fuse_kv_projection = false;
@@ -59,6 +60,7 @@ struct RunConfig {
     bool kv_on_gpu = true;
     bool ignore_eos = false;
     std::string kv_dtype = "f16";
+    std::string kv_projection_weight_dtype;
     std::vector<std::int32_t> prompt_token_ids;
     AttentionConfig attention;
     bool dump_logits = false;

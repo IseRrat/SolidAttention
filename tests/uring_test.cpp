@@ -62,6 +62,37 @@ int main() {
             !std::equal(direct.begin(),direct.end(),expected.begin()+11)) {
             throw std::runtime_error("unaligned asynchronous direct read payload");
         }
+        const solid::KvGeometry geometry{1, 2, 128, 32, 32, 4096, solid::KvLayout::separate, true};
+        auto layer_path = path;
+        layer_path += "-dense";
+        solid::FileKvStore dense(geometry, solid::create_session_file(layer_path, true), 2048);
+        for (std::uint64_t p = 0; p < 3; ++p) {
+            std::vector<solid::Half> token(512);
+            for (std::size_t i = 0; i < token.size(); ++i) token[i] = static_cast<solid::Half>(p * 512 + i + 1);
+            dense.append_interleaved(0, p, token);
+        }
+        dense.enable_direct_reads();
+        auto batch = solid::make_uring_reader(4);
+        std::vector<solid::Half> planes(2 * 2 * 128 * 32);
+        dense.read_dense_layer(0, 3, 32, planes.data(), batch.get());
+        for (std::uint32_t kind = 0; kind < 2; ++kind) for (std::uint32_t h = 0; h < 2; ++h) {
+            for (std::uint32_t p = 0; p < 3; ++p) for (std::uint32_t d = 0; d < 128; ++d) {
+                if (planes[((kind * 2 + h) * 32 + p) * 128 + d] != p * 512 + h * 256 + kind * 128 + d + 1) {
+                    throw std::runtime_error("batched layer read changed K/V order or pending rows");
+                }
+            }
+        }
+        if (dense.io_stats().read_requests != 4 || batch->stats().completed_reads != 4) {
+            throw std::runtime_error("batched layer issued a read for pending K/V rows");
+        }
+        auto sparse_reads = solid::make_uring_reader(2);
+        std::array<solid::Half, 128> key_0{}, value_0{}, key_1{}, value_1{}, pending_key{}, pending_value{};
+        dense.read_separate_rows(0, {{1, 0, 1, key_0.data(), value_0.data()},
+            {0, 1, 1, key_1.data(), value_1.data()}, {0, 2, 1, pending_key.data(), pending_value.data()}}, sparse_reads.get(), 2);
+        if (sparse_reads->stats().completed_reads != 4 || key_0.front() != 257 || value_0.front() != 385 ||
+            key_1.front() != 513 || value_1.front() != 641 || pending_key.front() != 1025 || pending_value.front() != 1153) {
+            throw std::runtime_error("multi-batch sparse read changed K/V ranges or issued disk reads for pending rows");
+        }
 #endif
         std::cout << "liburing temporary-file reads, short reads, EOF, cancellation and drain passed\n";
         return 0;

@@ -6,15 +6,18 @@
 
 namespace solid {
 void validate_representative_seed(const KvGeometry & geometry, std::uint32_t representatives, std::uint32_t local,
-                                  const RepresentativeSeed & seed) {
+                                  const RepresentativeSeed & seed, std::uint32_t input_heads) {
     geometry.validate();
+    if (!input_heads) input_heads = geometry.heads;
     if (!local || local > geometry.capacity_tokens || !representatives || representatives > geometry.block_tokens ||
-        seed.length > geometry.capacity_tokens) throw std::invalid_argument("invalid representative builder geometry or length");
+        geometry.heads % input_heads || seed.length > geometry.capacity_tokens) {
+        throw std::invalid_argument("invalid representative builder geometry or length");
+    }
     const auto pending = std::min<std::uint64_t>(seed.length, local);
     const auto matured = seed.length - pending;
     const auto partial = matured % geometry.block_tokens;
     const auto slots = static_cast<std::uint64_t>(geometry.heads) * representatives;
-    if (seed.pending_keys.size() != pending * geometry.heads * geometry.dimension ||
+    if (seed.pending_keys.size() != pending * input_heads * geometry.dimension ||
         seed.pending_scores.size() != pending * geometry.heads || seed.partial_positions.size() != slots ||
         seed.partial_scores.size() != slots || seed.partial_keys.size() != slots * geometry.dimension) {
         throw std::invalid_argument("representative builder seed shape");

@@ -5,6 +5,7 @@
 #include "solid_build_info.hpp"
 #include "llama.h"
 #include "llama-memory.h"
+#include "llama-model.h"
 #include "ggml-backend.h"
 #include "nlohmann/json.hpp"
 
@@ -19,6 +20,7 @@
 #include <limits>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 #include <vector>
 
 namespace {
@@ -109,13 +111,17 @@ Json counters(const solid::SessionStats & s, const solid::DeviceCacheStats & d) 
         {"prefill_kv_download_bytes",s.prefill_kv_download_bytes},{"prefill_query_upload_bytes",s.prefill.query_upload_bytes},
         {"prefill_device_query_tokens",s.prefill.device_query_tokens},{"prefill_device_kv_tokens",s.prefill.device_kv_tokens},
         {"prefill_output_download_bytes",s.prefill.output_download_bytes},{"prefill_output_device_copy_bytes",s.prefill.output_device_copy_bytes},
+        {"prefill_probability_download_bytes",s.prefill.probability_download_bytes},
         {"prefill_tiled_batches", s.prefill.batches}, {"prefill_tiled_queries", s.prefill.query_tokens},
         {"prefill_tiles", s.prefill.tiles}, {"prefill_kv_tokens", s.prefill.kv_tokens},
         {"prefill_upload_bytes", s.prefill.upload_bytes}, {"tiled_prefill_inclusive_ms", s.tiled_prefill_ns/1e6},
         {"gather_inclusive_ms", s.gather_ns / 1e6}, {"gather_copy_bytes", s.gather_copy_bytes},
+        {"dense_prefetch_layers", s.dense_prefetch_layers}, {"dense_prefetch_wait_ms", s.dense_prefetch_wait_ns / 1e6},
+        {"sparse_prefetch_layers", s.sparse_prefetch_layers}, {"sparse_prefetch_wait_ms", s.sparse_prefetch_wait_ns / 1e6},
         {"streaming_attention_inclusive_ms", s.streaming_attention_ns / 1e6},
         {"prefetch_wait_ms", s.prefetch.wait_ns / 1e6}, {"prefetch_resolve_ms", s.prefetch.resolve_ns / 1e6},
         {"device_uploads", d.uploads}, {"device_upload_bytes", d.upload_bytes},
+        {"device_reused_blocks", d.reused_blocks}, {"device_overwritten_blocks", d.overwritten_blocks},
         {"device_shared_host_copy_bytes", d.shared_host_copy_bytes},
         {"current_device_rows",d.current_device_rows},{"current_device_bytes",d.current_device_bytes},
         {"current_host_bytes",d.current_host_bytes},{"refreshed_device_tails",d.refreshed_tails},{"retained_device_prefix_bytes",d.retained_prefix_bytes}};
@@ -137,16 +143,22 @@ struct EvaluationBridge {
     solid::ExecutionProfile * profile;
     std::filesystem::path diagnostic;
     std::size_t diagnostic_layers = 0, captured = 0;
+    bool diagnostic_prefill = false;
     std::exception_ptr diagnostic_error;
     void check() const { if (diagnostic_error) std::rethrow_exception(diagnostic_error); }
     bool wants_diagnostic(const ggml_tensor * tensor) const {
-        return !diagnostic.empty() && captured < diagnostic_layers &&
-            tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[0]->ne[1] == 1;
+        if (diagnostic.empty() || captured >= diagnostic_layers) return false;
+        if (diagnostic_prefill) {
+            return tensor->type == GGML_TYPE_F32 && tensor->ne[1] > 1 &&
+                std::string_view(ggml_get_name(tensor)) == "solid_sync_attention";
+        }
+        return tensor->op == GGML_OP_FLASH_ATTN_EXT && tensor->src[0]->ne[1] == 1;
     }
     void capture(ggml_tensor * tensor) {
         Json tensors = Json::array();
-        const ggml_tensor * values[] = {tensor->src[0], tensor->src[1], tensor->src[2], tensor->src[3], tensor};
-        const char * labels[] = {"q", "k", "v", "mask", "output"};
+        const ggml_tensor * values[] = {tensor->src[0], tensor->src[1], tensor->src[2],
+                                       diagnostic_prefill ? nullptr : tensor->src[3], tensor};
+        const char * labels[] = {"q", diagnostic_prefill && !tensor->src[2] ? "kv" : "k", "v", "mask", "output"};
         for (std::size_t i = 0; i < std::size(values); ++i) {
             const auto * value = values[i];
             if (!value) continue;
@@ -247,6 +259,21 @@ int main(int argc, char ** argv) {
             llama_model_load_from_file(config.model.string().c_str(), mp), llama_model_free);
         if (!model) throw std::runtime_error("model load failed");
         const double load_ms = milliseconds(load_start);
+        auto weight_types = Json::object();
+        if (!tokenize_only && !config.kv_projection_weight_dtype.empty()) {
+            for (const auto & layer : model->layers) {
+                if (!layer.wk || !layer.wv || layer.wk->type != GGML_TYPE_Q4_0 || layer.wv->type != GGML_TYPE_Q4_0) {
+                    throw std::runtime_error("K/V projection weights must both be q4_0 in every layer");
+                }
+            }
+            for (const auto & entry : model->tensors_by_name) {
+                const auto * tensor = entry.second;
+                if (ggml_n_dims(tensor) > 1) {
+                    const auto type = ggml_type_name(tensor->type);
+                    weight_types[type] = weight_types.value(type, 0) + 1;
+                }
+            }
+        }
         if (llama_model_has_encoder(model.get())) throw std::runtime_error("runner requires a decoder-only model");
         const auto * vocab = llama_model_get_vocab(model.get());
         for (const auto token : config.replay_token_ids) {
@@ -296,16 +323,17 @@ int main(int argc, char ** argv) {
         const double adapter_ms = milliseconds(adapter_start);
         EvaluationBridge evaluation{adapter.get(), config.attention.profile ? &profile : nullptr};
         if (const auto * directory = std::getenv("SOLID_DIAGNOSTIC_ATTENTION")) {
-            if (config.attention.prefetch && config.attention.schedule != "naive") {
+            evaluation.diagnostic_prefill = config.attention.infllm_attention;
+            if (!evaluation.diagnostic_prefill && config.attention.prefetch && config.attention.schedule != "naive") {
                 throw std::invalid_argument("attention diagnostics require naive prefetch scheduling to retain the captured cache bank");
             }
             evaluation.diagnostic = directory;
-            evaluation.diagnostic_layers = llama_model_n_layer(model.get());
+            evaluation.diagnostic_layers = evaluation.diagnostic_prefill ? 2 : llama_model_n_layer(model.get());
             if (!std::filesystem::create_directory(evaluation.diagnostic)) {
                 throw std::runtime_error("attention diagnostic requires a new output directory");
             }
         }
-        if (config.attention.profile || config.attention.prefetch || !evaluation.diagnostic.empty()) {
+        if (config.attention.profile || config.attention.prefetch || (adapter && adapter->dense_offload_enabled()) || !evaluation.diagnostic.empty()) {
             cp.cb_eval = EvaluationBridge::evaluate;
             cp.cb_eval_user_data = &evaluation;
         }
@@ -402,6 +430,10 @@ int main(int argc, char ** argv) {
                                 {"prefill_ms", perf.t_p_eval_ms}, {"decode_ms", perf.t_eval_ms}}}
         };
         result["model_parts_sha256"] = Json::array({config.model_sha256});
+        if (!config.kv_projection_weight_dtype.empty()) {
+            result["kv_projection_weight_dtype"] = config.kv_projection_weight_dtype;
+            result["matrix_weight_types"] = std::move(weight_types);
+        }
         result["memory"] = {{"native_memory_buffers", Json::array()}, {"kv_system_tracked_bytes", 0}};
         if (!adapter) {
             std::uint64_t bytes = 0;
@@ -426,6 +458,7 @@ int main(int argc, char ** argv) {
                 stats.prefetch.host_bytes + device.resident_bytes + staging + stats.ranking.device_bytes + stats.ranking.host_bytes +
                 stats.prefill.kv_device_bytes + stats.prefill_host_bytes;
             result["memory"]["custom_buffers"] = {{"store_bytes", stats.kv_resident_bytes}, {"representatives_bytes", stats.representative_bytes},
+                {"store_write_buffer_bytes", stats.kv_write_buffer_bytes},
                 {"prefetch_host_bytes", stats.prefetch.host_bytes}, {"device_kv_bytes", device.resident_bytes}, {"copy_staging_bytes", staging},
                 {"selection_device_bytes", stats.ranking.device_bytes}, {"selection_host_bytes", stats.ranking.host_bytes},
                 {"prefill_kv_device_bytes", stats.prefill.kv_device_bytes}, {"prefill_kv_host_bytes", stats.prefill_host_bytes},
@@ -466,10 +499,17 @@ int main(int argc, char ** argv) {
                 {"prefill_kv_download_bytes",stats.prefill_kv_download_bytes},{"prefill_query_upload_bytes",stats.prefill.query_upload_bytes},
                 {"prefill_device_query_tokens",stats.prefill.device_query_tokens},{"prefill_device_kv_tokens",stats.prefill.device_kv_tokens},
                 {"prefill_output_download_bytes",stats.prefill.output_download_bytes},{"prefill_output_device_copy_bytes",stats.prefill.output_device_copy_bytes},
+                {"prefill_probability_download_bytes",stats.prefill.probability_download_bytes},
                 {"block_tokens", config.attention.block_tokens}, {"context_budget_tokens", budget.total},
                 {"init_tokens", budget.initial}, {"local_tokens", budget.local}, {"representative_count", budget.representatives},
-                {"head_aggregation", "mean"}, {"position_policy", "absolute_native_rope"},
-                {"attention_backend", config.attention.gpu_decode ? "ggml_flash_decode+"+stats.prefill_backend : "cpu_streaming_reference"},
+                {"head_aggregation", budget.shared_heads ? "shared_across_heads" : "mean"},
+                {"representative_scoring_heads", budget.shared_heads ? "query" : "kv"},
+                {"infllm_attention", budget.infllm_attention},
+                {"representative_score", budget.infllm_attention ? "attention_probability" : "window_dot_product"},
+                {"position_policy", budget.infllm_attention ? "infllm_relative_rope" : "absolute_native_rope"},
+                {"attention_backend", config.attention.gpu_decode ?
+                    (budget.infllm_attention ? "ggml_infllm_decode+" : "ggml_flash_decode+") + stats.prefill_backend :
+                    (budget.infllm_attention ? stats.prefill_backend : "cpu_streaming_reference")},
                 {"prefill_backend",stats.prefill_backend},{"prefill_backend_requested",config.attention.prefill_backend},
                 {"prefill_query_capacity",stats.prefill.query_capacity},{"prefill_tile_capacity",stats.prefill.tile_capacity},
                 {"io_mode", config.attention.direct_decode_reads ? "direct_decode_reads" : "buffered"},

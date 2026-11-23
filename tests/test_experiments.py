@@ -57,7 +57,7 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
-    def test_short_sparse_baseline_budget_does_not_change_solid_budget(self):
+    def test_paired_sparse_variants_share_budget(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)
             spec_path,_=fixture(root)
@@ -66,14 +66,14 @@ class ExperimentTests(unittest.TestCase):
             suite.update(lengths=[4,8],variants=["offload","offload-sparse","solid"],
                          offload_sparse_budgets={"4":"full","8":4})
             write(spec_path,spec)
+            with self.assertRaisesRegex(ValueError, "same budget"):
+                experiments.create(spec_path,root/"invalid-plan")
+            del suite["offload_sparse_budgets"]
+            write(spec_path,spec)
             _,plan=experiments.read_plan(experiments.create(spec_path,root/"plan"))
             for row in plan["jobs"]:
-                group=row["group"]
                 attention=common.load(row["config"])["attention"]
-                if group["variant"]=="offload-sparse":
-                    self.assertEqual(attention["context_budget_tokens"],{4:6,8:4}[group["input_tokens"]])
-                else:
-                    self.assertNotIn("context_budget_tokens",attention)
+                self.assertNotIn("context_budget_tokens",attention)
 
     def test_worker_cpu_settings_are_applied_only_to_prefetch_variants(self):
         template={"attention":{"io_cpu":6,"coordinator_cpu":7}}
@@ -94,6 +94,11 @@ class ExperimentTests(unittest.TestCase):
                 self.assertEqual(config["attention"]["prefill_tile_tokens"],128)
         for bad in ({"prefill_backend":"unknown"},{"prefill_tile_tokens":0},{"prefill_tile_tokens":True}):
             with self.assertRaises(ValueError): experiments.variant_config({"attention":bad},"offload",32,1024)
+        infllm = {"attention": {"infllm_attention":True,"prefill_backend":"cuda"}}
+        for variant in ("offload-sparse", "solid"):
+            attention = experiments.variant_config(infllm, variant, 32, 0)["attention"]
+            self.assertEqual(attention["prefill_backend"], "cuda")
+            self.assertNotIn("context_budget_tokens", attention)
 
     def test_selection_backend_survives_sparse_variant_preparation(self):
         for selector in ("auto", "cpu", "cuda"):

@@ -1,4 +1,5 @@
 #include "solid/kv_store.hpp"
+#include "solid/async_reader.hpp"
 
 #include <algorithm>
 #include <array>
@@ -218,7 +219,8 @@ float from_half(Half value) {
 void KvGeometry::validate() const {
     if (layers == 0 || heads == 0 || dimension == 0 || block_tokens == 0 || capacity_tokens == 0 ||
         alignment == 0 || alignment > header_bytes || (alignment & (alignment - 1)) != 0 ||
-        (layout != KvLayout::separate && layout != KvLayout::interleaved)) {
+        (layout != KvLayout::separate && layout != KvLayout::interleaved) ||
+        (contiguous_planes && layout != KvLayout::separate)) {
         throw std::invalid_argument("invalid KV geometry");
     }
     (void) file_bytes();
@@ -234,8 +236,12 @@ std::uint64_t KvGeometry::slot_bytes() const {
     if (alignment == 0) throw std::invalid_argument("alignment must be positive");
     return layout == KvLayout::separate ? product(2, align_up(plane_bytes(), alignment)) : align_up(product(2, plane_bytes()), alignment);
 }
+std::uint64_t KvGeometry::value_offset() const {
+    return align_up(contiguous_planes ? product(product(capacity_tokens, dimension), sizeof(Half)) : plane_bytes(), alignment);
+}
 std::uint64_t KvGeometry::file_bytes() const {
-    const auto data = product(product(product(layers, heads), blocks_per_head()), slot_bytes());
+    const auto head_bytes = contiguous_planes ? product(2, value_offset()) : product(blocks_per_head(), slot_bytes());
+    const auto data = product(product(layers, heads), head_bytes);
     if (data > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) - header_bytes) {
         throw std::overflow_error("KV file size overflow");
     }
@@ -243,6 +249,10 @@ std::uint64_t KvGeometry::file_bytes() const {
 }
 std::uint64_t KvGeometry::block_offset(std::uint32_t layer, std::uint32_t head, std::uint64_t block) const {
     if (layer >= layers || head >= heads || block >= blocks_per_head()) throw std::out_of_range("KV block identity");
+    if (contiguous_planes) {
+        return header_bytes + product(static_cast<std::uint64_t>(layer) * heads + head, 2 * value_offset()) +
+            product(block, plane_bytes());
+    }
     const auto index = (static_cast<std::uint64_t>(layer) * heads + head) * blocks_per_head() + block;
     return header_bytes + product(index, slot_bytes());
 }
@@ -250,6 +260,32 @@ std::unique_ptr<RandomAccessFile> create_session_file(const std::filesystem::pat
     return std::make_unique<NativeFile>(path, remove_on_close);
 }
 KvStore::KvStore(KvGeometry geometry) : geometry_(geometry) { geometry_.validate(); }
+void KvStore::read_rows(std::uint32_t layer, std::uint32_t head, std::uint64_t first, std::uint32_t count,
+                        Half * keys, Half * values, std::vector<Half> &) {
+    const auto & g = geometry_;
+    if (!keys || head >= g.heads || first > length(layer) || count > length(layer) - first) {
+        throw std::invalid_argument("KV row range");
+    }
+    KvBlock block;
+    for (std::uint32_t copied = 0; copied < count;) {
+        const auto position = first + copied;
+        read(layer, head, position / g.block_tokens, block);
+        const auto row = position % g.block_tokens;
+        if (row >= block.valid_tokens) throw std::logic_error("incomplete KV row range");
+        const auto take = std::min<std::uint32_t>(count - copied, block.valid_tokens - row);
+        if (!values && g.layout == KvLayout::interleaved) {
+            std::copy_n(block.key(row), static_cast<std::size_t>(take) * 2 * g.dimension,
+                        keys + static_cast<std::size_t>(copied) * 2 * g.dimension);
+        } else {
+            for (std::uint32_t i = 0; i < take; ++i) {
+                const auto offset = static_cast<std::size_t>(copied + i) * g.dimension;
+                std::copy_n(block.key(row + i), g.dimension, keys + (values ? offset : 2 * offset));
+                std::copy_n(block.value(row + i), g.dimension, values ? values + offset : keys + 2 * offset + g.dimension);
+            }
+        }
+        copied += take;
+    }
+}
 std::vector<KvReadSegment> KvStore::plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
                                             KvBlock & destination, std::uint32_t) {
     read(layer, head, block, destination);
@@ -344,7 +380,8 @@ FileKvStore::FileKvStore(KvGeometry geometry, std::unique_ptr<RandomAccessFile> 
     std::array<unsigned char, header_bytes> header{};
     std::memcpy(header.data(), "SOLIDKV1", 8);
     const std::uint64_t fields[] = {1, header_bytes, geometry.layers, geometry.heads, geometry.dimension,
-        geometry.block_tokens, geometry.capacity_tokens, geometry.alignment, static_cast<std::uint32_t>(geometry.layout), sizeof(Half)};
+        geometry.block_tokens, geometry.capacity_tokens, geometry.alignment, static_cast<std::uint32_t>(geometry.layout),
+        sizeof(Half), geometry.contiguous_planes};
     for (std::size_t i = 0; i < std::size(fields); ++i) put_u64(header.data() + 8 + i * 8, fields[i]);
     write_exact(header.data(), header.size(), 0);
     stats_ = {};
@@ -415,7 +452,8 @@ std::vector<KvWriteSegment> FileKvStore::begin_write(std::uint32_t layer) {
     for (std::size_t first = 0; first < count;) {
         const auto position = pending.first + first;
         const auto in_block = position % geometry_.block_tokens;
-        const auto take = std::min<std::size_t>(count - first, geometry_.block_tokens - in_block);
+        const auto take = geometry_.contiguous_planes ? count - first :
+            std::min<std::size_t>(count - first, geometry_.block_tokens - in_block);
         for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
             const auto offset = geometry_.block_offset(layer, head, position / geometry_.block_tokens);
             if (geometry_.layout == KvLayout::separate) {
@@ -426,7 +464,7 @@ std::vector<KvWriteSegment> FileKvStore::begin_write(std::uint32_t layer) {
                 }
                 const auto bytes = take * dimension * sizeof(Half);
                 segments.push_back({offset + in_block * dimension * sizeof(Half), packed, bytes});
-                segments.push_back({offset + align_up(geometry_.plane_bytes(), geometry_.alignment) + in_block * dimension * sizeof(Half),
+                segments.push_back({offset + geometry_.value_offset() + in_block * dimension * sizeof(Half),
                                     packed + take * dimension, bytes});
             } else {
                 for (std::size_t i = 0; i < take; ++i) {
@@ -457,6 +495,130 @@ void FileKvStore::read(std::uint32_t layer, std::uint32_t head, std::uint64_t bl
         read_exact(reinterpret_cast<unsigned char *>(result.storage()) + segment.buffer_offset, segment.bytes, segment.file_offset);
     }
 }
+void FileKvStore::read_rows(std::uint32_t layer, std::uint32_t head, std::uint64_t first, std::uint32_t count,
+                            Half * keys, Half * values, std::vector<Half> & scratch) {
+    const auto & g = geometry_;
+    const bool packed = g.layout == KvLayout::interleaved && g.slot_bytes() == 2 * g.plane_bytes() && !values;
+    if (!g.contiguous_planes && !packed) {
+        KvStore::read_rows(layer, head, first, count, keys, values, scratch);
+        return;
+    }
+    const auto size = length(layer);
+    if (!keys || head >= g.heads || first > size || count > size - first) throw std::invalid_argument("KV row range");
+    if (!count) return;
+    const auto committed = committed_[layer] > first ? std::min<std::uint64_t>(count, committed_[layer] - first) : 0;
+    if (committed) {
+        const auto offset = g.block_offset(layer, head, first / g.block_tokens) +
+            (first % g.block_tokens) * g.dimension * sizeof(Half) * (packed ? 2 : 1);
+        const auto elements = static_cast<std::size_t>(committed) * g.dimension;
+        const auto bytes = elements * sizeof(Half);
+        if (packed) read_exact(keys, 2 * bytes, offset);
+        else if (values) {
+            read_exact(keys, bytes, offset);
+            read_exact(values, bytes, offset + g.value_offset());
+        } else {
+            scratch.resize(2 * elements);
+            read_exact(scratch.data(), bytes, offset);
+            read_exact(scratch.data() + elements, bytes, offset + g.value_offset());
+            for (std::size_t i = 0; i < committed; ++i) {
+                std::copy_n(scratch.data() + i * g.dimension, g.dimension, keys + i * 2 * g.dimension);
+                std::copy_n(scratch.data() + elements + i * g.dimension, g.dimension, keys + (i * 2 + 1) * g.dimension);
+            }
+        }
+    }
+    const auto & pending = pending_[layer];
+    for (auto i = committed; i < count; ++i) {
+        const auto source = (first + i - pending.first) * token_elements_ + head * 2 * g.dimension;
+        if (source + 2 * g.dimension > pending.values.size()) throw std::logic_error("KV dirty range mismatch");
+        const auto offset = static_cast<std::size_t>(i) * g.dimension;
+        if (values) {
+            std::copy_n(pending.values.data() + source, g.dimension, keys + offset);
+            std::copy_n(pending.values.data() + source + g.dimension, g.dimension, values + offset);
+        } else std::copy_n(pending.values.data() + source, 2 * g.dimension, keys + 2 * offset);
+    }
+}
+void FileKvStore::read_dense_layer(std::uint32_t layer, std::uint32_t count, std::uint32_t slots, Half * destination,
+                                    AsyncReader * reader) {
+    check_ready();
+    const auto & g = geometry_;
+    if (!g.contiguous_planes || !destination || count > slots || count != length(layer)) {
+        throw std::invalid_argument("invalid dense KV layer read");
+    }
+    const auto stride = static_cast<std::size_t>(slots) * g.dimension;
+    const auto plane = stride * g.heads;
+    std::vector<KvRowRange> ranges;
+    ranges.reserve(g.heads);
+    for (std::uint32_t head = 0; head < g.heads; ++head) {
+        ranges.push_back({head, 0, count, destination + head * stride, destination + plane + head * stride});
+    }
+    read_separate_rows(layer, ranges, reader, 2 * static_cast<std::size_t>(g.heads));
+}
+void FileKvStore::read_separate_rows(std::uint32_t layer, const std::vector<KvRowRange> & ranges, AsyncReader * reader,
+                                     std::size_t depth) {
+    if (ranges.empty()) return;
+    const auto & g = geometry_;
+    const auto size = length(layer);
+    if (!g.contiguous_planes || !depth) throw std::invalid_argument("invalid separate KV read batch");
+    if (!reader || native_handle() < 0) {
+        std::vector<Half> scratch;
+        for (const auto & range : ranges) read_rows(layer, range.head, range.first, range.count, range.keys, range.values, scratch);
+        return;
+    }
+    const auto committed = committed_[layer];
+    const auto start = std::chrono::steady_clock::now();
+    std::vector<KvReadRequest> requests;
+    requests.reserve(depth);
+    const auto finish_batch = [&] {
+        if (requests.empty()) return;
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            const auto & read = requests[i];
+            if (!reader->submit(i + 1, read.fd, read.buffer, read.bytes, read.offset)) throw std::runtime_error("KV read queue capacity");
+        }
+        reader->flush();
+        for (std::size_t i = 0; i < requests.size(); ++i) {
+            ReadCompletion receipt{};
+            if (!reader->poll(receipt, true) || !receipt.id || receipt.id > requests.size()) throw std::runtime_error("missing KV read completion");
+            const auto & read = requests[receipt.id - 1];
+            const auto bytes = read.scratch ? read.logical_bytes : read.bytes;
+            if (read.finish(receipt.result) != static_cast<std::int64_t>(bytes)) throw std::runtime_error("incomplete KV read");
+            ++stats_.read_requests;
+            stats_.read_bytes += bytes;
+        }
+        reader->acknowledge_notifications();
+        requests.clear();
+    };
+    try {
+        for (const auto & range : ranges) {
+            const auto [head, first, count, keys, values] = range;
+            if (!keys || !values || head >= g.heads || first > size || count > size - first) throw std::invalid_argument("KV row range");
+            const auto disk = committed > first ? std::min<std::uint64_t>(count, committed - first) : 0;
+            if (disk) {
+                const auto offset = g.block_offset(layer, head, first / g.block_tokens) +
+                    (first % g.block_tokens) * g.dimension * sizeof(Half);
+                const auto bytes = disk * g.dimension * sizeof(Half);
+                requests.push_back(prepare_read(keys, bytes, offset));
+                if (requests.size() == depth) finish_batch();
+                requests.push_back(prepare_read(values, bytes, offset + g.value_offset()));
+                if (requests.size() == depth) finish_batch();
+            }
+            const auto & pending = pending_[layer];
+            for (auto i = disk; i < count; ++i) {
+                const auto source = (first + i - pending.first) * token_elements_ + head * 2 * g.dimension;
+                if (source + 2 * g.dimension > pending.values.size()) throw std::logic_error("KV dirty range mismatch");
+                std::copy_n(pending.values.data() + source, g.dimension, keys + i * g.dimension);
+                std::copy_n(pending.values.data() + source + g.dimension, g.dimension, values + i * g.dimension);
+            }
+        }
+        finish_batch();
+        stats_.read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+    } catch (...) {
+        failed_ = true;
+        // Keep the aligned buffers alive until the original read completions retire.
+        try { reader->drain(); } catch (...) { std::terminate(); }
+        throw;
+    }
+
+}
 std::vector<KvReadSegment> FileKvStore::plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
                                                 KvBlock & result, std::uint32_t prefix) {
     check_ready();
@@ -481,7 +643,7 @@ std::vector<KvReadSegment> FileKvStore::plan_read(std::uint32_t layer, std::uint
         const auto bytes = (committed - prefix) * dimension * sizeof(Half);
         if (geometry_.layout == KvLayout::separate) {
             segments.push_back({offset + prefix * dimension * sizeof(Half), prefix * dimension * sizeof(Half), static_cast<std::size_t>(bytes)});
-            segments.push_back({offset + align_up(geometry_.plane_bytes(), geometry_.alignment) + prefix * dimension * sizeof(Half),
+            segments.push_back({offset + geometry_.value_offset() + prefix * dimension * sizeof(Half),
                                 (static_cast<std::size_t>(geometry_.block_tokens) + prefix) * dimension * sizeof(Half), static_cast<std::size_t>(bytes)});
         } else {
             segments.push_back({offset + prefix * 2 * dimension * sizeof(Half), prefix * 2 * dimension * sizeof(Half), static_cast<std::size_t>(bytes * 2)});
@@ -506,8 +668,12 @@ void FileKvStore::flush_full_layer(std::uint32_t layer) {
 }
 std::uint64_t FileKvStore::length(std::uint32_t layer) const { check_ready(); return lengths_.at(layer); }
 std::uint64_t FileKvStore::resident_bytes() const {
-    std::uint64_t total = (lengths_.capacity() + committed_.capacity()) * sizeof(std::uint64_t) + scratch_.capacity() * sizeof(Half);
-    for (const auto & pending : pending_) total += sizeof(Pending) + pending.values.capacity() * sizeof(Half);
+    return (lengths_.capacity() + committed_.capacity()) * sizeof(std::uint64_t) +
+        pending_.capacity() * sizeof(Pending) + scratch_.capacity() * sizeof(Half) + write_buffer_bytes();
+}
+std::uint64_t FileKvStore::write_buffer_bytes() const {
+    std::uint64_t total = 0;
+    for (const auto & pending : pending_) total += pending.values.capacity() * sizeof(Half);
     return total;
 }
 } // namespace solid

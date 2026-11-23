@@ -47,7 +47,8 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     const std::set<std::string> keys = {
         "schema_version", "model", "model_sha256", "additional_model_files", "prompt", "output", "context_tokens",
         "batch_tokens", "microbatch_tokens", "max_new_tokens", "threads", "gpu_layers",
-        "flash_attention", "kv_on_gpu", "ignore_eos", "sampling", "kv_dtype", "attention", "dump_logits", "replay_token_ids", "prompt_token_ids"
+        "flash_attention", "kv_on_gpu", "ignore_eos", "sampling", "kv_dtype", "kv_projection_weight_dtype", "attention", "dump_logits",
+        "replay_token_ids", "prompt_token_ids"
     };
     if (!j.is_object()) {
         throw std::invalid_argument("config must be an object");
@@ -118,6 +119,12 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     result.kv_on_gpu = j.at("kv_on_gpu").get<bool>();
     result.ignore_eos = j.at("ignore_eos").get<bool>();
     result.kv_dtype = j.at("kv_dtype").get<std::string>();
+    if (j.contains("kv_projection_weight_dtype")) {
+        result.kv_projection_weight_dtype = j.at("kv_projection_weight_dtype").get<std::string>();
+        if (result.kv_projection_weight_dtype != "q4_0") {
+            throw std::invalid_argument("kv_projection_weight_dtype must be q4_0");
+        }
+    }
     if (result.kv_dtype == "q4_0" && !result.flash_attention) throw std::invalid_argument("q4_0 KV requires flash attention");
     if (j.contains("prompt_token_ids")) {
         const auto & ids = j.at("prompt_token_ids");
@@ -146,7 +153,7 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     }
     if (j.contains("attention")) {
         const auto & a = j.at("attention");
-        const std::set<std::string> allowed = {"storage", "sparse", "gpu_decode", "layout", "fuse_kv_projection", "profile", "block_tokens", "context_budget_tokens",
+        const std::set<std::string> allowed = {"storage", "sparse", "infllm_attention", "gpu_decode", "layout", "fuse_kv_projection", "profile", "block_tokens", "context_budget_tokens",
             "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "direct_decode_reads", "selection_replay",
             "prefetch", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head", "schedule", "schedule_trace", "selection_trace", "selection_backend", "prefill_backend", "prefill_tile_tokens", "io_cpu", "coordinator_cpu"};
         if (!a.is_object()) throw std::invalid_argument("attention must be an object");
@@ -159,6 +166,8 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         if (storage != "memory" && storage != "ssd") throw std::invalid_argument("attention storage must be memory or ssd");
         target.in_memory = storage == "memory";
         target.sparse = a.at("sparse").get<bool>();
+        if (a.contains("infllm_attention")) target.infllm_attention = a.at("infllm_attention").get<bool>();
+        if (target.infllm_attention && !target.sparse) throw std::invalid_argument("InfLLM requires sparse attention");
         if (a.contains("layout")) {
             const auto layout = a.at("layout").get<std::string>();
             if (layout != "separate" && layout != "interleaved") throw std::invalid_argument("layout must be separate or interleaved");
@@ -189,6 +198,7 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         if (a.contains("prefill_tile_tokens")) target.prefill_tile_tokens=positive(a,"prefill_tile_tokens");
         if (target.prefill_backend=="cuda" && !target.gpu_decode) throw std::invalid_argument("CUDA prefill requires gpu_decode=true");
         if (target.prefill_backend=="sycl" && !target.gpu_decode) throw std::invalid_argument("SYCL prefill requires gpu_decode=true");
+        if (target.infllm_attention && target.prefill_backend=="sycl") throw std::invalid_argument("InfLLM GPU prefill requires CUDA");
         if (a.contains("prefetch")) target.prefetch = a.at("prefetch").get<bool>();
         if (a.contains("prefetch_trace")) target.prefetch_trace = a.at("prefetch_trace").get<bool>();
         if (a.contains("schedule")) target.schedule = a.at("schedule").get<std::string>();

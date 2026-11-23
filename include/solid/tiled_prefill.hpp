@@ -7,12 +7,37 @@
 #include <vector>
 
 namespace solid {
+struct RelativeRope;
+struct SparsePrefillFrame {
+    std::uint64_t first_query;
+    std::uint32_t queries;
+    float scale;
+    std::uint32_t local;
+    const RelativeRope & rope;
+    const std::vector<std::uint64_t> & positions;
+    const std::vector<float> & query;
+    // [KV head, selected position, K/V, D].
+    const std::vector<Half> & kv;
+    // The local union can include rows that age out before the last query.
+    std::size_t local_only_from = static_cast<std::size_t>(-1);
+    DeviceQuery device_query;
+    DeviceOutput device_output;
+    DeviceKvBatch device_kv;
+    bool keep_scores_on_device = false;
+};
+struct SparsePrefillOutput {
+    std::vector<float> attention;
+    // [key, query head], starting at the first query's local window.
+    std::vector<float> key_scores;
+    DeviceQuery device_scores = {};
+};
 struct PrefillStats {
     std::uint32_t query_capacity=0, tile_capacity=0;
     std::uint64_t kv_device_bytes = 0, workspace_device_bytes = 0;
     std::uint64_t kv_device_peak_bytes = 0, workspace_device_peak_bytes = 0;
     std::uint64_t batches = 0, query_tokens = 0, tiles = 0, kv_tokens = 0, upload_bytes = 0;
     std::uint64_t query_upload_bytes = 0, output_download_bytes = 0, output_device_copy_bytes = 0;
+    std::uint64_t probability_download_bytes = 0;
     std::uint64_t device_query_tokens = 0, device_kv_tokens = 0;
 };
 class TiledPrefill {
@@ -34,9 +59,13 @@ public:
     virtual void abort() = 0;
     virtual PrefillStats stats() const = 0;
     virtual const char * name() const = 0;
+    virtual bool supports_sparse() const { return false; }
+    virtual DeviceQuery mean_sparse_query(DeviceQuery, std::uint32_t) { throw std::logic_error("device sparse query is disabled"); }
+    virtual SparsePrefillOutput sparse(const SparsePrefillFrame &) { throw std::logic_error("sparse prefill is disabled"); }
 };
 std::unique_ptr<TiledPrefill> make_cuda_tiled_prefill(const KvGeometry & geometry, std::uint32_t query_heads,
-                                                    std::uint32_t queries, std::uint32_t tile_tokens, int device);
+                                                    std::uint32_t queries, std::uint32_t tile_tokens, int device,
+                                                    std::uint32_t sparse_local = 0);
 std::unique_ptr<TiledPrefill> make_sycl_tiled_prefill(const KvGeometry & geometry, std::uint32_t query_heads,
                                                     std::uint32_t queries, std::uint32_t tile_tokens, void * backend_queue);
 } // namespace solid

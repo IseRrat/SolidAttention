@@ -2,11 +2,12 @@
 
 #include "ggml.h"
 #include "solid/device_timing.hpp"
+#include "solid/stream_completion.hpp"
 #include <cstdint>
 #include <cstring>
 
 namespace solid {
-enum class DeviceOp : std::uint32_t { none = 0, query_token = 1, consolidate_kv = 2, release_mask = 3, prefill_result = 4, kv_token = 5 };
+enum class DeviceOp : std::uint32_t { none = 0, query_token = 1, consolidate_kv = 2, release_mask = 3, prefill_result = 4, kv_token = 5, attention_result = 6 };
 struct DeviceOpBinding {
     std::uint64_t magic = 0x534f4c49444f5031ull;
     std::uint32_t version = 1;
@@ -30,6 +31,10 @@ inline bool device_op_supported(const ggml_tensor * tensor) {
             source->nb[2] >= static_cast<std::size_t>(source->ne[1])*source->nb[1];
     };
     switch (device_op(tensor)) {
+        case DeviceOp::attention_result:
+            return a && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) &&
+                tensor->type == GGML_TYPE_F32 && ggml_are_same_shape(a, tensor) &&
+                tensor->src[1] && tensor->src[1]->type == GGML_TYPE_F32 && ggml_nelements(tensor->src[1]) == 1;
         case DeviceOp::query_token:
             return vector(a) && ggml_is_contiguous(a) && tensor->type == GGML_TYPE_F32 && ggml_nelements(tensor) == 1;
         case DeviceOp::kv_token:
@@ -60,6 +65,7 @@ inline bool device_op_supported(const ggml_tensor * tensor) {
 }
 // Pure graph operations: no CPU coordination side effects in captured kernels.
 ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query);
+ggml_tensor * device_attention_result(ggml_context * context, ggml_tensor * output, ggml_tensor * receipt, ggml_tensor * kv = nullptr);
 ggml_tensor * device_kv_token(ggml_context * context, ggml_tensor * kv);
 ggml_tensor * device_consolidate_kv(ggml_context * context, ggml_tensor * key, ggml_tensor * value,
                                    ggml_tensor * query, ggml_tensor * early_selection);

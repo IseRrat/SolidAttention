@@ -13,6 +13,7 @@ struct BlockCandidates {
     std::vector<std::uint64_t> blocks;
     std::vector<std::uint32_t> tokens;
     std::uint32_t remaining = 0;
+    bool shared_heads = false;
 };
 struct RankerStats {
     std::uint64_t device_bytes = 0;
@@ -32,7 +33,7 @@ struct RankerStats {
 };
 struct RepresentativeSeed {
     std::uint64_t length = 0;
-    // Oldest to newest: [min(length, local), head, D] and [pending, head].
+    // Oldest to newest: [pending, KV head, D] and [pending, scoring head].
     std::vector<Half> pending_keys;
     std::vector<double> pending_scores;
     // Current partially finalized block: [head, representative, D] and
@@ -47,8 +48,17 @@ struct BuiltRepresentatives {
     std::vector<std::uint64_t> positions;
     std::vector<double> scores;
 };
+struct ProbabilityFrame {
+    std::uint32_t layer;
+    std::uint64_t first;
+    std::uint32_t count;
+    std::uint64_t score_first;
+    DeviceKvBatch kv;
+    DeviceQuery scores;
+    bool key_major = true;
+};
 void validate_representative_seed(const KvGeometry & geometry, std::uint32_t representatives, std::uint32_t local,
-                                  const RepresentativeSeed & seed);
+                                  const RepresentativeSeed & seed, std::uint32_t input_heads = 0);
 class BlockRanker {
 public:
     virtual ~BlockRanker() = default;
@@ -62,6 +72,11 @@ public:
                                                         const BlockCandidates & candidates) = 0;
     virtual RankerStats stats() const = 0;
     virtual const char * name() const = 0;
+    virtual bool configure_probability_builder(std::uint32_t, std::uint32_t, std::uint32_t) { return false; }
+    virtual bool device_probabilities() const { return false; }
+    virtual std::vector<BuiltRepresentatives> probability_update(const ProbabilityFrame &) {
+        throw std::logic_error("device probability builder is disabled");
+    }
     // An owning backend keeps every published immutable K block. The index may
     // release its host payload; diagnostic scoring reads back one block only.
     virtual bool owns_representative_keys() const { return false; }
@@ -104,8 +119,8 @@ public:
 // operations restore the calling thread's previous device on exit.
 std::unique_ptr<BlockRanker> make_cuda_block_ranker(const KvGeometry & geometry, std::uint32_t query_heads,
                                                    std::uint32_t representatives, std::uint32_t budget, int device,
-                                                   std::uint32_t local = 0);
+                                                   std::uint32_t local = 0, std::uint32_t input_heads = 0);
 std::unique_ptr<BlockRanker> make_sycl_block_ranker(const KvGeometry & geometry, std::uint32_t query_heads,
                                                    std::uint32_t representatives, std::uint32_t budget, void * backend_queue,
-                                                   std::uint32_t local);
+                                                   std::uint32_t local, std::uint32_t input_heads = 0);
 } // namespace solid

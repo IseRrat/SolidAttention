@@ -21,10 +21,12 @@ foreach(SOLID_SOURCE IN LISTS SOLID_LLAMA_SOURCES)
 endforeach()
 set_property(TARGET llama PROPERTY SOURCES "${SOLID_ADAPTED_SOURCES}")
 target_sources(llama PRIVATE "${PROJECT_SOURCE_DIR}/src/llama_adapter.cpp" "${PROJECT_SOURCE_DIR}/src/projection.cpp"
-                            "${PROJECT_SOURCE_DIR}/src/ggml_prefetch.cpp" "${PROJECT_SOURCE_DIR}/src/device_ops.cpp")
+                            "${PROJECT_SOURCE_DIR}/src/ggml_prefetch.cpp" "${PROJECT_SOURCE_DIR}/src/device_ops.cpp"
+                            "${PROJECT_SOURCE_DIR}/src/dense_offload.cpp")
 set_source_files_properties("${SOLID_OVERLAY}/llama-graph.cpp" "${SOLID_OVERLAY}/llama-context.cpp"
     "${PROJECT_SOURCE_DIR}/src/llama_adapter.cpp" "${PROJECT_SOURCE_DIR}/src/projection.cpp"
     "${PROJECT_SOURCE_DIR}/src/ggml_prefetch.cpp" "${PROJECT_SOURCE_DIR}/src/device_ops.cpp"
+    "${PROJECT_SOURCE_DIR}/src/dense_offload.cpp"
     TARGET_DIRECTORY llama PROPERTIES SKIP_UNITY_BUILD_INCLUSION ON)
 target_include_directories(llama PRIVATE "${PROJECT_SOURCE_DIR}/include")
 target_link_libraries(llama PRIVATE solid_core)
@@ -36,7 +38,7 @@ if(SOLID_CUDA)
     target_include_directories(solid_cuda_selection PUBLIC "${PROJECT_SOURCE_DIR}/include")
     target_include_directories(solid_cuda_selection PRIVATE "${PROJECT_SOURCE_DIR}/third_party/llama.cpp/ggml/src"
         "${PROJECT_SOURCE_DIR}/third_party/llama.cpp/ggml/include")
-    target_link_libraries(solid_cuda_selection PUBLIC solid_core CUDA::cudart)
+    target_link_libraries(solid_cuda_selection PUBLIC solid_core CUDA::cudart CUDA::cublas)
     get_target_property(SOLID_SELECTION_ARCHITECTURES ggml-cuda CUDA_ARCHITECTURES)
     set_target_properties(solid_cuda_selection PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
         CUDA_ARCHITECTURES "${SOLID_SELECTION_ARCHITECTURES}")

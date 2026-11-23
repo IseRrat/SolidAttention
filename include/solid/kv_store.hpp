@@ -9,6 +9,7 @@
 #include <vector>
 
 namespace solid {
+class AsyncReader;
 using Half = std::uint16_t;
 Half to_half(float value);
 float from_half(Half value);
@@ -23,11 +24,13 @@ struct KvGeometry {
     std::uint32_t capacity_tokens = 0;
     std::uint32_t alignment = 4096;
     KvLayout layout = KvLayout::separate;
+    bool contiguous_planes = false;
 
     void validate() const;
     std::uint64_t blocks_per_head() const;
     std::uint64_t plane_bytes() const;
     std::uint64_t slot_bytes() const;
+    std::uint64_t value_offset() const;
     std::uint64_t file_bytes() const;
     std::uint64_t block_offset(std::uint32_t layer, std::uint32_t head, std::uint64_t block) const;
 };
@@ -66,6 +69,13 @@ struct KvReadSegment {
     std::uint64_t file_offset = 0;
     std::size_t buffer_offset = 0;
     std::size_t bytes = 0;
+};
+struct KvRowRange {
+    std::uint32_t head;
+    std::uint64_t first;
+    std::uint32_t count;
+    Half * keys;
+    Half * values;
 };
 struct KvReadRequest {
     int fd;
@@ -109,10 +119,15 @@ public:
     virtual void append_interleaved(std::uint32_t layer, std::uint64_t position,
                                     const std::vector<Half> & kv) = 0;
     virtual void read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & destination) = 0;
+    // Read one head over [first, first+count). A null values pointer requests
+    // interleaved output. Scratch is reused by callers that read many ranges.
+    virtual void read_rows(std::uint32_t layer, std::uint32_t head, std::uint64_t first, std::uint32_t count,
+                           Half * keys, Half * values, std::vector<Half> & scratch);
     virtual void flush() = 0;
     virtual void flush_full_layer(std::uint32_t) {}
     virtual std::uint64_t length(std::uint32_t layer) const = 0;
     virtual std::uint64_t resident_bytes() const = 0;
+    virtual std::uint64_t write_buffer_bytes() const { return 0; }
     virtual IoStats io_stats() const { return {}; }
     virtual int native_handle() const { return -1; }
     virtual void enable_direct_reads() { throw std::logic_error("direct KV reads require SSD storage"); }
@@ -150,11 +165,18 @@ public:
                 std::size_t write_buffer_bytes_per_layer = 32768);
     void append_interleaved(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv) override;
     void read(std::uint32_t layer, std::uint32_t head, std::uint64_t block, KvBlock & destination) override;
+    void read_rows(std::uint32_t layer, std::uint32_t head, std::uint64_t first, std::uint32_t count,
+                   Half * keys, Half * values, std::vector<Half> & scratch) override;
+    void read_dense_layer(std::uint32_t layer, std::uint32_t count, std::uint32_t slots, Half * destination,
+                          AsyncReader * reader);
+    void read_separate_rows(std::uint32_t layer, const std::vector<KvRowRange> & ranges, AsyncReader * reader,
+                            std::size_t depth);
     void flush() override;
     void flush_full_layer(std::uint32_t layer) override;
     std::uint64_t length(std::uint32_t layer) const override;
     std::uint64_t resident_bytes() const override;
     IoStats io_stats() const override { return stats_; }
+    std::uint64_t write_buffer_bytes() const override;
     bool failed() const { return failed_; }
     bool write_buffer_full(std::uint32_t layer) const;
     // The segments borrow a single packed workspace until all writes finish.

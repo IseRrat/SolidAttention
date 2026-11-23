@@ -1,0 +1,35 @@
+{
+  "schema_version": 1,
+  "model": "../models/qwen2.5-7b-instruct-q4_0-00001-of-00002.gguf",
+  "model_sha256": "09cda9ec3aff8b5d3a760ddd16d26351e2dbf01f5c4ad4d05e18ac666708a6a2",
+  "additional_model_files": [
+    {
+      "path": "../models/qwen2.5-7b-instruct-q4_0-00002-of-00002.gguf",
+      "sha256": "db92b5c30da42fbfa33af1c501f4be6fcba1c85348d879d794b475154c0fe564"
+    }
+  ],
+  "prompt": "../prompts/smoke.txt",
+  "output": "../results/qwen2.5-7b/baseline/result.json",
+  "context_tokens": 4096,
+  "batch_tokens": 512,
+  "microbatch_tokens": 512,
+  "max_new_tokens": 512,
+  "threads": 4,
+  "gpu_layers": 99,
+  "flash_attention": true,
+  "kv_on_gpu": true,
+  "ignore_eos": false,
+  "sampling": "greedy",
+  "kv_dtype": "f16",
+  "kv_projection_weight_dtype": "q4_0",
+  "attention": {
+    "storage": "ssd",
+    "session_file": "../results/ssd-kv/qwen2.5-7b-q4_0.cache",
+    "sparse": true,
+    "infllm_attention": true,
+    "representative_count": 4,
+    "direct_decode_reads": true,
+    "prefill_backend": "cuda",
+    "prefill_tile_tokens": 1024
+  }
+}

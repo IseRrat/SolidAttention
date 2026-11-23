@@ -267,10 +267,15 @@ SlotLease Prefetcher::load(const BlockIdentity & id, ReadDispatch dispatch,const
         poll(true);
         lease = slots_.acquire(id);
     }
-    stages_[lease->slot]={*lease,stage};
-    upload_order_[lease->slot] = dispatch;
-    issue(*lease,0,dispatch);
+    issue_missing(*lease, dispatch, stage, true);
     return *lease;
+}
+void Prefetcher::issue_missing(const SlotLease & lease, ReadDispatch dispatch, const std::shared_ptr<BlockStage> & stage, bool dispatch_now) {
+    stages_[lease.slot] = {lease, stage};
+    upload_order_[lease.slot] = dispatch;
+    issue(lease, 0, dispatch, dispatch_now);
+    ++stats_.missing_blocks;
+    event("missing", lease);
 }
 void Prefetcher::promote(const SlotLease & lease, ReadDispatch dispatch) {
     for (auto & job:queued_) if (job.lease==lease && dispatch.before(job.dispatch)) job.dispatch=dispatch;
@@ -300,7 +305,7 @@ void Prefetcher::read_complete(const SlotLease & lease,const char * proof) {
 bool Prefetcher::selected(std::uint64_t block) const {
     const auto & g=store_.geometry();
     const auto first=block*g.block_tokens;
-    const auto local_first=position_+1-std::min<std::uint64_t>(budget_.local,position_+1);
+    const auto local_first = budget_.recent_start(g, position_);
     return position_+1>budget_.total && first<local_first && first+g.block_tokens>budget_.initial;
 }
 void Prefetcher::retire(const SlotLease & lease) {
@@ -372,7 +377,7 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
             for (std::uint64_t b = 0; b * g.block_tokens < position; ++b) add(b);
         } else {
             for (std::uint64_t p = 0; p < std::min<std::uint64_t>(budget_.initial, position); ++p) add(p / g.block_tokens);
-            const auto first = position + 1 - std::min<std::uint64_t>(budget_.local, position + 1);
+            const auto first = budget_.recent_start(g, position);
             for (auto p = first; p < position; ++p) add(p / g.block_tokens);
             for (const auto id : history_[layer][head]) add(id);
         }
@@ -420,7 +425,7 @@ std::vector<SlotLease> Prefetcher::resolve(std::uint32_t layer, std::uint64_t po
 }
 std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
                                                 const StagePlan & plan, const ReadyBlock & ready, const StageFactory & factory,
-                                                bool keep_tail, const ReadyBatch & batch) {
+                                                bool keep_tail, const ReadyBatch & batch, bool admit_before_stage) {
     auto past = actual;
     for (auto & head : past) {
         if (!head.positions.empty() && head.positions.back() == position) head.positions.pop_back();
@@ -428,12 +433,12 @@ std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uin
             head.positions.push_back(position-1);
         }
     }
-    return resolve_impl(layer, position, past, true,plan,ready,factory,batch);
+    return resolve_impl(layer, position, past, true, plan, ready, factory, batch, admit_before_stage);
 }
 std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64_t position,
                                             const std::vector<HeadSelection> & actual, bool historical,
                                             const StagePlan & plan, const ReadyBlock & ready,const StageFactory & factory,
-                                            const ReadyBatch & batch) {
+                                            const ReadyBatch & batch, bool admit_before_stage) {
     const auto start = std::chrono::steady_clock::now();
     check();
     const auto & g = store_.geometry();
@@ -504,7 +509,7 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
         }
         promote(*lease,dispatch(id));
     }
-    if (plan) plan(needed);
+    if (plan && !admit_before_stage) plan(needed);
     for (std::uint32_t i = 0; i < slots_.size(); ++i) {
         const auto lease = slots_.lease(i);
         if (slots_.entry(i).state==SlotState::free || slots_.entry(i).state==SlotState::retiring) continue;
@@ -515,8 +520,26 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
             retire(lease);
         }
     }
+    std::map<BlockIdentity, SlotLease> admitted;
+    if (admit_before_stage) {
+        // Only start reads into free host slots while earlier uploads may still
+        // be using other slots. Refreshing a prefix can wait for those copies.
+        for (const auto & id : needed) {
+            if (slots_.find(id) || prefix(id)) continue;
+            const auto lease = slots_.acquire(id);
+            if (!lease) continue;
+            admitted.emplace(id, *lease);
+            issue_missing(*lease, dispatch(id), stage, false);
+        }
+        if (!admitted.empty()) pump();
+        if (plan) plan(needed);
+    }
     std::vector<SlotLease> result;
     for (const auto & id : needed) {
+        if (const auto it = admitted.find(id); it != admitted.end()) {
+            result.push_back(it->second);
+            continue;
+        }
         auto lease = slots_.find(id);
         if (lease) {
             if (slots_.entry(lease->slot).state == SlotState::loading) { ++stats_.inflight_hits; event("inflight_hit", *lease); }
@@ -533,8 +556,6 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
                 event("refresh", *lease);
             } else {
                 lease = load(id,dispatch(id),stage);
-                ++stats_.missing_blocks;
-                event("missing", *lease);
             }
         }
         result.push_back(*lease);

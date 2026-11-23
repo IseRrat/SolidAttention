@@ -105,12 +105,13 @@ public:
     solid::PrefillStats stats_;
     bool direct_=false;
 };
-inline void close(const std::vector<float> & actual,const std::vector<float> & expected) {
+inline void close(const std::vector<float> & actual,const std::vector<float> & expected,float tolerance=3e-4f) {
     require(actual.size()==expected.size(),"tiled output shape");
     for (std::size_t i=0;i<actual.size();++i) require(std::isfinite(actual[i]) &&
-        std::abs(actual[i]-expected[i])<3e-4f*std::max(1.0f,std::abs(expected[i])),"tiled attention differs from FP64 dense reference");
+        std::abs(actual[i]-expected[i])<tolerance*std::max(1.0f,std::abs(expected[i])),"tiled attention differs from FP64 dense reference");
 }
-template<class Factory> void frames(Factory factory,std::uint32_t width,bool constant=false) {
+template<class Factory> void frames(Factory factory,std::uint32_t width,bool constant=false,std::uint32_t queries=5,
+                                     float tolerance=3e-4f) {
     const solid::KvGeometry g{1,2,width,4,49,64,solid::KvLayout::interleaved};
     constexpr std::uint32_t qh=6;
     solid::MemoryKvStore store(g);
@@ -124,10 +125,12 @@ template<class Factory> void frames(Factory factory,std::uint32_t width,bool con
         for (auto & v:values.back()) v=solid::to_half(constant?7.25f:sample());
         store.append(0,p,keys.back(),values.back());
     }
-    auto backend=factory(g,qh,5,7);
+    auto backend=factory(g,qh,queries,7);
     const auto bytes=backend->stats().kv_device_bytes+backend->stats().workspace_device_bytes;
+    std::uint64_t query_tokens=0;
     for (const auto first: {0u,3u,7u,24u,44u}) {
-        const auto count=std::min<std::uint32_t>(5,g.capacity_tokens-first);
+        const auto count=std::min(queries,g.capacity_tokens-first);
+        query_tokens += count;
         const auto scale=1/std::sqrt(static_cast<float>(width));
         std::vector<float> query(static_cast<std::size_t>(count)*qh*width);
         for (auto & q:query) q=sample();
@@ -153,10 +156,10 @@ template<class Factory> void frames(Factory factory,std::uint32_t width,bool con
             auto row=solid::streamed_attention(store,0,first+p,qh,{begin,begin+qh*width},scale);
             expected.insert(expected.end(),row.begin(),row.end());
         }
-        close(actual,expected);
+        close(actual,expected,tolerance);
         require(backend->stats().kv_device_bytes+backend->stats().workspace_device_bytes==bytes,"prefill allocations grew with history length");
     }
-    require(backend->stats().batches==5 && backend->stats().query_tokens==25,"prefill frame counters");
+    require(backend->stats().batches==5 && backend->stats().query_tokens==query_tokens,"prefill frame counters");
 }
 template<class Factory> void session_case(Factory factory,solid::KvLayout layout,bool packed) {
     const solid::KvGeometry g{2,2,7,4,37,64,layout};

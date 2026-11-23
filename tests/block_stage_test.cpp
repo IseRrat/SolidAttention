@@ -29,23 +29,28 @@ void dependencies(bool prediction) {
     solid::BlockStage empty({}); require(empty.finished() && empty.stats().tasks==1,"empty historical gate");
     rejects([&] { solid::BlockStage duplicate({{a},{a}}); });
 }
-void real_queue(bool fail) {
+void real_queue(bool fail, bool admit_before_stage = false) {
     const solid::KvGeometry g{1,1,2,1,16,64,solid::KvLayout::interleaved};
-    auto file=std::make_unique<File>(); auto reader=std::make_unique<Reader>(file.get(),1); auto * observe=reader.get();
+    auto file=std::make_unique<File>(); auto reader=std::make_unique<Reader>(file.get(),admit_before_stage ? 2 : 1); auto * observe=reader.get();
     solid::FileKvStore store(g,std::move(file),8); fill(store,6);
     solid::Prefetcher host(store,{4,1,1,1},4,std::move(reader));
     Transport transport; solid::DeviceCache cache(host,g,2,transport); host.begin(0,6);
     std::shared_ptr<solid::BlockStage> stage;
     std::vector<solid::SlotLease> leases;
     std::size_t callbacks=0;
+    const auto queued_before_selection = observe->submitted.size();
     const auto resolve=[&] {
         return host.resolve_history(0,6,{{{0,1,3,6},{}}},
-            [&](const auto & plan) { cache.begin_stage(plan); },
+            [&](const auto & plan) {
+                if (admit_before_stage) require(observe->submitted.size() > queued_before_selection,
+                    "correction read waited for the device stage");
+                cache.begin_stage(plan);
+            },
             [&](const solid::SlotLease & lease) { transport.fail_upload=fail && ++callbacks==2; cache.stage_ready(lease,stage); },
             [&](std::vector<solid::BlockWork> plan) {
                 for (auto & block:plan) { block.read_ns=block.identity.block==3?100:2; block.copy_ns=2; }
                 stage=std::make_shared<solid::BlockStage>(std::move(plan)); return stage;
-            });
+            }, false, {}, admit_before_stage);
     };
     if (fail) rejects([&] { (void) resolve(); });
     else {
@@ -91,6 +96,6 @@ void failed_read_after_upload() {
 }
 }
 int main() {
-    try { dependencies(false); dependencies(true); real_queue(false); real_queue(true); split_segments(); failed_read_after_upload(); std::cout<<"block event DAG, critical/LST dispatch, real queue order and receipts passed\n"; return 0; }
+    try { dependencies(false); dependencies(true); real_queue(false); real_queue(true); real_queue(false, true); split_segments(); failed_read_after_upload(); std::cout<<"block event DAG, critical/LST dispatch, real queue order and receipts passed\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }
