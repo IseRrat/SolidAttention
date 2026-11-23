@@ -113,6 +113,8 @@ void probability_representatives(int device) {
     auto ranker = solid::make_cuda_block_ranker(scoring_geometry, 2, 1, budget.total, device, 0, 1);
     test_tiled::require(ranker->configure_probability_builder(budget.initial, budget.local, budget.representatives),
                         "probability builder configuration");
+    solid::RepresentativeIndex observed(geometry, 2, budget);
+    observed.set_ranker(std::move(ranker));
     for (std::uint64_t first = 0; first < 800;) {
         const std::uint32_t count = first < 768 ? 128 : 1;
         const auto end = first + count;
@@ -141,13 +143,21 @@ void probability_representatives(int device) {
         auto device_scores = device_buffer<float>(scores.size());
         cuda_check(cudaMemcpy(device_kv.get(), kv.data(), kv.size() * sizeof(solid::Half), cudaMemcpyHostToDevice));
         cuda_check(cudaMemcpy(device_scores.get(), scores.data(), scores.size() * sizeof(float), cudaMemcpyHostToDevice));
-        const auto built = ranker->probability_update({0, first, count, origin,
-            {device_kv.get(), kv.size(), solid::DeviceMemory::cuda},
-            {device_scores.get(), scores.size(), solid::DeviceMemory::cuda}, count != 1});
-        for (const auto & block : built) for (std::uint32_t h = 0; h < 2; ++h) {
-            const auto expected = reference.representative_positions(0, h, block.block);
-            test_tiled::require(std::equal(expected.begin(), expected.end(), block.positions.begin() + h * budget.representatives),
-                                "GPU probability representatives differ from InfLLM reference");
+        const solid::DeviceKvBatch current{device_kv.get(), kv.size(), solid::DeviceMemory::cuda};
+        const solid::DeviceQuery probabilities{device_scores.get(), scores.size(), solid::DeviceMemory::cuda};
+        if (count != 1) observed.observe_prefill_device_scores(0, first, count, current, probabilities);
+        else {
+            observed.begin_probability_query(0, first);
+            observed.append_keys(0, first, {kv.begin(), kv.begin() + 64});
+            observed.observe_device_probabilities(0, first, count, current, probabilities, false);
+        }
+        for (std::uint64_t block = 0; block < geometry.blocks_per_head(); ++block) {
+            test_tiled::require(observed.ready(0, block) == reference.ready(0, block), "GPU representative publication boundary");
+            if (!reference.ready(0, block)) continue;
+            for (std::uint32_t h = 0; h < 2; ++h) {
+                test_tiled::require(reference.representative_positions(0, h, block) == observed.representative_positions(0, h, block),
+                                    "GPU probability representatives differ from InfLLM reference");
+            }
         }
         first = end;
     }

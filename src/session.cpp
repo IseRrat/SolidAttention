@@ -140,9 +140,12 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
     const auto kwidth = static_cast<std::size_t>(g.heads) * g.dimension;
     const auto capacity = prefill_ ? std::min(infllm_prefill_chunk_tokens, prefill_->query_capacity())
                                    : infllm_prefill_chunk_tokens;
-    std::vector<float> output(archived ? 0 : tokens * qwidth), mean(qwidth), q(qwidth), probabilities, batch;
-    std::vector<Half> row(2 * kwidth), key_row(kwidth), current, planes;
+    std::vector<float> output(archived ? 0 : tokens * qwidth), mean(archived ? 0 : qwidth), q(prefill_ ? 0 : qwidth), probabilities, batch;
+    std::vector<Half> row(2 * kwidth), key_row(prefill_ ? 0 : kwidth), current, planes;
     try {
+        if (archived) for (const auto value : *archived) {
+            if ((value & 0x7c00u) == 0x7c00u) throw std::invalid_argument("non-finite prefill KV offload");
+        }
         for (std::size_t start = 0; start < tokens;) {
             const auto position = first + start;
             auto count = static_cast<std::uint32_t>(std::min<std::size_t>(capacity, tokens - start));
@@ -168,14 +171,14 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
             }();
             const auto & positions = context.positions;
             stats_.selection_ns += elapsed(selection_start);
-            current.resize(count * 2 * kwidth);
+            if (!device_probabilities()) current.resize(count * 2 * kwidth);
             const auto append_start = Clock::now();
             for (std::uint32_t i = 0; i < count; ++i) {
                 const auto offset = (start + i) * kwidth;
                 if (archived) std::copy_n(archived->data() + offset * 2, row.size(), row.data());
                 else pack_token(g, keys.data() + offset * (packed ? 2 : 1), packed ? nullptr : values.data() + offset, row.data());
                 store_->append_interleaved(layer, position + i, row);
-                std::copy(row.begin(), row.end(), current.data() + i * 2 * kwidth);
+                if (!device_probabilities()) std::copy(row.begin(), row.end(), current.data() + i * 2 * kwidth);
             }
             stats_.append_ns += elapsed(append_start);
 
@@ -215,7 +218,7 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
                     stats_.prefill_kv_download_bytes += count * 2 * kwidth * sizeof(Half);
                 }
                 if (device_probabilities()) {
-                    representatives_->observe_prefill_device_scores(layer, position, count, current, chunk_kv, device.device_scores);
+                    representatives_->observe_prefill_device_scores(layer, position, count, chunk_kv, device.device_scores);
                 } else representatives_->observe_prefill_scores(layer, position, count, current, device.key_scores);
             }
             for (std::uint32_t i = 0; i < count; ++i) {

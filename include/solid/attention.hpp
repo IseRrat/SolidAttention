@@ -39,7 +39,7 @@ public:
     void observe_device_probabilities(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
                                      DeviceKvBatch kv, DeviceQuery scores, bool key_major);
     void observe_prefill_device_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
-        const std::vector<Half> & host_kv, DeviceKvBatch kv, DeviceQuery scores);
+        DeviceKvBatch kv, DeviceQuery scores);
     void append_keys(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & keys);
     void observe_probabilities(std::uint32_t layer, std::uint64_t position, const std::vector<float> & probabilities);
     void observe_query_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query,bool will_rank=false);

@@ -1,6 +1,6 @@
 # 实现记录
 
-更新日期为 2026-11-22。
+更新日期为 2026-11-23。
 
 ## 一、KV Consolidator
 
@@ -95,6 +95,8 @@
 3. **物理槽位原地覆盖**
 
    已实现逻辑块到设备槽位映射、命中原槽保留、错误预测槽位回收和对应 mask。当前设备行支持 D2D、尾块前缀复用及主机缺口补齐。
+
+   生成 attention mask 前，将本层使用的显存槽位按 KV head 和逻辑块号排序。每次切换到另一个选中块时二分查找槽位，块内各 token 复用查询结果，并逐行检查版本范围。后续固定、释放槽位使用同一份列表。
 
    [device_cache.cpp](../src/device_cache.cpp)、[device_cache.hpp](../include/solid/device_cache.hpp)。
 
@@ -198,7 +200,9 @@
 
    Offload＋Sparse 和 SolidAttention 共用 InfLLM 稀疏预填充。每组最多 512 个输入 token，超出 25%／1K 预算后按组内 Q 的均值检索一次 32-token 历史 KV 块。预算内的起始前缀使用全量因果 attention。每组读取并上传一次历史工作集，组内各 token 共用初始位置和检索结果，各自应用因果掩码和滑动近期窗口。CUDA softmax 屏蔽已滑出窗口的临时位置，每个 token 可见的 KV 数按总预算限制。 [attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[ranker_test.cpp](../tests/ranker_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
 
-   cuBLAS 分别对可能参与历史 attention 的行和近期窗口的行计算 QK，CUDA 依据每个 token 的因果和窗口位置做联合 softmax 与 V 累积。GPU 上按 key 和 query head 汇总本组近期分数，CPU 累加到此前的分数，发布离开近期窗口的代表块。回归检查对照逐 query 记分和按 key 汇总得到的代表位置。
+   cuBLAS 分别对可能参与历史 attention 的行和近期窗口的行计算 QK，CUDA 依据每个 token 的因果和窗口位置做联合 softmax 与 V 累积。GPU 上按 key 和 query head 汇总本组近期分数。设备代表模式在 GPU 环形缓冲中追加 Key、累加分数并生成代表，CPU 记录追加位置和已发布块的元数据。CPU 代表模式接收近期分数并累加，发布离开近期窗口的代表块。
+
+   设备代表模式的 Prefill 直接使用设备 K/V 和分数，主机归档 KV 写入按层写缓冲后，省去当前检索组的额外 KV 副本及逐 token 提取 Key。设备 Key 的有限值检查由 GPU 代表更新完成，归档前检查主机 KV 的有限值。CPU Query、均值和 Key 临时数组按实际计算路径分配。`attention.hpp`、`attention.cpp`、`session.cpp` 接入此路径；`cuda_prefill_test.cpp` 对照 CPU 参考，检查多组 Prefill 转单 token Decode 后的代表位置和发布边界。
 
    CUDA 设备选块路径直接从模型图接收设备 Q，均值向量在 GPU 生成后交给设备评分器，attention 输出直接写入下一层可用的设备缓冲。新 K/V 就地参与 attention，并回传一次 FP16 副本供 SSD 写入。工作集上传仅拷贝历史行。统计分别记录设备 Q/KV 数量、SSD 归档字节和近期分数回传字节。`scatter_sparse_output` 检查 V 累积结果。`baseline.cpp` 的 `EvaluationBridge` 支持采集首个多 token 批次的前两层投影和 attention 输出。
 

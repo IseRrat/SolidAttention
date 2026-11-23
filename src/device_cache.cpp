@@ -393,14 +393,23 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
     std::vector<Half> mask(static_cast<std::size_t>(tokens) * query_heads_, Half{0xfc00});
     const auto marker_offset = mask.size();
     if (local_window) mask.resize(marker_offset + static_cast<std::size_t>(tokens) * geometry_.heads, Half{0});
+    const auto block_key = [](const SlotLease & lease) {
+        return std::make_pair(lease.identity.head, lease.identity.block);
+    };
+    std::sort(used.begin(), used.end(), [&](const auto & a, const auto & b) { return block_key(a) < block_key(b); });
     const auto group = query_heads_ / geometry_.heads;
     for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
         if (selection[head].positions.empty()) throw std::invalid_argument("empty device attention selection");
+        auto found = used.end();
         for (const auto position : selection[head].positions) {
-            const auto found = std::find_if(used.begin(), used.end(), [&](const SlotLease & lease) {
-                return lease.identity.head == head && lease.identity.block == position / geometry_.block_tokens;
-            });
-            if (found == used.end() || position % geometry_.block_tokens >= found->identity.version) throw std::invalid_argument("device selection has no matching versioned slot");
+            const auto key = std::make_pair(head, position / geometry_.block_tokens);
+            if (found == used.end() || block_key(*found) != key) {
+                found = std::lower_bound(used.begin(), used.end(), key,
+                    [&](const SlotLease & lease, const auto & wanted) { return block_key(lease) < wanted; });
+            }
+            if (found == used.end() || block_key(*found) != key || position % geometry_.block_tokens >= found->identity.version) {
+                throw std::invalid_argument("device selection has no matching versioned slot");
+            }
             const auto row = (found->slot % slots_.slots_per_head()) * geometry_.block_tokens + position % geometry_.block_tokens;
             for (auto q = head * group; q < (head + 1) * group; ++q) mask[static_cast<std::size_t>(q) * tokens + row] = 0;
             const auto distance = selection[head].positions.back() - position;

@@ -410,21 +410,16 @@ void RepresentativeIndex::observe_device_probabilities(std::uint32_t layer, std:
     probability_lengths_[layer] = first + count;
 }
 void RepresentativeIndex::observe_prefill_device_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
-    const std::vector<Half> & host_kv, DeviceKvBatch kv, DeviceQuery scores) {
-    const auto width = static_cast<std::size_t>(kv_heads_) * geometry_.dimension;
-    if (!device_probabilities_ || !count || first != lengths_.at(layer) || query_pending_[layer] ||
-        probability_lengths_[layer] != first || host_kv.size() != count * 2 * width) {
+    DeviceKvBatch kv, DeviceQuery scores) {
+    const auto memory = rank_memory();
+    if (!device_probabilities_ || !memory || !count || first != lengths_.at(layer) || query_pending_[layer] ||
+        probability_lengths_[layer] != first || first >= geometry_.capacity_tokens || count > geometry_.capacity_tokens - first) {
         throw std::invalid_argument("device prefill representative frame");
     }
-    std::vector<Half> keys(width);
-    for (std::uint32_t i = 0; i < count; ++i) {
-        for (std::uint32_t h = 0; h < kv_heads_; ++h) {
-            const auto offset = static_cast<std::size_t>(h) * geometry_.dimension;
-            std::copy_n(host_kv.data() + i * 2 * width + offset * 2, geometry_.dimension, keys.data() + offset);
-        }
-        query_pending_[layer] = true;
-        append_keys(layer, first + i, keys);
-    }
+    validate_device_kv(kv, *memory, kv_heads_, geometry_.dimension, count);
+    // The device probability builder validates and retains the keys in its ring.
+    // Only the append position belongs to the host index in this mode.
+    lengths_[layer] += count;
     observe_device_probabilities(layer, first, count, kv, scores, true);
 }
 void RepresentativeIndex::release_published_keys(std::uint32_t layer, std::uint64_t block) {
