@@ -72,6 +72,8 @@
 
    GPU 代表更新按本步 Key 和分数元素数确定线程块数量。单 token Decode 只派发所需的线程块，512-token Prefill 保留网格步进处理。设备分数模式仅返回设备指针和元素数，省去同尺寸的 CPU 分数向量分配及清零。稀疏基线收到 attention 完成回执后先提交下一层 SSD 固定窗口读取，再更新本层代表分数。下一层读取和本层代表更新使用独立的数据。 [block_ranker.cu](../src/cuda/block_ranker.cu)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
 
+   设备概率回执的就绪节点同时依赖 attention 输出和当前设备 KV，保证 CPU 使用设备指针前两者已完成。输出依赖节点持有设备 KV 和近期分数，直到 CPU 更新代表后再允许图分配器复用内存。近期分数直接作为就绪节点输入，省去额外的连续副本。 [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
+
    [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cuh](../include/solid/device_ops.cuh)、[sycl_device_ops.hpp](../include/solid/sycl_device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)。
 
    [llama_adapter.cpp](../src/llama_adapter.cpp)、[llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[device_cache.cpp](../src/device_cache.cpp)、[device_cache.hpp](../include/solid/device_cache.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[sycl_flash_decode.hpp](../include/solid/sycl_flash_decode.hpp)、[gather_test.cpp](../tests/gather_test.cpp)、[prefetch_graph_test.cpp](../tests/prefetch_graph_test.cpp)。

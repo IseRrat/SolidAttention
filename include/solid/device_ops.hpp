@@ -64,8 +64,9 @@ inline bool device_op_supported(const ggml_tensor * tensor) {
     }
 }
 // Pure graph operations: no CPU coordination side effects in captured kernels.
-ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query);
-ggml_tensor * device_attention_result(ggml_context * context, ggml_tensor * output, ggml_tensor * receipt, ggml_tensor * kv = nullptr);
+ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query, ggml_tensor * dependency = nullptr);
+ggml_tensor * device_attention_result(ggml_context * context, ggml_tensor * output, ggml_tensor * receipt,
+    ggml_tensor * kv = nullptr, ggml_tensor * scores = nullptr);
 ggml_tensor * device_kv_token(ggml_context * context, ggml_tensor * kv);
 ggml_tensor * device_consolidate_kv(ggml_context * context, ggml_tensor * key, ggml_tensor * value,
                                    ggml_tensor * query, ggml_tensor * early_selection);

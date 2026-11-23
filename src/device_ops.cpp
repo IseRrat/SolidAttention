@@ -42,13 +42,15 @@ ggml_tensor * make(ggml_context * context, ggml_type type, const std::int64_t * 
     return output;
 }
 }
-ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query) {
+ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query, ggml_tensor * dependency) {
     const std::int64_t shape[]{1,1,1,1};
-    return make(context,GGML_TYPE_F32,shape,&query,1,DeviceOp::query_token,"solid_device_query_token");
+    ggml_tensor * sources[]{query, dependency};
+    return make(context,GGML_TYPE_F32,shape,sources,dependency ? 2 : 1,DeviceOp::query_token,"solid_device_query_token");
 }
-ggml_tensor * device_attention_result(ggml_context * context, ggml_tensor * output, ggml_tensor * receipt, ggml_tensor * kv) {
-    ggml_tensor * sources[]{output, receipt, kv};
-    return make(context, GGML_TYPE_F32, output->ne, sources, kv ? 3 : 2, DeviceOp::attention_result, "solid_device_attention_result");
+ggml_tensor * device_attention_result(ggml_context * context, ggml_tensor * output, ggml_tensor * receipt, ggml_tensor * kv, ggml_tensor * scores) {
+    if (scores && !kv) throw std::invalid_argument("device attention scores require retained KV");
+    ggml_tensor * sources[]{output, receipt, kv, scores};
+    return make(context, GGML_TYPE_F32, output->ne, sources, scores ? 4 : kv ? 3 : 2, DeviceOp::attention_result, "solid_device_attention_result");
 }
 ggml_tensor * device_kv_token(ggml_context * context, ggml_tensor * kv) {
     const std::int64_t shape[]{1,1,1,1};

@@ -793,16 +793,17 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         ggml_set_name(compact, "solid_infllm_recent_scores");
         if (impl_->session.device_probabilities()) {
             impl_->device_scores = compact;
-            compact = on_device(device_query_token(context, on_device(ggml_cont(context, compact))));
+            compact = on_device(device_query_token(context, compact));
         }
         output = on_device(ggml_cont(context, ggml_reshape_2d(context, output, g.dimension * impl_->session.query_heads(), 1)));
-        auto * ready = on_device(device_query_token(context, output));
+        auto * ready = on_device(device_query_token(context, output,
+            impl_->session.device_probabilities() ? impl_->device_kv : nullptr));
         ggml_tensor * receipt_inputs[]{compact, ready};
         auto * received = ggml_custom_4d(context, GGML_TYPE_F32, 1, 1, 1, 1,
             receipt_inputs, 2, Impl::receive_attention, 1, impl_.get());
         ggml_set_name(received, "solid_infllm_attention_receipt");
         return on_device(device_attention_result(context, output, received,
-            impl_->session.device_probabilities() ? impl_->device_kv : nullptr));
+            impl_->session.device_probabilities() ? impl_->device_kv : nullptr, impl_->device_scores));
     };
     if (impl_->prefill_output) {
         result=on_device(device_prefill_result(context,impl_->prefill_output->tensor,result,impl_->device_query,impl_->device_kv));
