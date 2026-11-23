@@ -262,9 +262,14 @@ void AttentionSession::observe_probabilities(std::uint32_t layer, std::uint64_t 
     try { representatives_->observe_probabilities(layer, position, probabilities); }
     catch (...) { failed_ = true; throw; }
 }
-void AttentionSession::observe_device_probabilities(std::uint32_t layer, std::uint64_t position, DeviceKvBatch kv, DeviceQuery scores) {
+void AttentionSession::observe_device_probabilities(std::uint32_t layer, std::uint64_t position, DeviceKvBatch kv, DeviceQuery scores,
+    void * compute_stream) {
     if (failed_ || !rope_ || early_) throw std::logic_error("device probability receipt without an active query");
-    try { representatives_->observe_device_probabilities(layer, position, 1, kv, scores, false); }
+    try { representatives_->observe_device_probabilities(layer, position, 1, kv, scores, false, compute_stream); }
+    catch (...) { failed_ = true; throw; }
+}
+void AttentionSession::finish_device_probabilities() {
+    try { if (representatives_) representatives_->finish_device_probabilities(); }
     catch (...) { failed_ = true; throw; }
 }
 std::vector<float> AttentionSession::tiled_prefill(std::uint32_t layer, std::uint64_t first, std::size_t tokens,
@@ -756,6 +761,7 @@ void AttentionSession::enable_direct_reads() {
 void AttentionSession::flush() {
     if (failed_) throw std::runtime_error("attention session failed");
     try {
+        finish_device_probabilities();
         if (prefetch_) prefetch_->finish_stores();
         store_->flush();
         if (trace_.is_open()) { trace_.flush(); if (!trace_) throw std::runtime_error("selection trace flush failed"); }

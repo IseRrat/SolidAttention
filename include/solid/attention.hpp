@@ -37,7 +37,8 @@ public:
                                 const std::vector<Half> & kv, const std::vector<float> & key_scores);
     bool device_probabilities() const { return device_probabilities_; }
     void observe_device_probabilities(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
-                                     DeviceKvBatch kv, DeviceQuery scores, bool key_major);
+                                     DeviceKvBatch kv, DeviceQuery scores, bool key_major, void * compute_stream = nullptr);
+    void finish_device_probabilities();
     void observe_prefill_device_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
         DeviceKvBatch kv, DeviceQuery scores);
     void append_keys(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & keys);
@@ -78,6 +79,9 @@ private:
     std::vector<std::uint64_t> probability_lengths_;
     std::unique_ptr<BlockRanker> ranker_;
     bool device_probabilities_ = false;
+    struct ProbabilityReceipt { std::uint32_t layer; std::uint64_t end; };
+    std::optional<ProbabilityReceipt> pending_probability_;
+    void accept_probability_blocks(std::uint32_t layer, const std::vector<BuiltRepresentatives> & built);
     void publish(BlockRanker & ranker, std::uint32_t layer, std::uint64_t first, std::uint64_t count) const;
     RepresentativeSeed builder_seed(std::uint32_t layer) const;
     void accept_built(std::uint32_t layer, std::uint64_t position, const std::optional<BuiltRepresentatives> & built);

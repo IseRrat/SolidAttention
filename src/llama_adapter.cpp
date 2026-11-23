@@ -402,7 +402,8 @@ struct AttentionNode::Impl {
                 if (self.sparse_lookahead) self.sparse_lookahead->completed(self.layer, position);
                 self.session.observe_device_probabilities(self.layer, position,
                     {static_cast<const Half *>(self.device_kv->data), static_cast<std::size_t>(ggml_nelements(self.device_kv)), DeviceMemory::cuda},
-                    {static_cast<const float *>(self.device_scores->data), static_cast<std::size_t>(ggml_nelements(self.device_scores)), DeviceMemory::cuda});
+                    {static_cast<const float *>(self.device_scores->data), static_cast<std::size_t>(ggml_nelements(self.device_scores)), DeviceMemory::cuda},
+                    self.prefetch ? self.prefetch->probability_compute_stream() : nullptr);
                 *static_cast<float *>(destination->data) = 0;
                 return;
             }
@@ -1036,6 +1037,7 @@ void AttentionAdapter::after_process() {
         if (impl_->device) impl_->device->process_complete();
         if (impl_->dense) impl_->dense->finish_decode();
         if (impl_->sparse_lookahead) impl_->sparse_lookahead->finish_decode();
+        impl_->session->finish_device_probabilities();
     } catch (...) { impl_->failure->capture(std::current_exception()); }
     check();
     impl_->session->release_prefill_if_complete();

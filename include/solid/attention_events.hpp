@@ -7,7 +7,7 @@
 
 struct ggml_backend_event;
 namespace solid {
-enum class AttentionProof { device_signal, query_boundary, process_boundary };
+enum class AttentionProof { device_signal, query_boundary, process_boundary, attention_boundary };
 struct AttentionReceipt { AttentionProof proof; std::uint64_t device_ns; };
 class AttentionEvents {
 public:
@@ -22,6 +22,7 @@ public:
     void stop() noexcept;
     bool stopped() const { return stopping_.load(std::memory_order_acquire); }
     bool boundary_seen(std::uint64_t epoch) const;
+    bool handoff_seen(std::uint64_t epoch) const;
     // Called after an existing full backend fence, including canceled frames.
     void retire_after_sync();
     int completion_handle() const { return notification_; }
@@ -34,7 +35,7 @@ protected:
 private:
     struct Slot;
     std::vector<std::unique_ptr<Slot>> slots_;
-    std::atomic<std::uint64_t> active_{0},consumed_{0},boundary_{0};
+    std::atomic<std::uint64_t> active_{0},consumed_{0},boundary_{0},handoff_{0};
     std::atomic<int> boundary_proof_{0},notification_error_{0};
     std::atomic<bool> stopping_{false};
     std::uint64_t last_epoch_=0;

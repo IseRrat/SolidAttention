@@ -88,8 +88,9 @@ def audit_schedule(path, mode, *, blocks=False):
     if blocks:
         return audit_block_frames(frames)
     totals = {"frames": len(frames), "tasks": 0, "critical_path_ns": 0, "miss_projection_overlap_ns": 0,
-              "query_reused_fences": 0, "process_reused_fences": 0, "attention_fences": 0, "fallback_fences": 0,"device_event_completions":0,"device_attention_ns":0}
+              "query_reused_fences": 0, "process_reused_fences": 0, "attention_fences": 0, "fallback_fences": 0,"device_event_completions":0,"device_attention_ns":0,"attention_receipt_reuses":0}
     proofs = {"query_dependency_reuse": "query_reused_fences", "process_synchronize_reuse": "process_reused_fences",
+              "attention_dependency_reuse": "attention_receipt_reuses",
               "attention_backend_complete": "attention_fences", "explicit_fallback": "fallback_fences",
               "attention_device_event": "device_event_completions", "attention_device_event_untimed": "device_event_completions"}
     identities = set()
@@ -290,7 +291,7 @@ def report(manifest_path, atol=1e-3, rtol=1e-4):
                       "miss_projection_overlap_ns": "miss_projection_overlap_sum_ms",
                       "block_critical_path_ns": "block_observed_critical_path_sum_ms","device_attention_ns":"device_attention_event_ms"}.get(key, key)
             expected = actual / 1e6 if key.endswith("_ns") else actual
-            observed = recorded[metric]
+            observed = recorded.get(metric, 0) if metric == "attention_receipt_reuses" else recorded[metric]
             if type(observed) not in (int, float) or not math.isfinite(observed) or not math.isclose(observed, expected, rel_tol=1e-9, abs_tol=1e-8):
                 raise ValueError(f"schedule metric differs from trace: {metric}")
         if value["timing"]["decode_steps"] and not audit["frames"]:

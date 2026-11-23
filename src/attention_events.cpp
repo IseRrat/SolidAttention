@@ -48,6 +48,7 @@ void AttentionEvents::arm(std::uint32_t layer,std::uint64_t epoch) {
     const auto previous=active_.load(std::memory_order_acquire);
     if (!epoch || epoch<=last_epoch_ || (previous && consumed_.load(std::memory_order_acquire)!=previous)) throw std::logic_error("completion armed before previous receipt was retired");
     stopping_.store(false,std::memory_order_release); boundary_.store(0,std::memory_order_release);
+    handoff_.store(0,std::memory_order_release);
     slot.done.store(0,std::memory_order_release); slot.armed.store(epoch,std::memory_order_release);
     last_epoch_=epoch; active_.store(epoch,std::memory_order_release);
 }
@@ -112,9 +113,11 @@ void AttentionEvents::boundary(AttentionProof proof,std::uint64_t epoch) {
     const auto active=active_.load(std::memory_order_acquire);
     if (!active || (epoch && epoch!=active)) return;
     boundary_proof_.store(static_cast<int>(proof),std::memory_order_release);
+    if (proof!=AttentionProof::attention_boundary) handoff_.store(active,std::memory_order_release);
     boundary_.store(active,std::memory_order_release); wake();
 }
 bool AttentionEvents::boundary_seen(std::uint64_t epoch) const { return epoch && boundary_.load(std::memory_order_acquire)==epoch; }
+bool AttentionEvents::handoff_seen(std::uint64_t epoch) const { return epoch && handoff_.load(std::memory_order_acquire)==epoch; }
 void AttentionEvents::stop() noexcept { stopping_.store(true,std::memory_order_release); wake(); }
 void AttentionEvents::retire_after_sync() { consumed_.store(active_.load(std::memory_order_acquire),std::memory_order_release); }
 } // namespace solid

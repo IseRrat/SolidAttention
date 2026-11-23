@@ -690,6 +690,7 @@ struct GgmlPrefetch::Impl {
     std::deque<std::shared_ptr<LayerWork>> storing;
     std::uint64_t sequence = 0;
     bool quiesced = true;
+    std::atomic<std::uint64_t> released_epoch{0};
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
         const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied,bool share_host_cache) :
         session(s), backend(backend), mode(mode), worker(cpu), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
@@ -800,6 +801,8 @@ struct GgmlPrefetch::Impl {
                 start_store(work);
                 if (work->dag.finished()) finish_frame(work);
             }
+            released_epoch.store(device.attention_epoch(), std::memory_order_release);
+            worker.notify_progress();
         }
     }
     void progress_after_attention(const std::shared_ptr<LayerWork> & current,std::uint64_t epoch) {
@@ -807,7 +810,7 @@ struct GgmlPrefetch::Impl {
         bool released=false;
         auto & host=session.prefetcher();
         const auto before_upload=[this,epoch] {
-            if (!events->boundary_seen(epoch)) ++totals.uploads_before_boundary;
+            if (!events->handoff_seen(epoch) && !events->stopped()) ++totals.uploads_before_boundary;
         };
         while (!events->stopped()) {
             // Clear notifications before inspecting queues/state. A producer
@@ -823,7 +826,8 @@ struct GgmlPrefetch::Impl {
                 } else {
                     ++totals.device_boundary_fallbacks;
                     if (receipt->proof==AttentionProof::query_boundary) { ++totals.query_reused_fences; proof="query_dependency_reuse"; }
-                    else { ++totals.process_reused_fences; proof="process_synchronize_reuse"; }
+                    else if (receipt->proof==AttentionProof::process_boundary) { ++totals.process_reused_fences; proof="process_synchronize_reuse"; }
+                    else { ++totals.attention_receipt_reuses; proof="attention_dependency_reuse"; }
                 }
                 release_attention(proof, receipt->device_ns ? std::optional<std::uint64_t>{receipt->device_ns} : std::nullopt,before_upload);
                 device.reap_transfers();
@@ -832,7 +836,7 @@ struct GgmlPrefetch::Impl {
             if (released) {
                 // Give formal correction the coordinator as soon as its query
                 // reaches the CPU. Remaining predicted SSD jobs stay queued.
-                if (events->boundary_seen(epoch)) return;
+                if (events->handoff_seen(epoch)) return;
                 if ((host.pending_reads() || host.pending_stores()) && host.completion_handle()<0) {
                     host.poll(true);
                     observe_stores();
@@ -1105,7 +1109,11 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
 }
 void GgmlPrefetch::completed(std::uint64_t epoch) {
     if (impl_->events && epoch!=impl_->device.attention_epoch()) return;
-    if (impl_->events) impl_->events->boundary(AttentionProof::process_boundary,epoch);
+    if (impl_->events) {
+        impl_->events->boundary(AttentionProof::attention_boundary,epoch);
+        impl_->worker.wait_until([&] { return impl_->released_epoch.load(std::memory_order_acquire)>=epoch; });
+        if (impl_->released_epoch.load(std::memory_order_acquire)>=epoch) return;
+    }
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->device.attention_pending() && epoch == impl_->device.attention_epoch()) {
@@ -1117,6 +1125,9 @@ void GgmlPrefetch::process_complete() {
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->device.attention_pending()) { ++impl_->totals.process_reused_fences; impl_->release_attention("process_synchronize_reuse"); }
+}
+void * GgmlPrefetch::probability_compute_stream() const {
+    return impl_->mode == ScheduleMode::sync_reuse ? impl_->transport.cuda_compute_stream() : nullptr;
 }
 void GgmlPrefetch::quiesce() {
     if (impl_->quiesced) return;

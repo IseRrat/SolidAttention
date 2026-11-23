@@ -76,6 +76,8 @@ public:
     ~TaskWorker();
     void submit(std::function<void()> work);
     void join();
+    void wait_until(const std::function<bool()> & ready);
+    void notify_progress();
 private:
     std::mutex mutex_;
     std::condition_variable cv_;
@@ -95,6 +97,7 @@ struct ScheduleStats {
     std::uint64_t device_event_completions=0,device_attention_ns=0,device_boundary_fallbacks=0,uploads_before_boundary=0,copy_event_queries=0;
     std::uint64_t critical_path_ns = 0, miss_projection_overlap_ns = 0;
     std::uint64_t query_reused_fences = 0, process_reused_fences = 0, attention_fences = 0;
+    std::uint64_t attention_receipt_reuses = 0;
     std::uint64_t fallback_fences = 0, event_waits = 0, batch_waits = 0, stream_waits = 0;
     std::uint64_t staging_bytes = 0;
     std::uint64_t backend_drains = 0, backend_compute_waits = 0, batch_groups = 0, events_coalesced = 0;

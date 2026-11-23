@@ -572,6 +572,7 @@ int main(int argc, char ** argv) {
                     {"observed_critical_path_sum_ms", schedule.critical_path_ns / 1e6},
                     {"miss_projection_overlap_sum_ms", schedule.miss_projection_overlap_ns / 1e6},
                     {"query_reused_fences", schedule.query_reused_fences}, {"process_reused_fences", schedule.process_reused_fences},
+                    {"attention_receipt_reuses", schedule.attention_receipt_reuses},
                     {"attention_fences", schedule.attention_fences}, {"fallback_fences", schedule.fallback_fences},
                     {"copy_event_waits", schedule.event_waits}, {"copy_batch_waits", schedule.batch_waits},
                     {"copy_stream_waits", schedule.stream_waits}, {"copy_batch_groups", schedule.batch_groups},

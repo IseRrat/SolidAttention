@@ -72,7 +72,7 @@
 
    GPU 代表更新按本步 Key 和分数元素数确定线程块数量。单 token Decode 只派发所需的线程块，512-token Prefill 保留网格步进处理。设备分数模式仅返回设备指针和元素数，省去同尺寸的 CPU 分数向量分配及清零。稀疏基线收到 attention 完成回执后先提交下一层 SSD 固定窗口读取，再更新本层代表分数。下一层读取和本层代表更新使用独立的数据。 [block_ranker.cu](../src/cuda/block_ranker.cu)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
 
-   设备概率回执的就绪节点同时依赖 attention 输出和当前设备 KV，保证 CPU 使用设备指针前两者已完成。输出依赖节点持有设备 KV 和近期分数，直到 CPU 更新代表后再允许图分配器复用内存。近期分数直接作为就绪节点输入，省去额外的连续副本。 [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
+   设备概率回执的就绪节点同时依赖 attention 输出和当前设备 KV，保证 CPU 使用设备指针前两者已完成。输出依赖节点持有设备 KV 和近期分数，覆盖代表更新的输入捕获过程。近期分数直接作为就绪节点输入，省去额外的连续副本。 [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
 
    [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cuh](../include/solid/device_ops.cuh)、[sycl_device_ops.hpp](../include/solid/sycl_device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)。
 
@@ -144,6 +144,12 @@
 
 4. **Attention 完成通知**
 
+   attention 回执确认本层完成，后继 Q 就绪和整次计算结束分别触发协调任务交接。`AttentionEvents` 分别记录完成证明与交接标记。收到 attention 回执后，模型线程通过 `TaskWorker` 的进度通知等待本层归档和槽位释放；协调线程继续接收下一层 SSD 完成回执并上传已就绪的块。下一层 Q 到达时交接给正式选块，请求结束或取消时排空任务。`native_completion_test.cpp` 延迟下一层读取，检查 attention 回执先返回，随后解锁读取时仍能继续上传。
+
+   [attention_events.hpp](../include/solid/attention_events.hpp)、[attention_events.cpp](../src/attention_events.cpp)、[scheduler.hpp](../include/solid/scheduler.hpp)、[scheduler.cpp](../src/scheduler.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[attention_events_test.cpp](../tests/attention_events_test.cpp)、[native_completion_test.cpp](../tests/native_completion_test.cpp)。
+
+   `baseline.cpp` 将 attention 回执复用单列为 `attention_receipt_reuses`，调度轨迹使用 `attention_dependency_reuse` 完成证明。`prefetch_graph_test.cpp` 写出同口径的图运行计数，`schedule_ablation.py` 和 `test_schedule_tools.py` 核对这类证明及次数。
+
    CUDA 已接入原生事件和图捕获/重放通知；SYCL 已接入结束事件和带 epoch 的独立队列通知。协调线程据此释放旧工作集读者并推进后继上传，后继 Q 与请求边界也具有完成证明。早于后继边界的上传次数，以上传开始派发时的边界状态为准。
 
    SolidAttention 的 CUDA InfLLM attention 在 QK 矩阵乘法前记录开始，在概率乘 V 后通知协调线程。下一层 SSD 预取可先发起，完成通知用于确认当前层上传依赖和当前 KV 回传，再推进当前层聚合写回及下一层显存上传。CPU 回执在归档完成后用近期概率更新代表索引。回归用例以相同输入核对重用解码图的输出、设备选块调用和 FP16 归档字节。 [llama_adapter.cpp](../src/llama_adapter.cpp)、[stream_completion.hpp](../include/solid/stream_completion.hpp)、[generate_adapter.py](../scripts/generate_adapter.py)、[prefetch_graph_test.cpp](../tests/prefetch_graph_test.cpp)、[representative_builder_cases.hpp](../tests/representative_builder_cases.hpp)。
@@ -153,6 +159,10 @@
    CUDA 在已有代表块无需发布的解码步，将代表分数更新与动态选块排入同一条流，等 Top-K 回传时一起检查更新和评分状态。需要发布新代表块或无需动态选块的步，在各自消费点确认更新完成。同步复用路径将当前 key 的追加放进 attention 计算流，共用 attention 回执，归档时验证相同 FP16 数据。结果记录选块等待复用及计算流追加次数。 [block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.hpp](../include/solid/session.hpp)、[session.cpp](../src/session.cpp)、[baseline.cpp](../src/baseline.cpp)。
 
    [attention_events.cpp](../src/attention_events.cpp)、[attention_events.cu](../src/cuda/attention_events.cu)、[cuda_completion.cuh](../include/solid/cuda_completion.cuh)、[attention_events.cpp](../src/sycl/attention_events.cpp)。
+
+   SolidAttention 的 CUDA `overlap+sync_reuse` 路径异步更新 InfLLM 代表。本层 attention 回执在模型计算流上捕获当前 FP16 K/V 和近期概率，随后代表队列等待捕获事件，执行原有 Key 追加、分数累加和代表生成内核。后续 FFN 只需排在输入捕获之后，CPU 在下一次 Q 前沿收取代表完成事件和元数据，每次模型计算结束及会话排空时收齐剩余结果。异步任务最多一份，快照大小由单 token 的 K/V 和近期概率窗口决定；位置、分数和错误状态通过固定页锁定缓冲区回传。Offload＋Sparse 保持原同步更新入口，两条路径使用相同的代表算法。
+
+   `block_ranker.hpp`、`block_ranker.cu` 提供提交、收取、快照及失败排空；`attention.hpp`、`attention.cpp` 管理待收取的层和位置；`session.hpp`、`session.cpp` 传播错误并完成会话收尾；`llama_adapter.cpp`、`ggml_prefetch.hpp`、`ggml_prefetch.cpp` 将异步入口限定到 SolidAttention 的同步复用调度。`cuda_prefill_test.cpp` 在提交后立即覆盖原 K/V 和分数缓冲，再与 CPU 参考核对代表位置和发布边界。
 
 5. **统一内存和复制队列**
 

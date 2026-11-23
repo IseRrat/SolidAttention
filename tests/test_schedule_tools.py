@@ -192,6 +192,17 @@ class ScheduleToolsTests(unittest.TestCase):
             jsonlines(path,good)
             with self.assertRaises(ValueError): scheduling.audit_schedule(path,"overlap+sync_reuse")
 
+    def test_attention_receipt_proof_is_counted_separately(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"schedule.jsonl"
+            rows=trace("overlap+sync_reuse")
+            next(row for row in rows if row["event"]=="complete" and row["task"]==9)['fence']='attention_dependency_reuse'
+            jsonlines(path,rows)
+            audit=scheduling.audit_schedule(path,"overlap+sync_reuse")
+            self.assertEqual(audit['attention_receipt_reuses'],1)
+            self.assertEqual(audit['process_reused_fences'],0)
+            self.assertEqual(audit['attention_fences'],0)
+
     def test_deferred_pin_keeps_copy_and_attention_lifetimes_separate(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "residency.jsonl"

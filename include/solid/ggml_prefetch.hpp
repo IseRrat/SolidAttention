@@ -20,6 +20,7 @@ public:
                               const std::vector<float> & keys, const std::vector<float> & values, bool packed_inputs);
     void completed(std::uint64_t epoch);
     void process_complete();
+    void * probability_compute_stream() const;
     bool early_enabled() const;
     bool reuses_sync() const;
     StreamCompletionToken * completion_token(std::uint32_t layer) const;

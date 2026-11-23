@@ -291,6 +291,10 @@ class CudaBlockRanker final : public BlockRanker {
         std::uint64_t * top_positions = nullptr;
         double * top_scores = nullptr;
     };
+    struct ProbabilityReceipt {
+        std::uint32_t layer, count;
+        std::uint64_t end, mature_end, first_block, block_end;
+    };
 public:
     CudaBlockRanker(KvGeometry geometry, std::uint32_t query_heads, std::uint32_t representatives,
                     std::uint32_t budget, int device, std::uint32_t local, std::uint32_t input_heads) :
@@ -375,7 +379,27 @@ public:
     }
     bool device_probabilities() const override { return probability_local_ != 0; }
     std::vector<BuiltRepresentatives> probability_update(const ProbabilityFrame & frame) override {
+        return probability_update_impl(frame, nullptr);
+    }
+    void submit_probability_update(const ProbabilityFrame & frame, void * compute_stream) override {
+        if (!compute_stream || frame.count != 1) throw std::invalid_argument("asynchronous probability update requires one decode token and its compute queue");
+        (void) probability_update_impl(frame, compute_stream);
+    }
+    std::vector<BuiltRepresentatives> finish_probability_update() override {
         check();
+        if (!probability_pending_) throw std::logic_error("no asynchronous probability receipt");
+        DeviceScope scope(device_);
+        try {
+            checked(cudaEventSynchronize(probability_done_), "collect probability receipt");
+            if (*probability_host_error_) throw std::runtime_error("non-finite probability keys or scores");
+            auto result = commit_probability(*probability_pending_, probability_host_positions_, probability_host_scores_);
+            probability_pending_.reset();
+            return result;
+        } catch (...) { fail(); throw; }
+    }
+    std::vector<BuiltRepresentatives> probability_update_impl(ProbabilityFrame frame, void * compute_stream) {
+        check();
+        if (probability_pending_) throw std::logic_error("previous probability receipt must be collected");
         if (!probability_local_ || frame.layer >= geometry_.layers || !frame.count || frame.count > 512 ||
             probability_lengths_.at(frame.layer) != frame.first || frame.first >= geometry_.capacity_tokens ||
             frame.count > geometry_.capacity_tokens - frame.first) throw std::invalid_argument("CUDA probability frame");
@@ -391,10 +415,10 @@ public:
         const auto mature_end = std::max<std::uint64_t>(probability_initial_, end - std::min<std::uint64_t>(end, probability_local_));
         const auto first_block = published_[frame.layer];
         const auto block_end = (mature_end - probability_initial_) / geometry_.block_tokens;
-        std::vector<BuiltRepresentatives> result(block_end - first_block);
-        const auto metadata = result.size() * geometry_.heads * probability_top_;
-        std::vector<std::uint64_t> positions(metadata);
-        std::vector<double> scores(metadata);
+        const auto metadata = (block_end - first_block) * geometry_.heads * probability_top_;
+        std::vector<std::uint64_t> positions(compute_stream ? 0 : metadata);
+        std::vector<double> scores(compute_stream ? 0 : metadata);
+        const ProbabilityReceipt receipt{frame.layer, frame.count, end, mature_end, first_block, block_end};
         try {
             if (!state.keys) {
                 const auto before = stats_.device_bytes;
@@ -409,6 +433,7 @@ public:
                 stats_.builder_device_bytes += stats_.device_bytes - before;
             }
             if (!banks_[frame.layer]) allocate(banks_[frame.layer], layer_bytes_);
+            if (compute_stream) capture_probability_inputs(frame, static_cast<cudaStream_t>(compute_stream));
             checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear probability status");
             const auto key_items = product(product(frame.count, input_heads_), geometry_.dimension);
             const auto score_items = product(end - origin, geometry_.heads);
@@ -427,25 +452,40 @@ public:
                 geometry_.heads, input_heads_, geometry_.dimension, probability_top_, geometry_.block_tokens);
             checked(cudaGetLastError(), "finalize probability representatives");
             if (metadata) {
-                checked(cudaMemcpyAsync(positions.data(), built_positions_, metadata * sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream_), "download representative positions");
-                checked(cudaMemcpyAsync(scores.data(), built_scores_, metadata * sizeof(double), cudaMemcpyDeviceToHost, stream_), "download representative scores");
+                checked(cudaMemcpyAsync(compute_stream ? probability_host_positions_ : positions.data(), built_positions_, metadata * sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream_), "download representative positions");
+                checked(cudaMemcpyAsync(compute_stream ? probability_host_scores_ : scores.data(), built_scores_, metadata * sizeof(double), cudaMemcpyDeviceToHost, stream_), "download representative scores");
             }
-            checked(cudaMemcpyAsync(&error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, stream_), "download probability status");
+            checked(cudaMemcpyAsync(compute_stream ? probability_host_error_ : &error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, stream_), "download probability status");
+            if (compute_stream) {
+                checked(cudaEventRecord(probability_done_, stream_), "record probability completion");
+                probability_pending_ = receipt;
+                return {};
+            }
             checked(cudaStreamSynchronize(stream_), "complete probability receipt");
             if (error_) throw std::runtime_error("non-finite probability keys or scores");
-        } catch (...) { fail(); throw; }
+        } catch (...) {
+            // A failed capture must drain borrowed sources as well as the
+            // ranker queue before graph memory or snapshot storage is reused.
+            if (compute_stream) (void) cudaStreamSynchronize(static_cast<cudaStream_t>(compute_stream));
+            fail(); throw;
+        }
+        return commit_probability(receipt, positions.data(), scores.data());
+    }
+    std::vector<BuiltRepresentatives> commit_probability(const ProbabilityReceipt & receipt,
+        const std::uint64_t * positions, const double * scores) {
+        std::vector<BuiltRepresentatives> result(receipt.block_end - receipt.first_block);
         const auto stride = static_cast<std::size_t>(geometry_.heads) * probability_top_;
         for (std::size_t i = 0; i < result.size(); ++i) {
-            result[i].block = first_block + i;
-            result[i].positions.assign(positions.begin() + i * stride, positions.begin() + (i + 1) * stride);
-            result[i].scores.assign(scores.begin() + i * stride, scores.begin() + (i + 1) * stride);
+            result[i].block = receipt.first_block + i;
+            result[i].positions.assign(positions + i * stride, positions + (i + 1) * stride);
+            result[i].scores.assign(scores + i * stride, scores + (i + 1) * stride);
         }
-        published_[frame.layer] = block_end;
-        probability_lengths_[frame.layer] = end;
-        probability_matured_[frame.layer] = mature_end;
+        published_[receipt.layer] = receipt.block_end;
+        probability_lengths_[receipt.layer] = receipt.end;
+        probability_matured_[receipt.layer] = receipt.mature_end;
         stats_.published_blocks += result.size();
         stats_.built_blocks += result.size();
-        stats_.device_builder_appends += frame.count;
+        stats_.device_builder_appends += receipt.count;
         return result;
     }
     std::optional<DeviceMemory> direct_memory() const override { return DeviceMemory::cuda; }
@@ -704,6 +744,7 @@ public:
     std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const float * query,
                                                     const BlockCandidates & candidates, bool device) {
         check();
+        if (probability_pending_) throw std::logic_error("block ranking requires its preceding probability receipt");
         if (deferred_query_ && (!device || *deferred_query_!=layer)) throw std::logic_error("ranking does not match deferred representative query");
         if (layer >= geometry_.layers ||
             candidates.blocks.size() != candidates.tokens.size() || candidates.blocks.size() > geometry_.blocks_per_head() ||
@@ -795,6 +836,33 @@ public:
         return keys;
     }
 private:
+    void capture_probability_inputs(ProbabilityFrame & frame, cudaStream_t compute) {
+        if (!probability_snapshot_keys_) {
+            const auto before = stats_.device_bytes;
+            allocate(probability_snapshot_keys_, product(product(input_heads_, geometry_.dimension), 2 * sizeof(Half)));
+            allocate(probability_snapshot_scores_, product(product(probability_local_, geometry_.heads), sizeof(float)));
+            stats_.builder_device_bytes += stats_.device_bytes - before;
+            const auto slots = product(geometry_.heads, probability_top_);
+            const auto bytes = slots * (sizeof(std::uint64_t) + sizeof(double)) + sizeof(int);
+            checked(cudaHostAlloc(&probability_host_, bytes, cudaHostAllocDefault), "allocate pinned probability receipt");
+            stats_.host_bytes += bytes;
+            probability_host_positions_ = static_cast<std::uint64_t *>(probability_host_);
+            probability_host_scores_ = reinterpret_cast<double *>(probability_host_positions_ + slots);
+            probability_host_error_ = reinterpret_cast<int *>(probability_host_scores_ + slots);
+            checked(cudaEventCreateWithFlags(&probability_captured_, cudaEventDisableTiming), "create probability input capture event");
+            checked(cudaEventCreateWithFlags(&probability_done_, cudaEventDisableTiming), "create probability completion event");
+        }
+        // These snapshots precede all subsequent graph work on compute. Once
+        // they finish, the graph may overwrite its K/V and probability tensors.
+        checked(cudaMemcpyAsync(probability_snapshot_keys_, frame.kv.data, frame.kv.elements * sizeof(Half),
+            cudaMemcpyDeviceToDevice, compute), "capture probability KV");
+        checked(cudaMemcpyAsync(probability_snapshot_scores_, frame.scores.data, frame.scores.elements * sizeof(float),
+            cudaMemcpyDeviceToDevice, compute), "capture probability scores");
+        checked(cudaEventRecord(probability_captured_, compute), "record probability input capture");
+        checked(cudaStreamWaitEvent(stream_, probability_captured_, 0), "order probability update after capture");
+        frame.kv.data = probability_snapshot_keys_;
+        frame.scores.data = probability_snapshot_scores_;
+    }
     void validate_pointer(const void * pointer) const {
         check();
         DeviceScope scope(device_);
@@ -839,6 +907,11 @@ private:
         if (scores_) (void) cudaFree(scores_);
         if (output_device_) (void) cudaFree(output_device_);
         if (error_device_) (void) cudaFree(error_device_);
+        if (probability_snapshot_keys_) (void) cudaFree(probability_snapshot_keys_);
+        if (probability_snapshot_scores_) (void) cudaFree(probability_snapshot_scores_);
+        if (probability_captured_) (void) cudaEventDestroy(probability_captured_);
+        if (probability_done_) (void) cudaEventDestroy(probability_done_);
+        if (probability_host_) (void) cudaFreeHost(probability_host_);
         if (stream_) (void) cudaStreamDestroy(stream_);
         if (restore && previous != device_) (void) cudaSetDevice(previous);
     }
@@ -853,6 +926,14 @@ private:
     std::vector<BuilderState> probability_states_;
     std::vector<std::uint64_t> probability_lengths_, probability_matured_;
     std::uint32_t probability_initial_ = 0, probability_local_ = 0, probability_top_ = 0, probability_capacity_ = 0;
+    std::optional<ProbabilityReceipt> probability_pending_;
+    Half * probability_snapshot_keys_ = nullptr;
+    float * probability_snapshot_scores_ = nullptr;
+    void * probability_host_ = nullptr;
+    std::uint64_t * probability_host_positions_ = nullptr;
+    double * probability_host_scores_ = nullptr;
+    int * probability_host_error_ = nullptr;
+    cudaEvent_t probability_captured_ = nullptr, probability_done_ = nullptr;
     std::optional<std::uint32_t> deferred_query_;
     double * mean_query_ = nullptr;
     std::uint64_t * built_positions_ = nullptr;

@@ -238,4 +238,16 @@ void TaskWorker::run() {
         cv_.notify_all();
     }
 }
+void TaskWorker::wait_until(const std::function<bool()> & ready) {
+    std::unique_lock<std::mutex> lock(mutex_);
+    cv_.wait(lock, [&] { return !busy_ || done_ || ready(); });
+    const auto error = error_;
+    if (error) { busy_ = false; done_ = false; error_ = nullptr; }
+    lock.unlock();
+    if (error) std::rethrow_exception(error);
+}
+void TaskWorker::notify_progress() {
+    std::lock_guard<std::mutex> lock(mutex_);
+    cv_.notify_all();
+}
 } // namespace solid

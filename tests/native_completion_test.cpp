@@ -112,7 +112,7 @@ void interrupted(bool timing_error) {
     if (timing_error) {
         auto * token=observe->token(0); token->notify(token->userdata);
         bool preserved=false;
-        try { cache.process_complete(); } catch (const std::exception & error) { preserved=std::string(error.what()).find("injected native timing failure")!=std::string::npos; }
+        try { cache.completed(cache.attention_epoch()); } catch (const std::exception & error) { preserved=std::string(error.what()).find("injected native timing failure")!=std::string::npos; }
         require(preserved,"native worker error was lost");
     }
     // The stream marker was never executed in the canceled case. stop() must
@@ -211,6 +211,38 @@ void query_handoff() {
     cache.quiesce(); session.finish();
     require(copies.pending.empty(),"query handoff lost copy source ownership");
 }
+void attention_receipt_keeps_prefetch() {
+    if (!solid::uring_available()) return;
+    auto gate=std::make_shared<ReadGate>();
+    const auto path=std::filesystem::temp_directory_path()/("solid-receipt-prefetch-"+std::to_string(std::chrono::steady_clock::now().time_since_epoch().count()));
+    auto store=std::make_unique<solid::FileKvStore>(geometry,solid::create_session_file(path,true),2048);
+    auto reads=solid::make_io_worker([gate] { return std::make_unique<GatedReads>(gate); },8);
+    solid::AttentionSession session(std::move(store),1,budget,true,4,{}, {},std::move(reads),4); seed(session); session.flush();
+    std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
+    DeferredCopies copies; BackendDevice restore(backend.get(),&copies.device);
+    copies.on_upload=[&] { std::lock_guard<std::mutex> lock(copies.mutex); if (copies.submitted==2) gate->open(false); };
+    auto events=std::make_unique<Events>(geometry.layers); auto * observe=events.get();
+    solid::GgmlPrefetch cache(session,backend.get(),{},solid::ScheduleMode::sync_reuse,{},-1,std::move(events));
+    struct OpenOnExit { std::shared_ptr<ReadGate> gate; ~OpenOnExit() { gate->open(true); } } release{gate};
+    std::vector<float> query(64,.125f),key(64,.25f),value(64,.75f);
+    cache.select_early(0,4,query,false); (void) cache.decode(0,4,{},key,value,false);
+    auto * token=observe->token(0); token->notify(token->userdata);
+    auto receipt=std::async(std::launch::async,[&] { cache.completed(cache.attention_epoch()); });
+    const bool returned=receipt.wait_for(std::chrono::seconds(2))==std::future_status::ready;
+    if (!returned) gate->open(true);
+    receipt.get();
+    require(returned,"attention receipt waited for next-layer SSD reads");
+    std::uint64_t before;
+    { std::lock_guard<std::mutex> lock(copies.mutex); before=copies.submitted; }
+    gate->open(true);
+    bool advanced;
+    { std::unique_lock<std::mutex> lock(copies.mutex);
+      advanced=copies.cv.wait_for(lock,std::chrono::seconds(2),[&] { return copies.submitted>before; }); }
+    cache.process_complete(); cache.quiesce(); session.finish();
+    require(advanced,"late SSD completions stopped uploading after the attention receipt");
+    require(cache.schedule_stats().uploads_before_boundary>0,"continued uploads were counted after the query handoff");
+    require(copies.pending.empty(),"continued prefetch lost its source ownership");
+}
 #endif
 }
 int main(int argc,char ** argv) {
@@ -219,7 +251,7 @@ int main(int argc,char ** argv) {
         require((argc==1 || (argc==3 && std::string(argv[1])=="--repeat")) && repeats>0 && repeats<=1000,"native check repeat arguments");
         for (int i=0;i<repeats;++i) { ffn_overlap(); interrupted(false); interrupted(true); selection_projection_overlap();
 #ifdef __linux__
-        query_handoff();
+        query_handoff(); attention_receipt_keeps_prefetch();
 #endif
         }
         std::cout<<"native attention notification, FFN/H2D overlap, query handoff, cancellation and worker errors passed\n"; return 0; }

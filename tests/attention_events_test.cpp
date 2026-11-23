@@ -56,6 +56,10 @@ void receipts() {
     events.acknowledge();
     const auto first=events.poll(0,1);
     require(first && first->proof==solid::AttentionProof::device_signal && first->device_ns==42,"device event proof or timing lost");
+    events.boundary(solid::AttentionProof::attention_boundary,1);
+    require(events.boundary_seen(1) && !events.handoff_seen(1),"attention receipt stopped next-layer prefetch");
+    events.boundary(solid::AttentionProof::query_boundary,1);
+    require(events.handoff_seen(1),"next query did not hand off prefetch coordination");
     publish(events.token(0)); require(!events.poll(0,1),"duplicate completion counted twice");
     rejects([&] { events.arm(0,1); });
     events.arm(1,2); events.boundary(solid::AttentionProof::query_boundary);
@@ -66,7 +70,7 @@ void receipts() {
     require(events.poll(0,3)->proof==solid::AttentionProof::process_boundary,"process boundary proof");
     events.arm(1,4); events.stop(); require(events.stopped(),"wait cancellation lost");
     rejects([&] { events.arm(0,5); });
-    events.retire_after_sync(); events.arm(0,5); require(!events.stopped() && !events.boundary_seen(5),"new frame inherited a stop or old boundary");
+    events.retire_after_sync(); events.arm(0,5); require(!events.stopped() && !events.boundary_seen(5) && !events.handoff_seen(5),"new frame inherited a stop or old boundary");
     publish(events.token(0)); events.error=true;
     rejects([&] { events.poll(0,5); }); events.error=false;
     require(events.poll(0,5).has_value(),"event error silently consumed its receipt");

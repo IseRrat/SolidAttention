@@ -339,6 +339,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         output << nlohmann::json({{"frames", stats.frames}, {"tasks", stats.tasks}, {"critical_path_ns", stats.critical_path_ns},
             {"miss_projection_overlap_ns", stats.miss_projection_overlap_ns}, {"query_reused_fences", stats.query_reused_fences},
             {"process_reused_fences", stats.process_reused_fences}, {"attention_fences", stats.attention_fences},
+            {"attention_receipt_reuses",stats.attention_receipt_reuses},
             {"fallback_fences", stats.fallback_fences},{"device_event_completions",stats.device_event_completions},
             {"device_attention_ns",stats.device_attention_ns}}).dump();
         require(output.good(), "graph trace stats write failed");

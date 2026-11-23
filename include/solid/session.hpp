@@ -78,7 +78,9 @@ public:
     const std::optional<RelativeRope> & relative_rope() const { return rope_; }
     void observe_probabilities(std::uint32_t layer, std::uint64_t position, const std::vector<float> & probabilities);
     bool device_probabilities() const { return representatives_ && representatives_->device_probabilities(); }
-    void observe_device_probabilities(std::uint32_t layer, std::uint64_t position, DeviceKvBatch kv, DeviceQuery scores);
+    void observe_device_probabilities(std::uint32_t layer, std::uint64_t position, DeviceKvBatch kv, DeviceQuery scores,
+        void * compute_stream = nullptr);
+    void finish_device_probabilities();
     void set_ranker(std::unique_ptr<BlockRanker> ranker);
     void set_prefill(std::unique_ptr<TiledPrefill> prefill);
     void release_prefill_if_complete();

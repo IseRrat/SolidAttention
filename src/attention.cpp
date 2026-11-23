@@ -219,6 +219,7 @@ void RepresentativeIndex::observe_query_device(std::uint32_t layer, std::uint64_
     query_pending_[layer] = true;
 }
 void RepresentativeIndex::begin_probability_query(std::uint32_t layer, std::uint64_t position) {
+    finish_device_probabilities();
     if (!budget_.infllm_attention || position != lengths_.at(layer) || position >= geometry_.capacity_tokens ||
         query_pending_.at(layer) || probability_lengths_[layer] != position) {
         throw std::logic_error("InfLLM query requires all preceding keys and attention probabilities");
@@ -385,13 +386,30 @@ void RepresentativeIndex::set_ranker(std::unique_ptr<BlockRanker> ranker) {
     }
 }
 void RepresentativeIndex::observe_device_probabilities(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
-    DeviceKvBatch kv, DeviceQuery scores, bool key_major) {
+    DeviceKvBatch kv, DeviceQuery scores, bool key_major, void * compute_stream) {
+    if (pending_probability_) throw std::logic_error("previous device probability receipt is pending");
     if (!device_probabilities_ || !count || probability_lengths_.at(layer) != first ||
         query_pending_.at(layer) || lengths_.at(layer) != first + count) {
         throw std::logic_error("device probability receipt has no matching appended keys");
     }
     const auto origin = first + 1 - std::min<std::uint64_t>(first + 1, budget_.local);
-    const auto built = ranker_->probability_update({layer, first, count, origin, kv, scores, key_major});
+    const ProbabilityFrame frame{layer, first, count, origin, kv, scores, key_major};
+    if (compute_stream) {
+        ranker_->submit_probability_update(frame, compute_stream);
+        pending_probability_ = ProbabilityReceipt{layer, first + count};
+        return;
+    }
+    accept_probability_blocks(layer, ranker_->probability_update(frame));
+    probability_lengths_[layer] = first + count;
+}
+void RepresentativeIndex::finish_device_probabilities() {
+    if (!pending_probability_) return;
+    const auto receipt = *pending_probability_;
+    accept_probability_blocks(receipt.layer, ranker_->finish_probability_update());
+    probability_lengths_[receipt.layer] = receipt.end;
+    pending_probability_.reset();
+}
+void RepresentativeIndex::accept_probability_blocks(std::uint32_t layer, const std::vector<BuiltRepresentatives> & built) {
     for (const auto & item : built) {
         if (item.positions.size() != static_cast<std::size_t>(geometry_.heads) * budget_.representatives ||
             item.scores.size() != item.positions.size()) throw std::runtime_error("device representative metadata shape");
@@ -407,7 +425,6 @@ void RepresentativeIndex::observe_device_probabilities(std::uint32_t layer, std:
             block.finalized = geometry_.block_tokens;
         }
     }
-    probability_lengths_[layer] = first + count;
 }
 void RepresentativeIndex::observe_prefill_device_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
     DeviceKvBatch kv, DeviceQuery scores) {

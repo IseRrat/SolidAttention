@@ -77,6 +77,14 @@ public:
     virtual std::vector<BuiltRepresentatives> probability_update(const ProbabilityFrame &) {
         throw std::logic_error("device probability builder is disabled");
     }
+    // A single outstanding update owns snapshots of the borrowed inputs. The
+    // compute queue protects their capture before the graph may reuse them.
+    virtual void submit_probability_update(const ProbabilityFrame &, void *) {
+        throw std::logic_error("asynchronous probability builder is disabled");
+    }
+    virtual std::vector<BuiltRepresentatives> finish_probability_update() {
+        throw std::logic_error("asynchronous probability builder is disabled");
+    }
     // An owning backend keeps every published immutable K block. The index may
     // release its host payload; diagnostic scoring reads back one block only.
     virtual bool owns_representative_keys() const { return false; }
