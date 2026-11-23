@@ -353,7 +353,7 @@ void AttentionSession::release_prefill_graph_output(std::uint64_t bytes) noexcep
 }
 void AttentionSession::process_prefill_device(std::uint32_t layer,std::uint64_t first,std::uint32_t tokens,DeviceQuery queries,
     DeviceKvBatch device_kv,const std::vector<Half> & host_kv,float scale,DeviceOutput output) {
-    trace::Scope phase("Prefill/attention layer", layer, first);
+    trace::Scope phase("GPU Attention", layer, first);
     const auto memory=prefill_direct_memory();
     if (failed_ || early_ || !memory || !tokens || tokens>prefill_tokens_ || first>prefill_tokens_-tokens ||
         store_->length(layer)!=first || !std::isfinite(scale) || scale<=0) throw std::invalid_argument("device prefill frame state or position");

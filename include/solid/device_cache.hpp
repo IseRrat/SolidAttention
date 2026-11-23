@@ -92,7 +92,11 @@ private:
         SlotLease device;
         std::shared_ptr<BlockStage> stage = {};
     };
-    struct Transfer { std::uint64_t ticket; std::vector<TransferSlot> slots; std::shared_ptr<BlockStage> stage; };
+    struct Transfer { std::uint64_t ticket; std::vector<TransferSlot> slots; std::shared_ptr<BlockStage> stage; std::shared_ptr<trace::Batch> phase = {}; };
+    std::weak_ptr<trace::Batch> upload_phase_;
+    std::uint32_t upload_layer_ = UINT32_MAX;
+    bool upload_prefetch_ = false;
+    std::shared_ptr<trace::Batch> upload_phase(std::uint32_t layer, bool prefetch);
     Prefetcher & host_;
     KvGeometry geometry_;
     std::uint32_t query_heads_;

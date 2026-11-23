@@ -62,6 +62,16 @@ void DeviceCache::event(const char * name, const SlotLease & lease,const Current
     trace_ << "}\n";
     if (!trace_) throw std::runtime_error("device residency trace write failed");
 }
+std::shared_ptr<trace::Batch> DeviceCache::upload_phase(std::uint32_t layer, bool prefetch) {
+    if (!trace::enabled() || transport_.aliases_host_slots()) return {};
+    auto phase = upload_phase_.lock();
+    if (!phase || layer != upload_layer_ || prefetch != upload_prefetch_) {
+        phase = std::make_shared<trace::Batch>(prefetch ? "CPU->GPU Prefetch" : "CPU->GPU Load", layer, UINT64_MAX);
+        upload_phase_ = phase; upload_layer_ = layer; upload_prefetch_ = prefetch;
+    }
+    phase->submitted();
+    return phase;
+}
 void DeviceCache::poll_transfers(bool wait,std::optional<std::uint64_t> through) {
     std::exception_ptr error;
     for (auto it = transfers_.begin(); it != transfers_.end();) {
@@ -129,8 +139,9 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
         const auto & block = host_.block(host);
         if (stage) stage->copy_started(host.identity);
         if (before_upload) before_upload();
+        auto phase = upload_phase(host.identity.layer, !stage);
         ticket = transport_.upload(device->slot, block);
-        transfers_.push_back({ticket, {{host,*device}},stage});
+        transfers_.push_back({ticket, {{host,*device}},stage,std::move(phase)});
         ++stats_.uploads;
         const auto bytes = block.storage_size() * sizeof(Half);
         if (!transport_.aliases_host_slots()) {
@@ -181,6 +192,7 @@ void DeviceCache::upload_batch(const std::vector<SlotLease> & leases,const std::
         }
         if (copies.empty()) return;
         if (before_upload) before_upload();
+        transfer.phase = upload_phase(transfer.slots.front().device.identity.layer, !stage);
         transfer.ticket=transport_.upload_batch(copies);
         for (const auto & slot : transfer.slots) event("upload",slot.device);
         transfers_.push_back(std::move(transfer));

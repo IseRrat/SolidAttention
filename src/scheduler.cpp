@@ -73,7 +73,9 @@ TaskDag::TaskDag(std::vector<TaskSpec> specs, ScheduleTrace * trace, std::uint64
                  std::uint64_t position, ScheduleMode mode) : trace_(trace), frame_(frame), layer_(layer), position_(position) {
     if (specs.empty() || specs.size() > UINT32_MAX) throw std::invalid_argument("invalid DAG size");
     for (auto & spec : specs) tasks_.push_back({std::move(spec)});
-    if (solid::trace::enabled()) ranges_.resize(tasks_.size());
+    if (solid::trace::enabled() && std::any_of(tasks_.begin(), tasks_.end(), [](const auto & t) {
+        return t.spec.name == "kv_d2h_ready";
+    })) ranges_.resize(tasks_.size());
     std::vector<std::size_t> indegree(tasks_.size());
     std::vector<std::vector<std::uint32_t>> successors(tasks_.size());
     for (std::uint32_t id = 0; id < tasks_.size(); ++id) {
@@ -139,11 +141,8 @@ void TaskDag::start(std::uint32_t id, std::uint64_t now,const std::string & proo
     for (const auto before : record.spec.predecessors) if (now < tasks_[before].end_ns) throw std::logic_error("nonmonotonic task start");
     record.start_ns = now; record.state = TaskState::running;
     if (!ranges_.empty()) {
-        const auto prefix = record.spec.resource == TaskResource::ssd ? "SSD stage" :
-            record.spec.resource == TaskResource::h2d ? "CPU->GPU stage" :
-            record.spec.resource == TaskResource::d2h ? "GPU->CPU stage" :
-            record.spec.resource == TaskResource::gpu ? "GPU stage" : "CPU stage";
-        ranges_[id] = trace::Range(prefix, layer_, position_, record.spec.name.c_str());
+        const auto * phase = record.spec.name == "kv_d2h_ready" ? "GPU->CPU Store" : nullptr;
+        if (phase) ranges_[id] = trace::Range(phase, layer_, position_);
     }
     if (trace_) trace_->event(frame_, id, "start", now,proof);
 }

@@ -1,11 +1,11 @@
 #pragma once
 #include <cstdint>
+#include <memory>
 
 namespace solid::trace {
 bool enabled() noexcept;
 void name_thread(const char * name) noexcept;
 void name_cuda_stream(void * stream, const char * name) noexcept;
-const char * operation_stage(const char * op, const char * input, const char * output) noexcept;
 
 // Lexical ranges stay on their creating thread and form the NVTX range stack.
 class Scope {
@@ -43,6 +43,49 @@ public:
     void finish() noexcept;
 private:
     std::uint64_t id_ = 0;
+};
+
+// One visible I/O phase shared by all requests in a layer batch. The final
+// request receipt releases the range, including cancellation receipts.
+class Batch {
+public:
+    Batch(const char * stage, std::uint32_t layer, std::uint64_t position) noexcept
+        : stage_(stage), layer_(layer), position_(position) {}
+    void submitted() noexcept {
+        if (!started_) { range_ = Range(stage_, layer_, position_); started_ = true; }
+    }
+private:
+    const char * stage_;
+    std::uint32_t layer_;
+    std::uint64_t position_;
+    bool started_ = false;
+    Range range_;
+};
+class BatchContext {
+public:
+    BatchContext(std::shared_ptr<Batch> & current, const char * stage, std::uint32_t layer, std::uint64_t position)
+        : current_(current), previous_(current) {
+        if (enabled()) current_ = std::make_shared<Batch>(stage, layer, position);
+    }
+    ~BatchContext() { current_ = std::move(previous_); }
+    BatchContext(const BatchContext &) = delete;
+    BatchContext & operator=(const BatchContext &) = delete;
+private:
+    std::shared_ptr<Batch> & current_;
+    std::shared_ptr<Batch> previous_;
+};
+
+// Aggregate model computation into projections and a complete attention phase.
+class ComputeScope {
+public:
+    ComputeScope(const char * op, const char * input, const char * output, void * stream) noexcept;
+    ~ComputeScope();
+    ComputeScope(const ComputeScope &) = delete;
+    ComputeScope & operator=(const ComputeScope &) = delete;
+private:
+    Scope projection_;
+    bool attention_end_ = false;
+    bool kv_end_ = false;
 };
 } // namespace solid::trace
 

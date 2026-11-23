@@ -400,7 +400,6 @@ public:
         } catch (...) { fail(); throw; }
     }
     std::vector<BuiltRepresentatives> probability_update_impl(ProbabilityFrame frame, void * compute_stream) {
-        trace::Scope phase("GPU/representatives enqueue", frame.layer, frame.first);
         check();
         if (probability_pending_) throw std::logic_error("previous probability receipt must be collected");
         if (!probability_local_ || frame.layer >= geometry_.layers || !frame.count || frame.count > 512 ||
@@ -752,7 +751,7 @@ public:
         if (layer >= geometry_.layers ||
             candidates.blocks.size() != candidates.tokens.size() || candidates.blocks.size() > geometry_.blocks_per_head() ||
             candidates.remaining > budget_) throw std::invalid_argument("CUDA ranking shape or budget");
-        trace::Scope phase("GPU/score+TopK submit..receipt", layer,
+        trace::Scope phase("GPU Score/select", layer,
             probability_local_ ? probability_lengths_[layer] : UINT64_MAX);
         for (std::size_t i = 0; i < candidates.blocks.size(); ++i) {
             if (candidates.blocks[i] >= published_[layer] || (i && candidates.blocks[i] <= candidates.blocks[i-1]) ||

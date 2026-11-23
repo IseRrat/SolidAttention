@@ -161,6 +161,8 @@ void Prefetcher::pump_store() {
     if (failed_ || write_queue_.empty()) return;
     if (!write_batch_) write_batch_.emplace(WriteBatch{disk_->begin_write(write_queue_.front()), 0, {}});
     auto & batch = *write_batch_;
+    if (trace::enabled() && !batch.phase)
+        batch.phase = std::make_shared<trace::Batch>("CPU->SSD Store", write_queue_.front(), disk_->length(write_queue_.front()) - 1);
     while (batch.next < batch.segments.size()) {
         if (next_id_ >= (std::uint64_t{1} << 63)) throw std::overflow_error("write request identity exhausted");
         const auto & segment = batch.segments[batch.next];
@@ -169,6 +171,7 @@ void Prefetcher::pump_store() {
             batch.inflight.erase(it);
             break;
         }
+        if (batch.phase) batch.phase->submitted();
         ++next_id_;
         ++batch.next;
     }
@@ -221,6 +224,7 @@ void Prefetcher::pump() {
                 requests_.erase(request);
                 break;
             }
+            if (job.phase) job.phase->submitted();
         } catch (...) {
             requests_.erase(request);
             throw;
@@ -235,12 +239,13 @@ void Prefetcher::pump() {
     catch (...) { failed_ = true; throw; }
     reader_->flush();
 }
-void Prefetcher::issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch,bool dispatch_now) {
+void Prefetcher::issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch,bool dispatch_now,
+                      const std::shared_ptr<trace::Batch> & phase) {
     const auto & id = lease.identity;
     const auto segments = store_.plan_read(id.layer, id.head, id.block, blocks_[lease.slot], prefix);
     if (blocks_[lease.slot].version != id.version) throw std::logic_error("read plan version changed before submission");
     pending_[lease.slot] = segments.size();
-    for (const auto & segment : segments) queued_.push_back({lease, segment, dispatch});
+    for (const auto & segment : segments) queued_.push_back({lease, segment, dispatch, phase ? phase : read_phase_});
     if (segments.empty()) { slots_.complete(lease); read_complete(lease,"host_forwarded"); event("ready", lease); }
     if (dispatch_now) pump();
 }
@@ -253,7 +258,7 @@ void Prefetcher::pump_predictions() {
             if (!lease) { ++it; continue; }
             stages_[lease->slot]={*lease,{}};
             upload_order_[lease->slot]=it->copy;
-            issue(*lease,0,it->read,false);
+            issue(*lease,0,it->read,false,it->phase);
             event("predict",*lease);
         } else upload_order_[lease->slot]=it->copy;
         ++stats_.predicted_blocks;
@@ -361,6 +366,7 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
     const auto & g = store_.geometry();
     if (layer >= g.layers || position >= g.capacity_tokens || store_.length(layer) != position) throw std::invalid_argument("prefetch begin position mismatch");
     if (layer_ == layer && position_ == position) { poll(); return; }
+    trace::BatchContext phase(read_phase_, "SSD->CPU Prefetch", layer, position);
     if (!defer_prediction_slots_) for (std::uint32_t i = 0; i < slots_.size(); ++i) {
         if (slots_.entry(i).readers) throw std::logic_error("host slots still held by a transfer");
     }
@@ -404,7 +410,7 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
     const BlockStage plan(std::move(tasks), nullptr, 0, layer, position);
     std::vector<Prediction> ordered;
     ordered.reserve(predicted.size());
-    for (const auto & id : predicted) ordered.push_back({id, plan.dispatch(id), plan.copy_dispatch(id)});
+    for (const auto & id : predicted) ordered.push_back({id, plan.dispatch(id), plan.copy_dispatch(id), read_phase_});
     std::stable_sort(ordered.begin(), ordered.end(), [](const Prediction & a, const Prediction & b) {
         return a.read.before(b.read);
     });
@@ -446,6 +452,7 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
     if (layer_ != layer || position_ != position || actual.size() != g.heads || store_.length(layer) != available) {
         throw std::invalid_argument("prefetch resolve identity mismatch");
     }
+    trace::BatchContext phase(read_phase_, "SSD->CPU Load", layer, position);
     std::vector<BlockWork> by_identity;
     const auto local_first=position+1-std::min<std::uint64_t>(budget_.local,position+1);
     for (std::uint32_t head = 0; head < g.heads; ++head) {

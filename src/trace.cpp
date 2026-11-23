@@ -29,7 +29,7 @@ bool enabled() noexcept {
 #ifdef SOLID_HAVE_NVTX
 namespace {
 nvtxDomainHandle_t domain() noexcept {
-    static auto value = nvtxDomainCreateA("SolidAttention");
+    static auto value = nvtxDomainCreateA("Stages");
     return value;
 }
 nvtxEventAttributes_t attributes(const char * stage, std::uint32_t layer, std::uint64_t position,
@@ -103,23 +103,43 @@ void Scope::finish() noexcept {
 #endif
     active_ = false;
 }
-const char * operation_stage(const char * op, const char * input, const char * output) noexcept {
-    if (std::strstr(output, "infllm.QK.")) return "GPU/attention QK enqueue";
-    if (std::strstr(output, "infllm.PV.")) return "GPU/attention PV enqueue";
-    if (!std::strcmp(op, "MUL_MAT")) {
-        if (std::strstr(input, "attn_q.weight")) return "GPU/Q projection enqueue";
-        if (std::strstr(input, "solid_fused_kv_weight")) return "GPU/KV projection enqueue";
-        if (std::strstr(input, "attn_k.weight")) return "GPU/K projection enqueue";
-        if (std::strstr(input, "attn_v.weight")) return "GPU/V projection enqueue";
-        if (std::strstr(input, "attn_output.weight")) return "GPU/attention output projection enqueue";
-        if (std::strstr(input, "ffn_")) return "GPU/FFN projection enqueue";
+namespace {
+struct ComputePhase {
+    Range attention;
+    void * stream = nullptr;
+    Range kv;
+    void * kv_stream = nullptr;
+};
+thread_local ComputePhase computation;
+}
+ComputeScope::ComputeScope(const char * op, const char * input, const char * output, void * stream) noexcept {
+    if (!enabled()) return;
+    unsigned layer = UINT32_MAX;
+    if (std::sscanf(output, "infllm.QK.L%u", &layer) == 1) {
+        computation.attention = Range("GPU Attention", layer);
+        computation.stream = stream;
+    } else if (std::sscanf(output, "infllm.PV.L%u", &layer) == 1) {
+        attention_end_ = computation.stream == stream;
+    } else if (!std::strcmp(op, "FLASH_ATTN_EXT")) {
+        projection_.start("GPU Attention");
+    } else if (!std::strcmp(op, "MUL_MAT")) {
+        const auto weighted = std::sscanf(input, "blk.%u.", &layer) == 1;
+        if (std::strstr(input, "attn_q.weight")) projection_.start("GPU Q projection", weighted ? layer : UINT32_MAX);
+        else if (std::strstr(input, "attn_k.weight")) {
+            computation.kv = Range("GPU KV projection", weighted ? layer : UINT32_MAX);
+            computation.kv_stream = stream;
+        } else if (std::strstr(input, "attn_v.weight")) {
+            kv_end_ = computation.kv_stream == stream;
+        }
+        else if (std::strstr(input, "solid_fused_kv_weight")) {
+            if (std::sscanf(output, "kv_projection.L%u", &layer) != 1) layer=UINT32_MAX;
+            projection_.start("GPU KV projection", layer);
+        }
     }
-    if (!std::strcmp(op, "FLASH_ATTN_EXT")) return "GPU/attention enqueue";
-    if (!std::strcmp(op, "SOFT_MAX")) return "GPU/attention softmax enqueue";
-    if (!std::strcmp(op, "ROPE")) return "GPU/RoPE enqueue";
-    if (!std::strcmp(op, "GET_ROWS")) return "GPU/gather rows enqueue";
-    if (!std::strcmp(op, "SET_ROWS")) return "GPU/store rows enqueue";
-    return "GPU/operator enqueue";
+}
+ComputeScope::~ComputeScope() {
+    if (attention_end_) { computation.attention.finish(); computation.stream=nullptr; }
+    if (kv_end_) { computation.kv.finish(); computation.kv_stream=nullptr; }
 }
 } // namespace solid::trace
 

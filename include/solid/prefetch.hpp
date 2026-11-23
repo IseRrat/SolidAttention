@@ -3,6 +3,7 @@
 #include "solid/attention.hpp"
 #include "solid/block_identity.hpp"
 #include "solid/block_stage.hpp"
+#include "solid/trace.hpp"
 #include <fstream>
 #include <deque>
 #include <map>
@@ -94,15 +95,16 @@ public:
     bool pending_reads() const { return !requests_.empty() || !queued_.empty() || !predictions_.empty(); }
     bool pending_stores() const { return !write_queue_.empty(); }
 private:
-    struct Job { SlotLease lease; KvReadSegment segment; ReadDispatch dispatch; };
+    struct Job { SlotLease lease; KvReadSegment segment; ReadDispatch dispatch; std::shared_ptr<trace::Batch> phase = {}; };
     struct ReadRequest : Job { KvReadRequest read; };
     struct ReadStage { SlotLease lease; std::shared_ptr<BlockStage> stage; };
-    struct Prediction { BlockIdentity identity; ReadDispatch read; ReadDispatch copy; };
+    struct Prediction { BlockIdentity identity; ReadDispatch read; ReadDispatch copy; std::shared_ptr<trace::Batch> phase = {}; };
     struct WriteBatch {
         std::vector<KvWriteSegment> segments;
         std::size_t next = 0;
         std::map<std::uint64_t, std::size_t> inflight;
         bool failed = false;
+        std::shared_ptr<trace::Batch> phase = {};
     };
     KvStore & store_;
     SparseBudget budget_;
@@ -115,6 +117,7 @@ private:
     std::map<std::uint64_t, ReadRequest> requests_;
     std::vector<Job> queued_;
     std::vector<Prediction> predictions_;
+    std::shared_ptr<trace::Batch> read_phase_;
     std::unique_ptr<AsyncReader> reader_;
     FileKvStore * disk_ = nullptr;
     std::vector<std::shared_ptr<StoreReceipt>> store_receipts_;
@@ -128,7 +131,8 @@ private:
     bool failed_ = false;
     bool defer_prediction_slots_ = false;
     void check() const;
-    void issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch,bool dispatch_now=true);
+    void issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch,bool dispatch_now=true,
+               const std::shared_ptr<trace::Batch> & phase = {});
     void issue_missing(const SlotLease & lease, ReadDispatch dispatch, const std::shared_ptr<BlockStage> & stage, bool dispatch_now);
     SlotLease load(const BlockIdentity & identity, ReadDispatch dispatch,const std::shared_ptr<BlockStage> & stage = {});
     void promote(const SlotLease & lease, ReadDispatch dispatch);

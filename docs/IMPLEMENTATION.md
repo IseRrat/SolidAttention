@@ -244,22 +244,18 @@
 
    [baseline.cpp](../src/baseline.cpp)、[config.cpp](../src/config.cpp)、[run_baseline.py](../scripts/run_baseline.py)、[experiments.py](../scripts/experiments.py)、[accuracy.py](../scripts/accuracy.py)、[plot_experiments.py](../scripts/plot_experiments.py)。
 
-7. **Nsight 时间线的线程、设备流与阶段标记**
+7. **Nsight 论文阶段标记**
 
-   `trace.hpp`、`trace.cpp` 接入 NVIDIA NVTX v3.3.0。线程命名使用 Linux 线程名及 NVTX 的 OS 线程 ID；CUDA stream 使用 NVTX 资源名；阶段区间支持跨线程开始、结束，带从 0 开始的层号 `L`、绝对 token 位置和任务名称。`third_party/nvtx` 保存官方头文件、许可及来源校验值。`CMakeLists.txt` 提供 `SOLID_NVTX` 构建选项；运行时由 `SOLID_NVTX_TRACE=1` 开启区间及 stream 标记，关闭时跳过区间格式化和 NVTX 调用。
+   `trace.hpp`、`trace.cpp` 接入 NVIDIA NVTX v3.3.0，运行时由 `SOLID_NVTX_TRACE=1` 开启。`third_party/nvtx` 保存官方头文件、许可和来源校验值，`CMakeLists.txt`、`Adapter.cmake` 接入构建。统一放在 `Stages` 分组，外层仅记录 Prefill 和逐步 Decode；层内记录 Q 投影、KV 投影、评分选块、完整 Attention、SSD→CPU 预取与补读、CPU→GPU 预取与装入、GPU→CPU 当前 KV 回传、CPU→SSD 写回。标签保留层号和适用的 token 位置。
 
-   CPU 线程按职责命名：`sa.infer` 为推理主线程，`sa.coordinator` 为 SolidAttention 调度协调线程，`sa.ssd-io` 为独立 I/O 线程，`off.ssd-read` 为全量卸载的读写 worker，`sp.window-read` 为稀疏基线的固定窗口 worker。`TaskWorker` 接收职责名称并在线程入口设置；GGML 持久 CPU 工作线程按编号命名为 `ggml.cpu.N`；生成的 `ggml-cpu.c` 在线程入口调用命名接口。Python 批量调度和采样监控分别命名为 `sa.matrix`、`sa.monitor`。对应实现位于 `scheduler.hpp`、`scheduler.cpp`、`io_worker.cpp`、`dense_offload.cpp`、`llama_adapter.hpp`、`ggml_prefetch.cpp`、`process_lifetime.py`、`experiments.py`、`run_baseline.py`。
+   `generate_adapter.py`、`trace.cpp` 在模型计算入口只标记 Q 投影、合并的 K/V 投影或融合 KV 投影，将 InfLLM 的 QK、softmax、PV 合为一个 Attention 区间。`llama_adapter.cpp` 为该区间边界和融合 KV 张量设置层号名称。`block_ranker.cu` 每次检索记录一个评分选块阶段，`session.cpp` 每层 Prefill attention 记录一个阶段。`baseline.cpp` 记录整体 Prefill 和逐步 Decode。逐算子、逐函数、逐块的 NVTX 条均已移除；`scheduler.cpp` 仅保留当前层 KV 回传的跨线程阶段。
 
-   CUDA stream 命名为模型计算 `model.compute.gpuN.streamN`、独立历史 KV 上传 `kv.H2D`、稀疏评分与代表更新 `sparse.score+representatives`、预填充 attention `prefill.attention`。`ggml_prefetch.cpp`、`block_ranker.cu`、`tiled_prefill.cu` 设置各自创建或使用的 stream；`generate_adapter.py` 在模型算子提交入口补齐计算 stream 名，并标记算子类型、输出张量和首个输入张量。
+   `prefetch.hpp`、`prefetch.cpp` 将同层、同用途的异步 SSD 请求绑定到一个共享批次标记。预取和正式补读分别记录，从第一笔请求接受提交开始，到最后一笔回执及规划持有者释放时结束；取消中的原请求继续持有标记至回执。异步写回从实际提交开始，到该层写批次完成时结束。`device_cache.hpp`、`device_cache.cpp` 将同层、同用途的并发上传票据合为一个阶段，按预取和正式装入区分，最后一个票据收割后结束。标记持有者仅保存追踪元数据。
 
-   `baseline.cpp` 标记本次方法、Prefill、输入批次和逐 token Decode。`session.cpp` 标记逐层 Prefill attention，`block_ranker.cu` 标记评分与 Top-K、代表更新提交。`dense_offload.cpp`、`llama_adapter.cpp`、`kv_store.cpp` 标记 SSD 读请求至回执、CPU 等待读盘、历史 KV 上传、当前 KV 归档和写回。`scheduler.cpp` 把 SolidAttention 的逐层及逐块 DAG 任务接入 NVTX，在任务开始、完成或失败时开闭区间；方向标签区分 SSD、CPU→GPU、GPU→CPU、GPU 和 CPU 调度。生成的 GGML 后端另外标记图间复制方向、源后端、目标后端及张量名。
+   `dense_offload.cpp`、`llama_adapter.cpp` 分别记录两条基线的整层或固定窗口预取，以及正式选中 KV 的补读、上传。`kv_store.cpp` 在写缓冲有数据且实际执行同步写回时记录 Store。三组保留原有 32 KiB 每层聚合写规则，缓冲攒满和请求结束排空时产生实际写盘阶段。
 
-   `scripts/solid-nsys.sh` 在采集时开启上述标记，同时记录 CUDA、NVTX、系统库调用及 CUDA Graph 节点。`scripts/profile_matrix.sh` 为矩阵内每个任务保存独立 `.nsys-rep`，生成 `INDEX.tsv`，逐项记录报告文件、方法、输入长度、模型、任务 ID 和配置文件。续跑时按执行清单跳过已有任务，每次采集后核对同一任务已完成，保持报告文件名与实验对应。`run_baseline.py` 将标记开关写入运行清单。
+   CPU 线程职责名为 `sa.infer`、`sa.coordinator`、`sa.ssd-io`、`off.ssd-read`、`sp.window-read`；`sa.infer` 只用于实际推理进程，配置检查和构建信息查询保留原进程名。Python 调度与监控分别为 `sa.matrix`、`sa.monitor`，GGML 持久 CPU worker 按编号命名。CUDA stream 保留模型计算、KV 上传、评分与代表更新、Prefill attention 的职责名。对应实现位于 `scheduler.hpp`、`scheduler.cpp`、`llama_adapter.hpp`、`ggml_prefetch.cpp`、`io_worker.cpp`、`process_lifetime.py`、`experiments.py`、`run_baseline.py`、`tiled_prefill.cu`。
 
-   区间名称中的 `enqueue` 表示主机提交调用，`submit..receipt` 表示主机观察到的提交至回执。GPU 计算和实际搬运时间保留在 Nsys 的 kernel、memory 行；标记代码仅添加名称和区间，沿用原有同步点。`tests/trace_test.cpp` 检查 Linux 线程职责名，以及跨线程区间的转交、结束和析构。
+   `scripts/solid-nsys.sh` 开启 CUDA、NVTX、系统库调用与 CUDA Graph 节点采集。`scripts/profile_matrix.sh` 为每个任务生成独立 `.nsys-rep` 和 `INDEX.tsv`，记录方法、输入长度、模型、任务 ID、配置文件；续跑按执行清单跳过已有任务，并核对采集对应任务已完成。`run_baseline.py` 在运行清单记录标记开关。CPU 阶段条记录主机观察到的区间，GPU kernel 和 memory 行记录实际计算与传输。
 
-   同一线程内的阶段使用 NVTX push/pop 形成嵌套条，跨线程的 DAG 任务使用 start/end 配对。模型算子条区分 Q/K/V 或融合 KV 投影、attention QK、softmax、PV、输出投影、FFN、RoPE 和行聚集；同时保留实际算子与张量名称。InfLLM 的 QK、softmax、PV 张量加上层号名称，便于从 GPU kernel 追到对应阶段。初始化模型及缓冲区单列 `Setup/model and buffers` 阶段。Nsys 原生 API 条保留系统函数名，业务用途显示在其对应的 NVTX 阶段条上。
-
-   `tests/test_adapter_generator.py` 检查 CPU 命名适配文件可重复生成，并核对上游 CPU 源码保持原始内容；CUDA 完成通知分别检查 FlashAttention 与 InfLLM 矩阵乘法两个入口。
-
-   [trace.hpp](../include/solid/trace.hpp)、[trace.cpp](../src/trace.cpp)、[trace_test.cpp](../tests/trace_test.cpp)、[solid-nsys.sh](../scripts/solid-nsys.sh)、[profile_matrix.sh](../scripts/profile_matrix.sh)、[NVTX 来源](../third_party/nvtx/ORIGIN)、[CMakeLists.txt](../CMakeLists.txt)、[Adapter.cmake](../cmake/Adapter.cmake)。
+   `tests/trace_test.cpp` 检查线程职责名、完整 Attention 的合并、批次标记共享、跨线程结束及上下文释放。`tests/test_adapter_generator.py` 检查生成结果可重复、上游源码保持原样，以及 FlashAttention 和 InfLLM 两个完成通知入口。

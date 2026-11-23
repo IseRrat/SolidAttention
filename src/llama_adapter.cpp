@@ -112,10 +112,10 @@ public:
         for (std::uint64_t p = 0; p < initial; ++p) positions.push_back(p);
         for (auto p = recent; p < position; ++p) positions.push_back(p);
         prepared_ = plan(position, positions, false);
-        read(layer, prepared_, reader, depth);
+        read(layer, prepared_, reader, depth, 0, nullptr, nullptr, "SSD->CPU Prefetch");
     }
     void upload_fixed() {
-        upload(prepared_);
+        upload(prepared_, "CPU->GPU Prefetch");
         prepared_.clear();
     }
     void load(std::uint32_t layer, std::uint64_t position, const std::vector<std::uint64_t> & selected,
@@ -204,8 +204,9 @@ private:
         return loads;
     }
     void read(std::uint32_t layer, const std::vector<Load> & loads, AsyncReader * reader, std::size_t depth,
-              std::uint64_t position = 0, const float * key = nullptr, const float * value = nullptr) {
-        trace::Scope phase("SSD->CPU/sparse KV submit..receipt", layer, frame_->second);
+              std::uint64_t position = 0, const float * key = nullptr, const float * value = nullptr, const char * phase_name = "SSD->CPU Load") {
+        trace::Scope phase;
+        if (!loads.empty()) phase.start(phase_name, layer, frame_->second);
         const auto & geometry = session_.geometry();
         const auto dim = geometry.dimension;
         std::vector<KvRowRange> ranges;
@@ -226,11 +227,11 @@ private:
         }
         session_.read_decode_rows(layer, ranges, reader, depth);
     }
-    void upload(const std::vector<Load> & loads) {
-        trace::Scope phase("CPU->GPU/sparse KV submit..receipt", frame_->first, frame_->second);
+    void upload(const std::vector<Load> & loads, const char * phase_name = "CPU->GPU Load") {
         const auto & geometry = session_.geometry();
         const auto dim = geometry.dimension;
         if (loads.empty()) return;
+        trace::Scope phase(phase_name, frame_->first, frame_->second);
         auto ranges = loads;
         std::sort(ranges.begin(), ranges.end(), [](const auto & a, const auto & b) { return a.row < b.row; });
         std::vector<Load> transfers;
@@ -325,6 +326,7 @@ struct AttentionNode::Impl {
     InfllmSelectedCache * selected_cache = nullptr;
     DenseOffload * dense = nullptr;
     SparseBaselineLookahead * sparse_lookahead = nullptr;
+    trace::Range current_store;
     bool packed_inputs = false;
     std::optional<DeviceMemory> direct = {};
     std::optional<DeviceMemory> selected_device = {};
@@ -366,6 +368,7 @@ struct AttentionNode::Impl {
             self.failure->check();
             const auto position = self.frame->positions.at(0);
             self.dense->upload_history(self.layer, position);
+            self.current_store = trace::Range("GPU->CPU Store", self.layer, position);
             index = static_cast<std::int32_t>(position);
         } catch (...) { self.failure->capture(std::current_exception(), self.layer); }
     }
@@ -376,13 +379,13 @@ struct AttentionNode::Impl {
         try {
             self.failure->check();
             self.sparse_lookahead->upload(self.layer, self.frame->positions.at(0));
+            self.current_store = trace::Range("GPU->CPU Store", self.layer, self.frame->positions.at(0));
         } catch (...) { self.failure->capture(std::current_exception(), self.layer); }
     }
     static void dense_archive(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith) return;
         auto & self = *static_cast<Impl *>(userdata);
-        trace::Scope phase("CPU/current KV archive", self.layer,
-            self.frame->positions.empty() ? UINT64_MAX : self.frame->positions.front());
+        self.current_store.finish();
         auto * mask = static_cast<Half *>(destination->data);
         const auto slots = static_cast<std::size_t>(ggml_nelements(destination));
         std::fill_n(mask, slots, Half{0xfc00});
@@ -398,8 +401,6 @@ struct AttentionNode::Impl {
     static void receive_attention(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith) return;
         auto & self = *static_cast<Impl *>(userdata);
-        trace::Scope phase("CPU/attention receipt", self.layer,
-            self.frame->positions.empty() ? UINT64_MAX : self.frame->positions.front());
         try {
             self.failure->check();
             const auto position = self.frame->positions.at(0);
@@ -477,8 +478,6 @@ struct AttentionNode::Impl {
     static void select_query(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith != 0) return;
         auto & self = *static_cast<Impl *>(userdata);
-        trace::Scope phase("CPU/Q ready -> selection dispatch", self.layer,
-            self.frame->positions.empty() ? UINT64_MAX : self.frame->positions.front());
         *static_cast<float *>(destination->data) = 0;
         try {
             self.failure->check();
@@ -501,6 +500,7 @@ struct AttentionNode::Impl {
     static void compute(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith != 0) return;
         auto & self = *static_cast<Impl *>(userdata);
+        self.current_store.finish();
         try {
             self.failure->check();
             const auto count = static_cast<std::size_t>(self.prefill_output?self.device_query->ne[2]:destination->ne[1]);
@@ -1335,6 +1335,7 @@ llm_graph_qkv adapter_qkv(const llm_graph_context & graph, const llama_layer & l
     adapter_mark_projection(graph,q,id,true);
     if (layer.wq_b) q = ggml_add(graph.ctx0, q, layer.wq_b);
     auto * packed = adapter->projection(id).project(graph.ctx0, input);
+    ggml_format_name(packed, "kv_projection.L%d", id);
     adapter_mark_projection(graph,packed,id,false);
     if (graph.hparams.f_clamp_kqv > 0) {
         const auto bound = graph.hparams.f_clamp_kqv;
