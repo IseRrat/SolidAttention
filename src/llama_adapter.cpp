@@ -2,6 +2,7 @@
 #include "solid/projection.hpp"
 #include "solid/ggml_prefetch.hpp"
 #include "solid/device_ops.hpp"
+#include "solid/trace.hpp"
 #include "solid/dense_offload.hpp"
 #include "solid/thread_affinity.hpp"
 #include "llama-model.h"
@@ -204,6 +205,7 @@ private:
     }
     void read(std::uint32_t layer, const std::vector<Load> & loads, AsyncReader * reader, std::size_t depth,
               std::uint64_t position = 0, const float * key = nullptr, const float * value = nullptr) {
+        trace::Scope phase("SSD->CPU/sparse KV submit..receipt", layer, frame_->second);
         const auto & geometry = session_.geometry();
         const auto dim = geometry.dimension;
         std::vector<KvRowRange> ranges;
@@ -225,6 +227,7 @@ private:
         session_.read_decode_rows(layer, ranges, reader, depth);
     }
     void upload(const std::vector<Load> & loads) {
+        trace::Scope phase("CPU->GPU/sparse KV submit..receipt", frame_->first, frame_->second);
         const auto & geometry = session_.geometry();
         const auto dim = geometry.dimension;
         if (loads.empty()) return;
@@ -378,6 +381,8 @@ struct AttentionNode::Impl {
     static void dense_archive(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith) return;
         auto & self = *static_cast<Impl *>(userdata);
+        trace::Scope phase("CPU/current KV archive", self.layer,
+            self.frame->positions.empty() ? UINT64_MAX : self.frame->positions.front());
         auto * mask = static_cast<Half *>(destination->data);
         const auto slots = static_cast<std::size_t>(ggml_nelements(destination));
         std::fill_n(mask, slots, Half{0xfc00});
@@ -393,6 +398,8 @@ struct AttentionNode::Impl {
     static void receive_attention(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith) return;
         auto & self = *static_cast<Impl *>(userdata);
+        trace::Scope phase("CPU/attention receipt", self.layer,
+            self.frame->positions.empty() ? UINT64_MAX : self.frame->positions.front());
         try {
             self.failure->check();
             const auto position = self.frame->positions.at(0);
@@ -470,6 +477,8 @@ struct AttentionNode::Impl {
     static void select_query(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith != 0) return;
         auto & self = *static_cast<Impl *>(userdata);
+        trace::Scope phase("CPU/Q ready -> selection dispatch", self.layer,
+            self.frame->positions.empty() ? UINT64_MAX : self.frame->positions.front());
         *static_cast<float *>(destination->data) = 0;
         try {
             self.failure->check();
@@ -765,10 +774,13 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
             rope.split_halves ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL, 0, rope.base, 1, 0, 1, 0, 0));
         rows = ggml_reshape_3d(context, rows, g.dimension, slots, g.heads);
         auto * logits = on_device(ggml_mul_mat(context, rows, q));
+        ggml_format_name(logits, "infllm.QK.L%u", impl_->layer);
         ggml_prec_set_acc(logits, GGML_PREC_F32);
         auto * probabilities = on_device(ggml_soft_max_ext(context, logits, mask, impl_->scale, 0));
+        ggml_format_name(probabilities, "infllm.softmax.L%u", impl_->layer);
         auto * transposed_values = on_device(ggml_cont(context, ggml_transpose(context, values)));
         auto * output = on_device(ggml_mul_mat(context, transposed_values, probabilities));
+        ggml_format_name(output, "infllm.PV.L%u", impl_->layer);
         ggml_prec_set_acc(output, GGML_PREC_F32);
         if (impl_->prefetch) {
             if (auto * token = impl_->prefetch->completion_token(impl_->layer)) {

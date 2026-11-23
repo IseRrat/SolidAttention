@@ -29,7 +29,7 @@ struct DenseOffload::Impl {
     // Destroy the worker first so the ring and its staging stay alive while it drains.
     TaskWorker worker;
 
-    Impl(AttentionSession & owner, ggml_backend * backend) : session(owner), copy_backend(backend), slots(owner.gather_slots()) {
+    Impl(AttentionSession & owner, ggml_backend * backend) : session(owner), copy_backend(backend), slots(owner.gather_slots()), worker(-1,"off.ssd-read") {
         const auto & geometry = session.geometry();
         if (!backend || !geometry.contiguous_planes || geometry.layout != KvLayout::separate) {
             throw std::invalid_argument("dense offload requires separate contiguous K/V planes");
@@ -63,6 +63,7 @@ struct DenseOffload::Impl {
         layer = target;
         phase = Phase::reading;
         worker.submit([this, target, p = position] {
+            trace::Scope phase("SSD->CPU/full layer submit..receipt", target, p);
             session.read_dense_history(target, static_cast<std::uint32_t>(p), aligned, reader.get());
         });
     }
@@ -81,9 +82,12 @@ void DenseOffload::begin(std::uint64_t position) {
     impl_->submit(0);
 }
 void DenseOffload::upload_history(std::uint32_t layer, std::uint64_t position) {
+    trace::Scope wait("CPU/wait full-layer SSD", layer, position);
     impl_->expect(layer, position, Impl::Phase::reading);
     const auto start = Impl::Clock::now();
     impl_->worker.join();
+    wait.finish();
+    trace::Scope upload("CPU->GPU/full layer submit..receipt", layer, position);
     const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(Impl::Clock::now() - start).count();
     impl_->session.account_dense_prefetch(waited);
     const auto & geometry = impl_->session.geometry();

@@ -42,7 +42,7 @@ def generate(source, destination):
     context = '#include "solid/llama_adapter.hpp"\n' + context
     context = replace_once(context, "/*.no_alloc  =*/ model.no_alloc(),", "/*.no_alloc  =*/ model.no_alloc() || solid::adapter_active(&model),")
     backend = (source.parent / "ggml/src/ggml-backend.cpp").read_text(encoding="utf-8")
-    backend = '#include "solid/profile.hpp"\n' + backend
+    backend = '#include "solid/profile.hpp"\n#include "solid/trace.hpp"\n#include <cstdio>\n' + backend
     # Copy scopes synchronize only during profiling. Prefetched reads have their own
     # scope; the consuming split returns before opening a second scope.
     helper = '''
@@ -54,7 +54,19 @@ struct solid_copy_scope {
     ggml_backend_t source;
     ggml_backend_t target;
     std::chrono::steady_clock::time_point start;
+    solid::trace::Scope annotation;
     solid_copy_scope(const ggml_tensor * t, ggml_backend_t s, ggml_backend_t d) : tensor(t), source(s), target(d) {
+        if (solid::trace::enabled() && source && target) {
+            const auto host = [](ggml_backend_t b) {
+                auto * device = ggml_backend_get_device(b);
+                return device && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU;
+            };
+            const char * stage = host(source) ? (host(target) ? "CPU->CPU/graph copy enqueue" : "CPU->GPU/graph copy enqueue") :
+                (host(target) ? "GPU->CPU/graph copy enqueue" : "GPU->GPU/graph copy enqueue");
+            char label[192];
+            std::snprintf(label, sizeof(label), "%s -> %s / %s", ggml_backend_name(source), ggml_backend_name(target), ggml_get_name(tensor));
+            annotation.start(stage, UINT32_MAX, UINT64_MAX, label);
+        }
         if (solid_transfer_observer) {
             ggml_backend_synchronize(source);
             ggml_backend_synchronize(target);
@@ -83,7 +95,22 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
     anchor = "        ggml_backend_tensor_get_async(backend, input, input_cpy->data, 0, ggml_nbytes(input));\n"
     backend = replace_once(backend, anchor, "        solid_copy_scope solid_copy(input, backend, sched->backends[next->backend_id]);\n" + anchor)
     cuda = (source.parent / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
-    cuda = '#include "solid/cuda_completion.cuh"\n#include "solid/device_ops.cuh"\n' + cuda
+    cuda = '#include "solid/cuda_completion.cuh"\n#include "solid/device_ops.cuh"\n#include "solid/trace.hpp"\n#include <cstdio>\n' + cuda
+    anchor = 'static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {\n'
+    cuda = replace_once(cuda, anchor, anchor + '''    solid::trace::Scope solid_launch;
+    if (solid::trace::enabled()) {
+        static thread_local cudaStream_t solid_named_stream = nullptr;
+        if (solid_named_stream != ctx.stream()) {
+            char stream_label[96];
+            std::snprintf(stream_label, sizeof(stream_label), "model.compute.gpu%d.stream%d", ctx.device, ctx.curr_stream_no);
+            solid::trace::name_cuda_stream(ctx.stream(), stream_label);
+            solid_named_stream = ctx.stream();
+        }
+        char label[192];
+        std::snprintf(label, sizeof(label), "%s / %s / src0=%s", ggml_op_name(dst->op), ggml_get_name(dst), dst->src[0] ? ggml_get_name(dst->src[0]) : "");
+        solid_launch.start(solid::trace::operation_stage(ggml_op_name(dst->op), dst->src[0] ? ggml_get_name(dst->src[0]) : "", ggml_get_name(dst)), UINT32_MAX, UINT64_MAX, label);
+    }
+''')
     anchor = '''        case GGML_OP_FILL:
             ggml_cuda_op_fill(ctx, dst);
             break;'''
@@ -214,9 +241,15 @@ extern "C" ggml_backend_buffer_t solid_sycl_alloc_shared_kv(ggml_backend_t backe
             if (auto * interval = solid::device_timing(node)) interval->record(sycl_ctx->stream(), false);
         }
 ''' + anchor)
+    cpu = (source.parent / "ggml/src/ggml-cpu/ggml-cpu.c").read_text(encoding="utf-8")
+    cpu = 'extern void solid_trace_name_cpu_worker(int index);\n' + cpu
+    anchor = '''static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
+    struct ggml_compute_state * state = (struct ggml_compute_state *) data;
+'''
+    cpu = replace_once(cpu, anchor, anchor + '    solid_trace_name_cpu_worker(state->ith);\n')
     destination.mkdir(parents=True, exist_ok=True)
     for name, text in (("llama-graph.cpp", graph), ("llama-context.cpp", context), ("ggml-backend.cpp", backend),
-                       ("ggml-cuda.cu", cuda), ("ggml-sycl.cpp", sycl)):
+                       ("ggml-cuda.cu", cuda), ("ggml-sycl.cpp", sycl), ("ggml-cpu.c", cpu)):
         target = destination / name
         if not target.exists() or target.read_text(encoding="utf-8") != text:
             target.write_text(text, encoding="utf-8", newline="\n")

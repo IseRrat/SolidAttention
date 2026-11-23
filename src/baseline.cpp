@@ -1,4 +1,5 @@
 #include "solid/config.hpp"
+#include "solid/trace.hpp"
 #include "solid/filehash.hpp"
 #include "solid/llama_adapter.hpp"
 #include "solid/profile.hpp"
@@ -208,6 +209,7 @@ struct AdapterContextLifetime {
 } // namespace
 
 int main(int argc, char ** argv) {
+    solid::trace::name_thread("sa.infer");
     try {
         if (argc == 2 && std::string(argv[1]) == "--help") {
             std::cout << "solid-baseline --config FILE\nsolid-baseline --validate-config FILE\nsolid-baseline --tokenize FILE\nsolid-baseline --build-info\n";
@@ -221,6 +223,9 @@ int main(int argc, char ** argv) {
             throw std::invalid_argument("use --config FILE, --validate-config FILE or --tokenize FILE");
         }
         const auto config = solid::RunConfig::load(argv[2]);
+        const auto * method = !config.attention.enabled ? "llama.cpp" : config.attention.prefetch ? "SolidAttention" :
+            config.attention.sparse ? "Offload+Sparse" : "Offload";
+        solid::trace::Scope request_range("Run", UINT32_MAX, UINT64_MAX, method);
         if (std::string(argv[1]) == "--validate-config") return 0;
         const bool tokenize_only = std::string(argv[1]) == "--tokenize";
         if (solid::sha256_file(config.model) != config.model_sha256) throw std::runtime_error("GGUF SHA256 mismatch");
@@ -234,6 +239,7 @@ int main(int argc, char ** argv) {
             throw std::runtime_error("prompt exceeds tokenizer input limit");
         }
         const auto request_start = Clock::now();
+        solid::trace::Scope setup_range("Setup/model and buffers");
         BackendLifetime backend;
         solid::ExecutionProfile profile(config.attention.profile);
         if (!tokenize_only && config.gpu_layers > 0 && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
@@ -345,13 +351,17 @@ int main(int argc, char ** argv) {
         std::unique_ptr<llama_batch_ext, decltype(&llama_batch_ext_free)> batch(llama_batch_ext_init(ctx.get()), llama_batch_ext_free);
         if (!batch) throw std::runtime_error("batch allocation failed");
         const auto prefill_start = Clock::now();
+        setup_range.finish();
+        solid::trace::Scope prefill_range("Prefill");
         for (std::size_t first = 0; first < tokens.size();) {
+            solid::trace::Scope batch_range("Prefill/batch", UINT32_MAX, first);
             const auto count = std::min<std::size_t>(config.batch_tokens, tokens.size() - first);
             submit(ctx.get(), batch.get(), tokens.data() + first, count, static_cast<llama_pos>(first), first + count == tokens.size(), adapter.get());
             profile.check(); evaluation.check();
             first += count;
         }
         if (adapter) adapter->flush();
+        prefill_range.finish();
         const double prefill_ms = milliseconds(prefill_start);
         const auto prefill_counters = adapter ? counters(adapter->stats(), adapter->device_stats()) : Json::object();
         if (adapter && config.attention.direct_decode_reads) adapter->enable_direct_reads();
@@ -375,6 +385,7 @@ int main(int argc, char ** argv) {
             const auto start = Clock::now();
             double process_ms = 0;
             if (i > 0) {
+                solid::trace::Scope step_range("Decode", UINT32_MAX, tokens.size() + i - 1);
                 const auto processing = Clock::now();
                 const llama_token input = config.replay ? config.replay_token_ids[i - 1] : generated.back();
                 decode_inputs.push_back(input);

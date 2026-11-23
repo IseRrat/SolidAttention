@@ -17,18 +17,25 @@ class GeneratorTests(unittest.TestCase):
         backend_before = backend.read_bytes()
         cuda=source.parent/"ggml/src/ggml-cuda/ggml-cuda.cu"
         cuda_before=cuda.read_bytes()
+        cpu=source.parent/"ggml/src/ggml-cpu/ggml-cpu.c"
+        cpu_before=cpu.read_bytes()
         with tempfile.TemporaryDirectory() as temporary:
             output = Path(temporary)
             generator.generate(source, output)
             first = {name: (output / name).read_bytes() for name in before}
             first_backend = (output / "ggml-backend.cpp").read_bytes()
             first_cuda=(output/"ggml-cuda.cu").read_bytes()
+            first_cpu=(output/"ggml-cpu.c").read_bytes()
             generator.generate(source, output)
             self.assertEqual(first, {name: (output / name).read_bytes() for name in before})
             self.assertEqual(first_backend, (output / "ggml-backend.cpp").read_bytes())
             self.assertEqual(first_cuda,(output/"ggml-cuda.cu").read_bytes())
-            self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_attention_begin("),1)
-            self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_attention_end("),1)
+            self.assertEqual(first_cpu,(output/"ggml-cpu.c").read_bytes())
+            self.assertEqual(first_cpu.count(b"solid_trace_name_cpu_worker(state->ith)"),1)
+            self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_attention_begin(solid_completion,"),1)
+            self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_attention_end(solid_completion,"),1)
+            self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_attention_begin(completion,"),1)
+            self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_attention_end(completion,"),1)
             self.assertEqual(first_cuda.count(b"case GGML_OP_CUSTOM:"),2)
             self.assertEqual(first_cuda.count(b"CUDA_CHECK(solid::cuda_device_op(dst, ctx.stream()))"),1)
             self.assertIn(b"return solid::device_op_supported(op);",first_cuda)
@@ -42,6 +49,7 @@ class GeneratorTests(unittest.TestCase):
         self.assertEqual(before, {name: (source / name).read_bytes() for name in before})
         self.assertEqual(backend_before, backend.read_bytes())
         self.assertEqual(cuda_before,cuda.read_bytes())
+        self.assertEqual(cpu_before,cpu.read_bytes())
 
     def test_changed_anchor_is_rejected(self):
         with self.assertRaises(ValueError):

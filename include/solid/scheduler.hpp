@@ -11,6 +11,7 @@
 #include <thread>
 #include <vector>
 #include <optional>
+#include "solid/trace.hpp"
 
 namespace solid {
 enum class ScheduleMode { naive, overlap, sync_reuse };
@@ -66,13 +67,16 @@ private:
     std::vector<std::uint32_t> order_;
     ScheduleTrace * trace_;
     std::uint64_t frame_;
+    std::uint32_t layer_;
+    std::uint64_t position_;
+    std::vector<trace::Range> ranges_;
     mutable std::recursive_mutex mutex_;
     bool dependencies_complete(std::uint32_t task) const;
 };
 // One persistent worker, one bounded job. Exceptions are delivered by join().
 class TaskWorker {
 public:
-    explicit TaskWorker(int cpu=-1);
+    explicit TaskWorker(int cpu=-1, const char * name="sa.worker");
     ~TaskWorker();
     void submit(std::function<void()> work);
     void join();

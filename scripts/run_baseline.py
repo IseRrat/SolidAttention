@@ -12,7 +12,7 @@ import shutil
 import subprocess
 import sys
 import time
-from process_lifetime import stop_process, termination_signals
+from process_lifetime import stop_process, termination_signals, name_thread
 
 ROOT = Path(__file__).resolve().parents[1]
 UPSTREAM = "ef6bc6f367082338006c8379bc7bcab3e1584766"
@@ -188,6 +188,7 @@ def run_monitored(manifest, run_dir, output):
 
 
 def main():
+    name_thread("sa.monitor")
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("config", type=Path, nargs="?")
     parser.add_argument("--runner", type=Path, default=ROOT / "build/release/bin/solid-baseline")
@@ -259,7 +260,7 @@ def main():
                    "os_release": Path("/etc/os-release").read_text()},
         "environment": {key: os.environ.get(key) for key in
                         ("CUDA_VISIBLE_DEVICES", "CUDA_MPS_PIPE_DIRECTORY", "CUDA_MPS_PINNED_DEVICE_MEM_LIMIT",
-                         "GGML_CUDA_DISABLE_GRAPHS", "OMP_NUM_THREADS")},
+                         "GGML_CUDA_DISABLE_GRAPHS", "OMP_NUM_THREADS", "SOLID_NVTX_TRACE")},
         "memory_sample_interval_seconds": 0.1,
         "launcher_sha256": digest(Path(__file__)),
     }

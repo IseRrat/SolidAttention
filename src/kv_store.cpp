@@ -1,4 +1,5 @@
 #include "solid/kv_store.hpp"
+#include "solid/trace.hpp"
 #include "solid/async_reader.hpp"
 
 #include <algorithm>
@@ -428,6 +429,7 @@ void FileKvStore::append_interleaved(std::uint32_t layer, std::uint64_t position
     ++lengths_[layer];
 }
 void FileKvStore::flush_layer(std::uint32_t layer) {
+    trace::Scope phase("CPU->SSD/write submit..receipt", layer);
     if (pending_.at(layer).values.empty()) return;
     const auto segments = begin_write(layer);
     try {
@@ -555,6 +557,8 @@ void FileKvStore::read_dense_layer(std::uint32_t layer, std::uint32_t count, std
 }
 void FileKvStore::read_separate_rows(std::uint32_t layer, const std::vector<KvRowRange> & ranges, AsyncReader * reader,
                                      std::size_t depth) {
+    trace::Scope phase("SSD->CPU/separate KV submit..receipt", layer,
+        ranges.empty() ? UINT64_MAX : ranges.front().first);
     if (ranges.empty()) return;
     const auto & g = geometry_;
     const auto size = length(layer);

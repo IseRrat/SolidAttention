@@ -1,4 +1,5 @@
 #include "solid/async_reader.hpp"
+#include "solid/trace.hpp"
 #include "solid/thread_affinity.hpp"
 #include <algorithm>
 #include <cerrno>
@@ -142,6 +143,7 @@ private:
         stats_.worker_capacity=depth_;
     }
     void run() noexcept {
+        trace::name_thread("sa.ssd-io");
         std::unique_ptr<AsyncReader> reader;
         try {
             bind_thread_cpu(cpu_); reader=factory_();

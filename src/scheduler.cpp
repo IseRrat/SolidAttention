@@ -70,9 +70,10 @@ void ScheduleTrace::flush() {
     if (stream_.is_open()) { stream_.flush(); if (!stream_) throw std::runtime_error("schedule trace flush failed"); }
 }
 TaskDag::TaskDag(std::vector<TaskSpec> specs, ScheduleTrace * trace, std::uint64_t frame, std::uint32_t layer,
-                 std::uint64_t position, ScheduleMode mode) : trace_(trace), frame_(frame) {
+                 std::uint64_t position, ScheduleMode mode) : trace_(trace), frame_(frame), layer_(layer), position_(position) {
     if (specs.empty() || specs.size() > UINT32_MAX) throw std::invalid_argument("invalid DAG size");
     for (auto & spec : specs) tasks_.push_back({std::move(spec)});
+    if (solid::trace::enabled()) ranges_.resize(tasks_.size());
     std::vector<std::size_t> indegree(tasks_.size());
     std::vector<std::vector<std::uint32_t>> successors(tasks_.size());
     for (std::uint32_t id = 0; id < tasks_.size(); ++id) {
@@ -137,6 +138,13 @@ void TaskDag::start(std::uint32_t id, std::uint64_t now,const std::string & proo
     if (record.state != TaskState::pending || !dependencies_complete(id)) throw std::logic_error("task started before dependencies completed");
     for (const auto before : record.spec.predecessors) if (now < tasks_[before].end_ns) throw std::logic_error("nonmonotonic task start");
     record.start_ns = now; record.state = TaskState::running;
+    if (!ranges_.empty()) {
+        const auto prefix = record.spec.resource == TaskResource::ssd ? "SSD stage" :
+            record.spec.resource == TaskResource::h2d ? "CPU->GPU stage" :
+            record.spec.resource == TaskResource::d2h ? "GPU->CPU stage" :
+            record.spec.resource == TaskResource::gpu ? "GPU stage" : "CPU stage";
+        ranges_[id] = trace::Range(prefix, layer_, position_, record.spec.name.c_str());
+    }
     if (trace_) trace_->event(frame_, id, "start", now,proof);
 }
 void TaskDag::complete(std::uint32_t id, std::uint64_t now, const std::string & proof,std::optional<std::uint64_t> device_ns) {
@@ -144,6 +152,7 @@ void TaskDag::complete(std::uint32_t id, std::uint64_t now, const std::string & 
     auto & record = tasks_.at(id);
     if (record.state != TaskState::running || now < record.start_ns) throw std::logic_error("invalid task completion");
     record.end_ns = now; record.state = TaskState::complete; record.device_ns=device_ns;
+    if (!ranges_.empty()) ranges_[id].finish();
     if (trace_) trace_->event(frame_, id, "complete", now, proof,device_ns);
 }
 void TaskDag::fence(const std::vector<std::uint32_t> & covered, std::uint64_t now, const std::string & proof) {
@@ -171,6 +180,7 @@ void TaskDag::abort(std::uint64_t now) {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     for (std::uint32_t id = 0; id < tasks_.size(); ++id) if (tasks_[id].state != TaskState::complete && tasks_[id].state != TaskState::failed) {
         tasks_[id].state = TaskState::failed;
+        if (!ranges_.empty()) ranges_[id].finish();
         if (trace_) trace_->event(frame_, id, "failed", now);
     }
 }
@@ -197,8 +207,9 @@ std::uint64_t TaskDag::overlap_ns(std::uint32_t a, std::uint32_t b) const {
     const auto begin = std::max(x.start_ns, y.start_ns), end = std::min(x.end_ns, y.end_ns);
     return end > begin ? end - begin : 0;
 }
-TaskWorker::TaskWorker(int cpu) {
-    thread_=std::thread([this,cpu] {
+TaskWorker::TaskWorker(int cpu, const char * name) {
+    thread_=std::thread([this,cpu,name=std::string(name)] {
+        trace::name_thread(name.c_str());
         std::exception_ptr error;
         try { bind_thread_cpu(cpu); } catch (...) { error=std::current_exception(); }
         { std::lock_guard<std::mutex> lock(mutex_); initialization_error_=error; initialized_=true; }

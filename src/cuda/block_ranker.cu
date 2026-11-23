@@ -1,4 +1,5 @@
 #include "solid/block_ranker.hpp"
+#include "solid/trace.hpp"
 #include "solid/ranking_math.hpp"
 #include "solid/representative_math.hpp"
 #include <cuda_runtime.h>
@@ -320,6 +321,7 @@ public:
                 throw std::invalid_argument("CUDA ranker launch geometry exceeds device limits");
             }
             checked(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking), "create CUDA ranker stream");
+            trace::name_cuda_stream(stream_, "sparse.score+representatives");
             allocate(query_, product(product(query_heads, geometry.dimension), sizeof(float)));
             allocate(ids_, product(geometry.blocks_per_head(), sizeof(std::uint64_t)));
             allocate(costs_, product(geometry.blocks_per_head(), sizeof(std::uint32_t)));
@@ -398,6 +400,7 @@ public:
         } catch (...) { fail(); throw; }
     }
     std::vector<BuiltRepresentatives> probability_update_impl(ProbabilityFrame frame, void * compute_stream) {
+        trace::Scope phase("GPU/representatives enqueue", frame.layer, frame.first);
         check();
         if (probability_pending_) throw std::logic_error("previous probability receipt must be collected");
         if (!probability_local_ || frame.layer >= geometry_.layers || !frame.count || frame.count > 512 ||
@@ -749,6 +752,8 @@ public:
         if (layer >= geometry_.layers ||
             candidates.blocks.size() != candidates.tokens.size() || candidates.blocks.size() > geometry_.blocks_per_head() ||
             candidates.remaining > budget_) throw std::invalid_argument("CUDA ranking shape or budget");
+        trace::Scope phase("GPU/score+TopK submit..receipt", layer,
+            probability_local_ ? probability_lengths_[layer] : UINT64_MAX);
         for (std::size_t i = 0; i < candidates.blocks.size(); ++i) {
             if (candidates.blocks[i] >= published_[layer] || (i && candidates.blocks[i] <= candidates.blocks[i-1]) ||
                 !candidates.tokens[i] || candidates.tokens[i] > geometry_.block_tokens) throw std::invalid_argument("invalid CUDA rank candidate");

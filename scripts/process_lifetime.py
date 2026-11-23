@@ -3,6 +3,14 @@ from contextlib import contextmanager
 import os
 import signal
 import subprocess
+import sys
+
+
+def name_thread(name):
+    if sys.platform.startswith("linux"):
+        import ctypes
+        libc = ctypes.CDLL(None)
+        libc.prctl(15, ctypes.c_char_p(name.encode("ascii")[:15]), 0, 0, 0)
 
 HARD_STOP = getattr(signal,"SIGKILL",9)
 

@@ -132,6 +132,8 @@ public:
             for (std::size_t ordinal=0;ordinal<ggml_backend_reg_dev_count(registry);++ordinal) {
                 if (ggml_backend_reg_dev_get(registry,ordinal)!=ggml_backend_get_device(backend_)) continue;
                 cuda_device_=static_cast<int>(ordinal);
+                solid::trace::name_cuda_stream(solid_cuda_queue(backend_), "model.compute");
+                if (copy_backend_ != backend_) solid::trace::name_cuda_stream(solid_cuda_queue(copy_backend_), "kv.H2D");
                 copy_intervals_.resize(static_cast<std::size_t>(geometry_.heads)*per_head_);
                 break;
             }
@@ -693,7 +695,7 @@ struct GgmlPrefetch::Impl {
     std::atomic<std::uint64_t> released_epoch{0};
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
         const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied,bool share_host_cache) :
-        session(s), backend(backend), mode(mode), worker(cpu), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
+        session(s), backend(backend), mode(mode), worker(cpu,"sa.coordinator"), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
             schedule.parent_path()/(schedule.stem().string()+".blocks"+schedule.extension().string())),
         events(attention_events(s,backend,mode,std::move(supplied))),
         transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode,events.get(),share_host_cache),

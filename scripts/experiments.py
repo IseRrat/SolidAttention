@@ -356,6 +356,8 @@ def collect(plan_path, destination):
 
 
 def main():
+    from process_lifetime import name_thread
+    name_thread("sa.matrix")
     parser = argparse.ArgumentParser(description=__doc__)
     actions = parser.add_subparsers(dest="action",required=True)
     p = actions.add_parser("prepare"); p.add_argument("spec",type=Path); p.add_argument("destination",type=Path)

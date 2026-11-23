@@ -1,4 +1,5 @@
 #include "solid/tiled_prefill.hpp"
+#include "solid/trace.hpp"
 #include "solid/attention.hpp"
 #include "solid/online_attention.hpp"
 #include <cuda_runtime.h>
@@ -379,6 +380,7 @@ public:
         DeviceScope scope(device_);
         try {
             checked(cudaStreamCreateWithFlags(&stream_,cudaStreamNonBlocking),"create prefill stream");
+            trace::name_cuda_stream(stream_, "prefill.attention");
             checked(cudaEventCreateWithFlags(&copied_,cudaEventDisableTiming),"create prefill upload event");
             allocate(kv_,product(tile_elements_,sizeof(Half)),stats_.kv_device_bytes);
             allocate(query_,product(product(rows,g_.dimension),sizeof(float)),stats_.workspace_device_bytes);

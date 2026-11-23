@@ -40,7 +40,7 @@ private:
     InfllmSelectedCache & workspace_;
     std::unique_ptr<AsyncReader> reader_;
     std::optional<std::pair<std::uint32_t, std::uint64_t>> frame_;
-    TaskWorker worker_;
+    TaskWorker worker_{-1,"sp.window-read"};
 };
 struct AttentionFrame { std::vector<std::uint64_t> positions; };
 
