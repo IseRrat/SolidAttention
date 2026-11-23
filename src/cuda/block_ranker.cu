@@ -410,10 +410,14 @@ public:
             }
             if (!banks_[frame.layer]) allocate(banks_[frame.layer], layer_bytes_);
             checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear probability status");
-            probability_append_keys<<<256, 256, 0, stream_>>>(frame.kv.data, state.keys, state.scores, error_device_,
+            const auto key_items = product(product(frame.count, input_heads_), geometry_.dimension);
+            const auto score_items = product(end - origin, geometry_.heads);
+            const auto key_grid = static_cast<unsigned>(std::min<std::size_t>((key_items + 255) / 256, 256));
+            const auto score_grid = static_cast<unsigned>(std::min<std::size_t>((score_items + 255) / 256, 256));
+            probability_append_keys<<<key_grid, 256, 0, stream_>>>(frame.kv.data, state.keys, state.scores, error_device_,
                 frame.first, frame.count, probability_capacity_, input_heads_, geometry_.heads, geometry_.dimension);
             checked(cudaGetLastError(), "append probability keys");
-            probability_add_scores<<<256, 256, 0, stream_>>>(frame.scores.data, state.scores, error_device_,
+            probability_add_scores<<<score_grid, 256, 0, stream_>>>(frame.scores.data, state.scores, error_device_,
                 origin, static_cast<std::uint32_t>(end - origin), geometry_.heads, probability_capacity_, frame.key_major);
             checked(cudaGetLastError(), "accumulate probability scores");
             probability_finalize<<<static_cast<unsigned>((geometry_.heads + 127) / 128), 128, 0, stream_>>>(

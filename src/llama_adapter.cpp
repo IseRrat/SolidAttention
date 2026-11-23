@@ -399,10 +399,10 @@ struct AttentionNode::Impl {
             if (self.session.device_probabilities()) {
                 if (!self.device_kv || !self.device_scores) throw std::logic_error("device probability inputs missing");
                 if (self.prefetch) self.prefetch->completed(self.epoch);
+                if (self.sparse_lookahead) self.sparse_lookahead->completed(self.layer, position);
                 self.session.observe_device_probabilities(self.layer, position,
                     {static_cast<const Half *>(self.device_kv->data), static_cast<std::size_t>(ggml_nelements(self.device_kv)), DeviceMemory::cuda},
                     {static_cast<const float *>(self.device_scores->data), static_cast<std::size_t>(ggml_nelements(self.device_scores)), DeviceMemory::cuda});
-                if (self.sparse_lookahead) self.sparse_lookahead->completed(self.layer, position);
                 *static_cast<float *>(destination->data) = 0;
                 return;
             }
@@ -416,8 +416,8 @@ struct AttentionNode::Impl {
                 std::copy_n(p + q * local + local - recent, recent, scores.data() + q * recent);
             }
             if (self.prefetch) self.prefetch->completed(self.epoch);
-            self.session.observe_probabilities(self.layer, position, scores);
             if (self.sparse_lookahead) self.sparse_lookahead->completed(self.layer, position);
+            self.session.observe_probabilities(self.layer, position, scores);
             *static_cast<float *>(destination->data) = 0;
         } catch (...) {
             self.failure->capture(std::current_exception(), self.layer, self.frame->positions.empty() ? 0 : self.frame->positions.front());

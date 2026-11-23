@@ -595,9 +595,11 @@ public:
         const auto global_end = frame.positions.begin() + local_only_from;
         const auto global_keys = end > frame.local ? static_cast<std::uint32_t>(
             std::upper_bound(frame.positions.begin(), global_end, end - 1 - frame.local) - frame.positions.begin()) : 0;
-        SparsePrefillOutput result{std::vector<float>(direct ? 0 : elements), std::vector<float>(product(qh_, end - origin))};
+        const auto score_elements = product(qh_, end - origin);
+        SparsePrefillOutput result{std::vector<float>(direct ? 0 : elements),
+            std::vector<float>(frame.keep_scores_on_device ? 0 : score_elements)};
         const auto q_bytes = result.attention.size() * sizeof(float);
-        const auto feedback_bytes = result.key_scores.size() * sizeof(float);
+        const auto feedback_bytes = score_elements * sizeof(float);
         if (frame.keep_scores_on_device && !direct) throw std::invalid_argument("device scores require device prefill inputs");
         const auto row_bytes = 2 * g_.dimension * sizeof(Half);
         const auto history = direct ? valid - frame.queries : valid;
@@ -630,7 +632,7 @@ public:
             sparse_softmax<<<static_cast<unsigned>(rows), 256, 0, stream_>>>(scores_, local_scores_, probabilities_,
                 key_positions_, error_device_, frame.first_query, frame.queries, frame.local, valid, local_only_from);
             checked(cudaGetLastError(), "apply joint sparse prefill softmax");
-            sum_sparse_local_scores<<<grid(result.key_scores.size()), 256, 0, stream_>>>(probabilities_, local_feedback_,
+            sum_sparse_local_scores<<<grid(score_elements), 256, 0, stream_>>>(probabilities_, local_feedback_,
                 frame.first_query, origin, frame.queries, qh_, frame.local, valid, local_begin);
             checked(cudaGetLastError(), "sum recent attention scores by key");
             multiply_values(valid, frame.queries);
@@ -653,8 +655,7 @@ public:
         stats_.upload_bytes += kv_bytes;
         stats_.output_download_bytes += q_bytes;
         if (frame.keep_scores_on_device) {
-            result.device_scores = {local_feedback_, result.key_scores.size(), DeviceMemory::cuda};
-            result.key_scores.clear();
+            result.device_scores = {local_feedback_, score_elements, DeviceMemory::cuda};
         } else stats_.probability_download_bytes += feedback_bytes;
         if (direct) { stats_.device_query_tokens += frame.queries; stats_.device_kv_tokens += frame.queries; }
         return result;
