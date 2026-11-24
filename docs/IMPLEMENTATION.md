@@ -1,6 +1,6 @@
 # 实现记录
 
-更新日期为 2026-11-23。
+更新日期为 2026-11-24。
 
 ## 一、KV Consolidator
 
@@ -42,13 +42,15 @@
 
 2. **代表向量构造**
 
-   CUDA 对照配置下，两条稀疏路径按 query head 累加联合 softmax 中属于近期窗口的实际概率。同一组 query heads 映射到同一个 KV head 的待定 K 行。历史块定稿时，每个 query head 取 4 个代表 Key 并求均值，设备排名只保存均值向量。多头分数汇总成一个块分数，块和代表同分时分别按逻辑块 ID 和绝对位置排序。原配置的局部点积建索引由低层兼容接口继续提供。运行结果记录代表评分与位置编码方式。
+   CUDA 对照配置下，两条稀疏路径按 query head 累加联合 softmax 中属于近期窗口的实际概率。同一组 query heads 映射到同一个 KV head 的待定 K 行。每批近期概率先转成 FP16，再加到 FP16 累计分数上，CPU 参考与 CUDA 设备更新遵循相同的两次舍入，沿用原版 `append_global` 的分数类型。历史块定稿时，每个 query head 取 4 个代表 Key 并求均值，设备排名只保存均值向量。多头分数汇总成一个块分数，块和代表同分时分别按逻辑块 ID 和绝对位置排序。原配置的局部点积建索引由低层兼容接口继续提供。运行结果记录代表评分与位置编码方式。
 
    [attention.cpp](../src/attention.cpp)、[representative_builder.cpp](../src/representative_builder.cpp)、[representative_math.hpp](../include/solid/representative_math.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[session.hpp](../include/solid/session.hpp)、[baseline.cpp](../src/baseline.cpp)。
 
 3. **CUDA 代表构造和选块**
 
-   设备维护代表 bank、pending K 环、窗口分数与部分块 top-R。两条稀疏实验路径使用相同的 CUDA 评分与 Top-K。每个线程块并行归约一个历史块跨头的 FP32 点积，只执行一份 Top-K 并回传一份块编号。已就绪的全部候选放得进预算时直接使用。原有低层逐头接口保留 FP64 评分，供既有调用使用。两种接口同分时都按逻辑块 ID 排序。
+   设备维护代表 bank、pending K 环和 FP16 窗口分数。完整块退出近期窗口后，每个“历史块、query head”对应一个 CUDA 线程块，独立执行块内 Top-K。32-token 实验块及不超过 128-token 的兼容块调用 CUB 稳定基数排序；更大的兼容块调用 CUB 并行归约选出代表。后续 gather/mean 内核并行读取代表 Key、计算各维均值，生成 FP16 块代表。待定环保留尚未完整退出窗口的块，代表构造按完整块提交，省去逐 token 插入及搬移代表 Key。位置、分数和状态通过一次分配的页锁定回执缓冲返回主机，同步、异步入口复用该缓冲。
+
+   两条稀疏实验路径使用相同的 CUDA 评分与 Top-K。每个线程块并行归约一个历史块跨头的 FP32 点积，只执行一份 Top-K 并回传一份块编号。已就绪的全部候选放得进预算时直接使用。原有低层逐头接口保留 FP64 评分及其增量代表构造接口，供既有调用使用。两种选块接口同分时都按逻辑块 ID 排序。
 
    [block_ranker.cu](../src/cuda/block_ranker.cu)、[block_ranker.hpp](../include/solid/block_ranker.hpp)。
 
@@ -64,7 +66,7 @@
 
    两条稀疏路径的 K/V 在矩阵乘法中使用 FP16，累加精度设为 FP32。近期槽位索引按 query head 和时间顺序生成，设备上的 GET_ROWS 从概率表中只取近期分数。CPU 回执接收近期分数和一个 attention 完成标量，确认本层归档后更新代表索引。attention 输出通过带回执依赖的原地设备节点直接交给后续层。CPU、CUDA、SYCL 均实现该节点，数值回归覆盖解码图复用、近期索引和原生完成通知。
 
-   CUDA 选块器启用设备概率累计时，近期分数和当前 FP16 Key 直接交给 GPU 的环形缓冲。每个 query head 独立累加分数，Key 离开近期窗口后加入所属历史块的代表候选，整块完成时在 GPU 生成均值代表。CPU 接收新完成块的代表位置、分数和状态。Prefill 的按 key 汇总分数与 Decode 的单 token 分数接入同一条更新路径。回归用例覆盖 128-token 输入组、逐 token 解码和环形缓冲周转，对照 CPU 参考得到的代表位置。[attention.cpp](../src/attention.cpp)、[attention.hpp](../include/solid/attention.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[session.cpp](../src/session.cpp)、[session.hpp](../include/solid/session.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
+   CUDA 选块器启用设备概率累计时，近期分数和当前 FP16 Key 直接交给 GPU 的环形缓冲。每个 query head 独立累加分数，整块退出近期窗口时在 GPU 生成均值代表。CPU 接收新完成块的代表位置、分数和状态。Prefill 的按 key 汇总分数与 Decode 的单 token 分数接入同一条更新路径。回归用例覆盖 128-token 输入组、逐 token 解码和环形缓冲周转；CPU 参考按同样的 Prefill 分组、Decode 单步边界累计 FP16 分数。[attention.cpp](../src/attention.cpp)、[attention.hpp](../include/solid/attention.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[session.cpp](../src/session.cpp)、[session.hpp](../include/solid/session.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
 
    稀疏基线用设备 Q 直接评分，仅把所选块编号交给主机安排 SSD 读取。历史行直接读入与设备 bank 对应的页锁定主机位置。相邻目标行合并上传，每批上传共享一次完成等待，源缓冲在完成后复用。纯 Offload 的整层上传也使用页锁定缓冲。 [llama_adapter.cpp](../src/llama_adapter.cpp)、[dense_offload.cpp](../src/dense_offload.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
 
@@ -77,6 +79,14 @@
    [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cuh](../include/solid/device_ops.cuh)、[sycl_device_ops.hpp](../include/solid/sycl_device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)。
 
    [llama_adapter.cpp](../src/llama_adapter.cpp)、[llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[device_cache.cpp](../src/device_cache.cpp)、[device_cache.hpp](../include/solid/device_cache.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[sycl_flash_decode.hpp](../include/solid/sycl_flash_decode.hpp)、[gather_test.cpp](../tests/gather_test.cpp)、[prefetch_graph_test.cpp](../tests/prefetch_graph_test.cpp)。
+
+6. **原版 InfLLM 代表构造对照**
+
+   `third_party/infllm` 保存 thunlp/InfLLM 提交 `12b70798f56e56ebb23c53c7018091a3f540a028` 的原始 Python 包及 MIT 许可证，`ORIGIN` 记录提交、来源和源码归档 SHA256。`infllm_reference_fixture.py` 直接调用这份源码的 `append_global`、`get_block_k`、GQA 展开及 `VectorTensor` 写入，生成 CPU 张量参考数据；初始化时只将存储放到 CPU，保留原函数。参考包含 32-token 检索块、28 个 query heads 对 4 个 KV heads、512-token Prefill、逐 token Decode、环形缓冲周转、未对齐 init 及 7/256-token 兼容块。
+
+   `infllm_reference_cases.hpp` 读取原版输出，逐批核对完整块发布边界、代表 Top-K 得分集合、选中的原始 Key 和 FP16 均值。分数唯一时核对原版代表集合；Top-K 边界同分时核对最优得分集合及实际所选 Key 的均值。`infllm_reference_test.cpp` 接入 CPU 索引，`cuda_prefill_test.cpp` 接入真实 CUDA 代表 bank。`CMakeLists.txt` 添加独立的 CPU 对照程序。已通过 CPU 对照的 4 组、127 批、69 个完整块，以及服务器 54 项 CPU 回归；CUDA 代表构造和对照程序已完成编译。
+
+   [原版源码及许可](../third_party/infllm/)、[来源记录](../third_party/infllm/ORIGIN)、[infllm_reference_fixture.py](../scripts/infllm_reference_fixture.py)、[infllm_reference_cases.hpp](../tests/infllm_reference_cases.hpp)、[infllm_reference_test.cpp](../tests/infllm_reference_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)、[CMakeLists.txt](../CMakeLists.txt)。
 
 ## 三、Speculative Prefetcher
 

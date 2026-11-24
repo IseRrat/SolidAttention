@@ -1,4 +1,5 @@
 #include "tiled_prefill_cases.hpp"
+#include "infllm_reference_cases.hpp"
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <limits>
@@ -132,7 +133,6 @@ void probability_representatives(int device) {
                 keys[d] = solid::to_half(static_cast<float>((position + d) % 19) / 16.f);
                 kv[i * 128 + d] = keys[d];
             }
-            reference.observe(0, position, std::vector<float>(128, 0.f), keys);
             const auto recent = std::min<std::uint64_t>(position + 1, budget.local);
             std::vector<float> probabilities(recent * 2);
             for (std::size_t h = 0; h < 2; ++h) for (std::uint64_t j = 0; j < recent; ++j) {
@@ -141,7 +141,11 @@ void probability_representatives(int device) {
                 const auto key = position + 1 - recent + j - origin;
                 scores[count == 1 ? h * recent + j : key * 2 + h] += value;
             }
-            reference.observe_probabilities(0, position, probabilities);
+        }
+        if (count != 1) reference.observe_prefill_scores(0, first, count, kv, scores);
+        else {
+            reference.observe(0, first, std::vector<float>(128, 0.f), {kv.begin(), kv.begin() + 64});
+            reference.observe_probabilities(0, first, scores);
         }
         auto device_kv = device_buffer<solid::Half>(kv.size());
         auto device_scores = device_buffer<float>(scores.size());
@@ -175,11 +179,11 @@ void probability_representatives(int device) {
 
 int main(int argc,char ** argv) {
     if (argc<2 || std::string(argv[1])!="--run-device-check") {
-        std::cout<<"Usage: solid-cuda-prefill-test --run-device-check [device ordinal]\n"; return argc==1?0:2;
+        std::cout<<"Usage: solid-cuda-prefill-test --run-device-check [device ordinal] [upstream-fixture.bin]\n"; return argc==1?0:2;
     }
     try {
-        if (argc>3) throw std::invalid_argument("unexpected device-check argument");
-        const auto device=argc==3?std::stoi(argv[2]):0;
+        if (argc>4) throw std::invalid_argument("unexpected device-check argument");
+        const auto device=argc>=3?std::stoi(argv[2]):0;
         const auto factory = [&](auto g, auto qh, auto queries, auto tile) {
             return solid::make_cuda_tiled_prefill(g, qh, queries, tile, device);
         };
@@ -187,6 +191,22 @@ int main(int argc,char ** argv) {
         test_tiled::frames(factory, 128, false, 32, 1e-3f);
         sparse_prefill(device);
         probability_representatives(device);
+        if (argc == 4) test_infllm::run(argv[3], [=](auto & index, auto geometry, auto heads, auto budget) {
+            const auto kv_heads = geometry.heads;
+            geometry.heads = heads;
+            auto ranker = solid::make_cuda_block_ranker(geometry, heads, 1, budget.total, device, 0, kv_heads);
+            test_infllm::require(ranker->configure_probability_builder(budget.initial, budget.local, budget.representatives),
+                "upstream fixture probability builder configuration");
+            index.set_ranker(std::move(ranker));
+        }, [](auto & index, auto first, auto count, const auto & kv, const auto & scores) {
+            auto device_kv = device_buffer<solid::Half>(kv.size());
+            auto device_scores = device_buffer<float>(scores.size());
+            cuda_check(cudaMemcpy(device_kv.get(), kv.data(), kv.size() * sizeof(solid::Half), cudaMemcpyHostToDevice));
+            cuda_check(cudaMemcpy(device_scores.get(), scores.data(), scores.size() * sizeof(float), cudaMemcpyHostToDevice));
+            index.observe_prefill_device_scores(0, first, count,
+                {device_kv.get(), kv.size(), solid::DeviceMemory::cuda},
+                {device_scores.get(), scores.size(), solid::DeviceMemory::cuda});
+        });
         std::cout<<"CUDA tiled prefill device checks passed\n"; return 0;
     } catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

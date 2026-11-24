@@ -1,0 +1,129 @@
+#!/usr/bin/env python3
+"""Export CPU fixtures by executing the pinned, unmodified InfLLM methods."""
+import argparse
+import importlib
+import json
+from pathlib import Path
+import struct
+import sys
+import types
+
+import torch
+
+
+def upstream(root):
+    # Load the real attention modules without the unrelated HF patcher/chat
+    # entry point. No algorithm or torch operation is replaced.
+    for name, path in (("inf_llm", root / "inf_llm"),
+                       ("inf_llm.attention", root / "inf_llm/attention")):
+        package = types.ModuleType(name)
+        package.__path__ = [str(path)]
+        sys.modules[name] = package
+    return importlib.import_module("inf_llm.attention.context_manager")
+
+
+def cpu_context(module, kv_heads, heads, width, block, initial, local, representatives, capacity):
+    # Bypass CUDA allocation in __init__, retain all actual append_global,
+    # MemoryUnit, get_block_k, grouped-head expansion and VectorTensor code.
+    context = module.ContextManager.__new__(module.ContextManager)
+    for name, value in dict(num_units=1, num_heads_kv=kv_heads, num_heads=heads,
+                            unit_size=heads, unit_size_kv=kv_heads, dim_head=width,
+                            block_size=block, n_init=initial, n_local=local,
+                            repr_topk=representatives, init_exc=False,
+                            num_global_block=0, _global_remainder_st=0,
+                            _global_remainder_ed=0, cuda_cache=None,
+                            pin_memory=False).items():
+        setattr(context, name, value)
+    context.global_remainder = tuple(torch.empty(1, kv_heads, 0, width, dtype=torch.float16) for _ in range(2))
+    context.global_remainder_local_score = torch.empty(1, heads, 0, dtype=torch.float16)
+    context.init_k = torch.empty(1, kv_heads, 0, width, dtype=torch.float16)
+    context.init_v = torch.empty_like(context.init_k)
+    context.global_blocks = [[]]
+    bank = module.VectorTensor.__new__(module.VectorTensor)
+    bank.hidden_size = heads * width
+    bank.length = 0
+    bank.cache_size = capacity
+    bank.data = torch.empty(capacity, bank.hidden_size, dtype=torch.float16)
+    context.block_k = [bank]
+    return context
+
+
+def write_fixture(output, module):
+    cases = [
+        # KV heads, query heads, D, block, init, local, total budget, capacity, chunks
+        (1, 2, 8, 32, 32, 96, 256, 1024, [128] * 6 + [1] * 32),
+        (4, 28, 8, 32, 32, 480, 1024, 2048, [512] * 3 + [1] * 32),
+        (2, 4, 8, 256, 3, 257, 1024, 2048, [512] * 3 + [1] * 32),
+        (1, 3, 8, 7, 3, 11, 64, 256, [19, 23, 31] + [1] * 16),
+    ]
+    summary = []
+    output.parent.mkdir(parents=True, exist_ok=True)
+    with output.open("wb") as file:
+        file.write(b"IFLMREF1")
+        file.write(struct.pack("<I", len(cases)))
+        for kv_heads, heads, width, block, initial, local, total, capacity, chunks in cases:
+            representatives = 4
+            context = cpu_context(module, kv_heads, heads, width, block, initial, local, representatives, capacity)
+            file.write(struct.pack("<10I", kv_heads, heads, width, block, initial, local,
+                                   total, capacity, representatives, len(chunks)))
+            first = 0
+            for frame, count in enumerate(chunks):
+                end = first + count
+                origin = max(0, first + 1 - local)
+                p = torch.arange(first, end)[:, None, None, None]
+                h = torch.arange(kv_heads)[None, :, None, None]
+                component = torch.arange(2)[None, None, :, None]
+                d = torch.arange(width)[None, None, None, :]
+                kv = (((p * 11 + h * 7 + component * 5 + d * 3) % 127 - 63) / 32).half()
+                scores = ((torch.arange(origin, end)[:, None] * 13 + torch.arange(heads)[None, :] * 7 + frame * 3) % 97 + 1).float() / 256
+                # Deliberately exercise rounding at both the chunk conversion
+                # and accumulation boundaries, including values below one ULP.
+                scores += (frame % 3) * 0.000013
+                keys = kv[:, :, 0].permute(1, 0, 2).unsqueeze(0).contiguous()
+                values = kv[:, :, 1].permute(1, 0, 2).unsqueeze(0).contiguous()
+                context.global_remainder = tuple(torch.cat((old, new), dim=-2)
+                                                 for old, new in zip(context.global_remainder, (keys, values)))
+                context.global_remainder_local_score = torch.cat((context.global_remainder_local_score,
+                    torch.zeros(1, heads, count, dtype=torch.float16)), dim=-1)
+                upstream_origin = max(0, first - local)
+                local_score = torch.zeros(1, heads, end - upstream_origin, dtype=torch.float16)
+                local_score[:, :, origin - upstream_origin:] = scores.T.half()
+                before = context.num_global_block
+                context.append_global(count, end - upstream_origin, local_score)
+                file.write(struct.pack("<QI", first, count))
+                file.write(kv.numpy().tobytes())
+                file.write(scores.contiguous().numpy().tobytes())
+                file.write(struct.pack("<I", context.num_global_block - before))
+                for block_id in range(before, context.num_global_block):
+                    start = initial + block_id * block
+                    block_scores = context.global_remainder_local_score[0, :, start:start + block]
+                    picked = block_scores.topk(representatives, dim=-1).indices + start
+                    mean = context.block_k[0].get_data()[block_id]
+                    # get_block_k is executed once more independently of the
+                    # stored bank to catch any fixture layout mistake.
+                    direct = context.get_block_k(context.global_remainder[0][:, :, start:start + block],
+                        block_scores.unsqueeze(0)).mean(dim=-2).reshape(-1)
+                    assert torch.equal(mean, direct)
+                    file.write(struct.pack("<Q", block_id))
+                    file.write(block_scores.contiguous().numpy().tobytes())
+                    file.write(picked.to(torch.int64).contiguous().numpy().tobytes())
+                    file.write(mean.contiguous().numpy().tobytes())
+                first = end
+            summary.append(dict(kv_heads=kv_heads, query_heads=heads, block_tokens=block,
+                                frames=len(chunks), tokens=first, published_blocks=context.num_global_block))
+    return summary
+
+
+def main():
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("output", type=Path)
+    args = parser.parse_args()
+    root = Path(__file__).resolve().parents[1]
+    module = upstream(root / "third_party/infllm")
+    summary = write_fixture(args.output, module)
+    print(json.dumps(dict(upstream_commit="12b70798f56e56ebb23c53c7018091a3f540a028",
+                          torch=torch.__version__, device="cpu", cases=summary), indent=2))
+
+
+if __name__ == "__main__":
+    main()

@@ -12,6 +12,11 @@ namespace {
 void finite_query(const std::vector<float> & query) {
     for (float value : query) if (!std::isfinite(value)) throw std::invalid_argument("non-finite query");
 }
+// InfLLM's local_score and global_remainder_local_score use the FP16 K
+// dtype: round each chunk's score first, then round the in-place sum.
+double accumulate_infllm_score(double previous, float chunk) {
+    return from_half(to_half(static_cast<float>(previous) + from_half(to_half(chunk))));
+}
 }
 void SparseBudget::validate(const KvGeometry & geometry) const {
     if (total == 0 || total > geometry.capacity_tokens || local == 0 || static_cast<std::uint64_t>(initial) + local > total ||
@@ -154,7 +159,7 @@ void RepresentativeIndex::observe_probabilities(std::uint32_t layer, std::uint64
     for (auto & token : pending_[layer]) {
         if (token.position < first) continue;
         for (std::uint32_t head = 0; head < query_heads_; ++head) {
-            token.scores[head] += probabilities[head * count + token.position - first];
+            token.scores[head] = accumulate_infllm_score(token.scores[head], probabilities[head * count + token.position - first]);
         }
     }
     finalize_before(layer, first, 1);
@@ -199,7 +204,7 @@ void RepresentativeIndex::observe_prefill_scores(std::uint32_t layer, std::uint6
     for (auto & token : pending_[layer]) {
         if (token.position < origin) continue;
         for (std::uint32_t head = 0; head < query_heads_; ++head) {
-            token.scores[head] += key_scores[(token.position - origin) * query_heads_ + head];
+            token.scores[head] = accumulate_infllm_score(token.scores[head], key_scores[(token.position - origin) * query_heads_ + head]);
         }
     }
     finalize_before(layer, end - std::min<std::uint64_t>(end, budget_.local), 1);
