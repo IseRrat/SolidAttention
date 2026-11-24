@@ -180,6 +180,7 @@ void bounded_prefill_chunk() {
     const auto positions = solid::select_prefill_context(g, budget, index, 0, 16, 3, {1});
     require(positions.positions == std::vector<std::uint64_t>{0, 1, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18} &&
             positions.local_only_from == 8, "prefill plan separates fixed history from sliding local rows");
+    rejects([&] { (void) solid::select_prefill_context(g, budget, index, 0, 16, 6, {1}); });
 }
 void long_prefill_chunk() {
     const solid::KvGeometry g{1, 1, 2, 32, 1024, 64};
@@ -194,11 +195,13 @@ void long_prefill_chunk() {
         if (first == 512) {
             // Keep initial tokens, the first selected block, the chunk-entry
             // remainder, and only the final query's own recent window.
-            require(std::abs(output[1022] - 34736.f / 97.f) < 1e-3f,
-                    "512-token group reranked its history or kept expired local positions");
+            require(std::abs(output[1022] - 35216.f / 97.f) < 1e-3f,
+                    "Prefill did not refresh its selection at the local-window group boundary");
         }
     }
     require(session.stats().selected_tokens <= 1024 * budget.total, "chunk exceeded the per-query budget");
+    require(session.stats().infllm_prefill_group_token_limit == 32 && session.stats().infllm_prefill_groups == 32 &&
+            session.stats().infllm_prefill_rank_groups == 28, "Prefill retrieval cadence differs from its local-window group size");
 }
 void prefill_budget_boundary() {
     const solid::KvGeometry g{1, 1, 2, 4, 40, 64};
@@ -218,9 +221,9 @@ void prefill_representative_scores() {
     const solid::KvGeometry geometry{1, 1, 2, 4, 24, 64};
     const solid::SparseBudget budget{12, 1, 4, 2, true, true};
     solid::RepresentativeIndex scalar(geometry, 2, budget), batched(geometry, 2, budget);
-    for (std::uint64_t first : {0, 6, 12}) {
+    for (std::uint64_t first : {0, 3, 6, 9, 12, 15}) {
         const auto origin = first + 1 - std::min<std::uint64_t>(first + 1, budget.local);
-        const auto end = first + 6;
+        const auto end = first + 3;
         std::vector<float> scores((end - origin) * 2);
         std::vector<solid::Half> rows;
         for (auto position = first; position < end; ++position) {
@@ -236,7 +239,7 @@ void prefill_representative_scores() {
             }
             scalar.observe_probabilities(0, position, probabilities);
         }
-        batched.observe_prefill_scores(0, first, 6, rows, scores);
+        batched.observe_prefill_scores(0, first, 3, rows, scores);
         for (std::uint64_t block = 0; block < geometry.blocks_per_head(); ++block) {
             require(scalar.ready(0, block) == batched.ready(0, block), "chunk published wrong representative blocks");
             if (scalar.ready(0, block)) for (int head = 0; head < 2; ++head) {

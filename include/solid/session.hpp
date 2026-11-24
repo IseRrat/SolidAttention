@@ -32,6 +32,8 @@ struct SessionStats {
     std::uint64_t sparse_prefetch_layers = 0, sparse_prefetch_wait_ns = 0;
     std::uint64_t direct_decode_queries = 0, decode_kv_download_bytes = 0;
     std::uint64_t direct_prefill_queries = 0, prefill_kv_download_bytes = 0;
+    std::uint32_t infllm_prefill_group_token_limit = 0;
+    std::uint64_t infllm_prefill_groups = 0, infllm_prefill_rank_groups = 0;
     std::uint64_t prefill_graph_device_bytes = 0, prefill_graph_device_peak_bytes = 0;
     PrefetchStats prefetch;
 };

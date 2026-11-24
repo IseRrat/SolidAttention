@@ -139,8 +139,9 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
     }
     const auto qwidth = static_cast<std::size_t>(query_heads_) * g.dimension;
     const auto kwidth = static_cast<std::size_t>(g.heads) * g.dimension;
-    const auto capacity = prefill_ ? std::min(infllm_prefill_chunk_tokens, prefill_->query_capacity())
-                                   : infllm_prefill_chunk_tokens;
+    const auto capacity = prefill_ ? std::min(budget_.prefill_group_tokens(), prefill_->query_capacity())
+                                   : budget_.prefill_group_tokens();
+    stats_.infllm_prefill_group_token_limit = capacity;
     std::vector<float> output(archived ? 0 : tokens * qwidth), mean(archived ? 0 : qwidth), q(prefill_ ? 0 : qwidth), probabilities, batch;
     std::vector<Half> row(2 * kwidth), key_row(prefill_ ? 0 : kwidth), current, planes;
     try {
@@ -246,6 +247,8 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
                                     device.attention.capacity() + device.key_scores.capacity()) * sizeof(float) +
                 (row.capacity() + key_row.capacity() + current.capacity() + planes.capacity()) * sizeof(Half);
             stats_.workspace_peak_bytes = std::max<std::uint64_t>(stats_.workspace_peak_bytes, workspace);
+            ++stats_.infllm_prefill_groups;
+            if (position >= budget_.total) ++stats_.infllm_prefill_rank_groups;
             start += count;
         }
     } catch (...) {

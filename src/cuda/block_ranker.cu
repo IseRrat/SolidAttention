@@ -424,13 +424,14 @@ public:
         probability_initial_ = initial;
         probability_local_ = local;
         probability_top_ = representatives;
-        probability_capacity_ = local + 512 + geometry_.block_tokens;
+        const auto group_tokens = std::min(512u, local);
+        probability_capacity_ = local + group_tokens + geometry_.block_tokens;
         probability_states_.resize(geometry_.layers);
         probability_lengths_.resize(geometry_.layers);
         probability_matured_.assign(geometry_.layers, initial);
         DeviceScope scope(device_);
         const auto before = stats_.device_bytes;
-        const auto blocks = (512 + geometry_.block_tokens - 1) / geometry_.block_tokens + 1;
+        const auto blocks = (group_tokens + geometry_.block_tokens - 1) / geometry_.block_tokens + 1;
         try {
             allocate(built_positions_, product(product(blocks, geometry_.heads), representatives * sizeof(std::uint64_t)));
             allocate(built_scores_, product(product(blocks, geometry_.heads), representatives * sizeof(double)));
@@ -468,7 +469,7 @@ public:
     std::vector<BuiltRepresentatives> probability_update_impl(ProbabilityFrame frame, void * compute_stream) {
         check();
         if (probability_pending_) throw std::logic_error("previous probability receipt must be collected");
-        if (!probability_local_ || frame.layer >= geometry_.layers || !frame.count || frame.count > 512 ||
+        if (!probability_local_ || frame.layer >= geometry_.layers || !frame.count || frame.count > std::min(512u, probability_local_) ||
             probability_lengths_.at(frame.layer) != frame.first || frame.first >= geometry_.capacity_tokens ||
             frame.count > geometry_.capacity_tokens - frame.first) throw std::invalid_argument("CUDA probability frame");
         const auto end = frame.first + frame.count;

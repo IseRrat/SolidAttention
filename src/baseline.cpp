@@ -517,6 +517,8 @@ int main(int argc, char ** argv) {
                     (budget.infllm_attention ? stats.prefill_backend : "cpu_streaming_reference")},
                 {"prefill_backend",stats.prefill_backend},{"prefill_backend_requested",config.attention.prefill_backend},
                 {"prefill_query_capacity",stats.prefill.query_capacity},{"prefill_tile_capacity",stats.prefill.tile_capacity},
+                {"prefill_group_token_limit",stats.infllm_prefill_group_token_limit},
+                {"prefill_groups",stats.infllm_prefill_groups},{"prefill_rank_groups",stats.infllm_prefill_rank_groups},
                 {"io_mode", config.attention.direct_decode_reads ? "direct_decode_reads" : "buffered"},
                 {"attention_queries", stats.attention_queries}, {"selected_tokens", stats.selected_tokens},
                 {"workspace_tracked_peak_bytes", stats.workspace_peak_bytes}, {"kv_buffer_bytes", stats.kv_resident_bytes},

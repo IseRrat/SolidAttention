@@ -550,7 +550,7 @@ public:
         checked(cudaGetLastError(), "merge prefill value tiles");
     }
     DeviceQuery mean_sparse_query(DeviceQuery query, std::uint32_t count) override {
-        if (!supports_sparse() || open_ || count > queries_) throw std::invalid_argument("sparse prefill mean frame");
+        if (!supports_sparse() || open_ || count > queries_ || count > std::min(512u, sparse_local_)) throw std::invalid_argument("sparse prefill mean frame");
         validate_device_query(query, DeviceMemory::cuda, qh_, g_.dimension, count);
         validate_pointer(query.data);
         DeviceScope scope(device_);
@@ -570,6 +570,7 @@ public:
         const auto tokens = frame.positions.size();
         const auto kv_elements = product(product(tokens, g_.heads), 2 * g_.dimension);
         if (!supports_sparse() || open_ || frame.local != sparse_local_ || !frame.queries || frame.queries > queries_ ||
+            frame.queries > std::min(512u, frame.local) ||
             frame.first_query > g_.capacity_tokens - frame.queries || !tokens || tokens > tile_ ||
             frame.query.size() != (direct ? 0 : elements) || frame.kv.size() != kv_elements ||
             !std::isfinite(frame.scale) || frame.scale <= 0 ||

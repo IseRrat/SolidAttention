@@ -25,6 +25,9 @@ void SparseBudget::validate(const KvGeometry & geometry) const {
         throw std::invalid_argument("invalid sparse token budget or representative count");
     }
 }
+std::uint32_t SparseBudget::prefill_group_tokens() const {
+    return std::min(infllm_prefill_chunk_tokens, local);
+}
 void RelativeRope::rotate(float * row, std::uint32_t position) const {
     const auto half = dimensions / 2;
     const auto step = std::pow(base, -2.f / dimensions);
@@ -188,7 +191,7 @@ void RepresentativeIndex::append_keys(std::uint32_t layer, std::uint64_t positio
 void RepresentativeIndex::observe_prefill_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
                                                 const std::vector<Half> & kv, const std::vector<float> & key_scores) {
     const auto width = static_cast<std::size_t>(kv_heads_) * geometry_.dimension;
-    if (!budget_.infllm_attention || !count || first != lengths_.at(layer) ||
+    if (!budget_.infllm_attention || !count || count > budget_.prefill_group_tokens() || first != lengths_.at(layer) ||
         probability_lengths_[layer] != first || query_pending_[layer] ||
         first >= geometry_.capacity_tokens || count > geometry_.capacity_tokens - first ||
         kv.size() != count * 2 * width) {
@@ -442,7 +445,7 @@ void RepresentativeIndex::accept_probability_blocks(std::uint32_t layer, const s
 void RepresentativeIndex::observe_prefill_device_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
     DeviceKvBatch kv, DeviceQuery scores) {
     const auto memory = rank_memory();
-    if (!device_probabilities_ || !memory || !count || first != lengths_.at(layer) || query_pending_[layer] ||
+    if (!device_probabilities_ || !memory || !count || count > budget_.prefill_group_tokens() || first != lengths_.at(layer) || query_pending_[layer] ||
         probability_lengths_[layer] != first || first >= geometry_.capacity_tokens || count > geometry_.capacity_tokens - first) {
         throw std::invalid_argument("device prefill representative frame");
     }
@@ -697,7 +700,7 @@ PrefillContext select_prefill_context_impl(const KvGeometry & g, const SparseBud
     const Query & mean_query) {
     budget.validate(g);
     if (!budget.infllm_attention || !count || first >= g.capacity_tokens || count > g.capacity_tokens - first ||
-        count > infllm_prefill_chunk_tokens) throw std::invalid_argument("InfLLM prefill range");
+        count > budget.prefill_group_tokens()) throw std::invalid_argument("InfLLM prefill range");
     const auto end = first + count;
     if (first < budget.total && end > budget.total) {
         throw std::invalid_argument("InfLLM prefill chunk crosses the sparse budget boundary");

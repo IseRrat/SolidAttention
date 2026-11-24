@@ -51,10 +51,11 @@ def cpu_context(module, kv_heads, heads, width, block, initial, local, represent
 def write_fixture(output, module):
     cases = [
         # KV heads, query heads, D, block, init, local, total budget, capacity, chunks
-        (1, 2, 32, 32, 32, 96, 256, 1024, [128] * 6 + [1] * 32),
-        (4, 28, 32, 32, 32, 480, 1024, 2048, [512] * 3 + [1] * 32),
-        (2, 4, 32, 256, 3, 257, 1024, 2048, [512] * 3 + [1] * 32),
-        (1, 3, 32, 7, 3, 11, 64, 256, [19, 23, 31] + [1] * 16),
+        (1, 2, 32, 32, 32, 96, 256, 1024, [96] * 8 + [1] * 32),
+        (4, 28, 32, 32, 32, 480, 1024, 2048, [480] * 3 + [96] + [1] * 32),
+        (2, 4, 32, 256, 3, 257, 1024, 2048, [257] * 5 + [251] + [1] * 32),
+        (1, 3, 32, 7, 3, 11, 64, 256, [11] * 6 + [7] + [1] * 16),
+        (1, 2, 32, 32, 32, 512, 2048, 4096, [512] * 3 + [1] * 32),
     ]
     summary = []
     output.parent.mkdir(parents=True, exist_ok=True)
@@ -69,6 +70,7 @@ def write_fixture(output, module):
             first = 0
             unique_blocks = []
             for frame, count in enumerate(chunks):
+                assert count <= min(512, local)
                 end = first + count
                 origin = max(0, first + 1 - local)
                 p = torch.arange(first, end)[:, None, None, None]
@@ -124,7 +126,9 @@ def write_rankings(file, module, context, blocks, heads, width, capacity):
     # Exclude blocks with a tied representative boundary: torch.topk permits
     # a different legal representative subset, hence a different mean vector.
     # Every retained candidate has exactly the same bank in both runtimes.
-    assert blocks
+    if not blocks:
+        file.write(struct.pack("<I", 0))
+        return 0
     bank = context.block_k[0].get_data()[blocks].contiguous()
     retrieval = module.ContextManager.__new__(module.ContextManager)
     retrieval.num_units, retrieval.unit_size, retrieval.dim_head = 1, heads, width
@@ -134,7 +138,8 @@ def write_rankings(file, module, context, blocks, heads, width, capacity):
     vectors = module.VectorTensor.__new__(module.VectorTensor)
     vectors.data, vectors.length, vectors.hidden_size = bank, len(blocks), heads * width
     retrieval.block_k = [vectors]
-    counts = (1, 37, min(512, capacity))
+    limit = min(512, context.n_local, capacity)
+    counts = tuple(dict.fromkeys((1, min(37, limit), limit)))
     file.write(struct.pack("<I", len(counts)))
     for query_case, count in enumerate(counts):
         raw = ((torch.arange(count * heads * width).reshape(count, heads, width) * 19 + query_case * 7) % 211 - 105).float() / 73

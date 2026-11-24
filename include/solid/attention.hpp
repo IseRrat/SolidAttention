@@ -15,6 +15,7 @@ struct SparseBudget {
     bool shared_heads = false;
     bool infllm_attention = false;
     void validate(const KvGeometry & geometry) const;
+    std::uint32_t prefill_group_tokens() const;
     std::uint32_t cache_slots(const KvGeometry & geometry) const;
     std::uint64_t complete_history_blocks(const KvGeometry & geometry, std::uint64_t position) const;
     std::uint64_t recent_start(const KvGeometry & geometry, std::uint64_t position) const;

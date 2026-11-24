@@ -68,13 +68,13 @@
 
    两条稀疏路径的 K/V 在矩阵乘法中使用 FP16，累加精度设为 FP32。近期槽位索引按 query head 和时间顺序生成，设备上的 GET_ROWS 从概率表中只取近期分数。CPU 回执接收近期分数和一个 attention 完成标量，确认本层归档后更新代表索引。attention 输出通过带回执依赖的原地设备节点直接交给后续层。CPU、CUDA、SYCL 均实现该节点，数值回归覆盖解码图复用、近期索引和原生完成通知。
 
-   CUDA 选块器启用设备概率累计时，近期分数和当前 FP16 Key 直接交给 GPU 的环形缓冲。每个 query head 独立累加分数，整块退出近期窗口时在 GPU 生成均值代表。CPU 接收新完成块的代表位置、分数和状态。Prefill 的按 key 汇总分数与 Decode 的单 token 分数接入同一条更新路径。回归用例覆盖 128-token 输入组、逐 token 解码和环形缓冲周转；CPU 参考按同样的 Prefill 分组、Decode 单步边界累计 FP16 分数。[attention.cpp](../src/attention.cpp)、[attention.hpp](../include/solid/attention.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[session.cpp](../src/session.cpp)、[session.hpp](../include/solid/session.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
+   CUDA 选块器启用设备概率累计时，近期分数和当前 FP16 Key 直接交给 GPU 的环形缓冲。每个 query head 独立累加分数，整块退出近期窗口时在 GPU 生成均值代表。CPU 接收新完成块的代表位置、分数和状态。Prefill 的按 key 汇总分数与 Decode 的单 token 分数接入同一条更新路径。回归用例覆盖 96-token 输入组、逐 token 解码和环形缓冲周转；CPU 参考按同样的 Prefill 分组、Decode 单步边界累计 FP16 分数。[attention.cpp](../src/attention.cpp)、[attention.hpp](../include/solid/attention.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[session.cpp](../src/session.cpp)、[session.hpp](../include/solid/session.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
 
    稀疏基线用设备 Q 直接评分，仅把所选块编号交给主机安排 SSD 读取。历史行直接读入与设备 bank 对应的页锁定主机位置。相邻目标行合并上传，每批上传共享一次完成等待，源缓冲在完成后复用。纯 Offload 的整层上传也使用页锁定缓冲。 [llama_adapter.cpp](../src/llama_adapter.cpp)、[dense_offload.cpp](../src/dense_offload.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
 
    近期位置表按 KV head 扫描一次，组内 Query head 复用这份位置映射，各自加上概率表的 head 偏移。CUDA Top-K 按候选块的最小有效 token 数计算结果个数上界，限制输出清零及回传的范围，兼容完整块、部分块和不同 token 成本。设备评分回归使用完整块和不同成本的候选，与 CPU 全量排序结果核对。 [llama_adapter.cpp](../src/llama_adapter.cpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[cuda_ranker_test.cpp](../tests/cuda_ranker_test.cpp)。
 
-   GPU 代表更新按本步 Key 和分数元素数确定线程块数量。单 token Decode 只派发所需的线程块，512-token Prefill 保留网格步进处理。设备分数模式仅返回设备指针和元素数，省去同尺寸的 CPU 分数向量分配及清零。稀疏基线收到 attention 完成回执后先提交下一层 SSD 固定窗口读取，再更新本层代表分数。下一层读取和本层代表更新使用独立的数据。 [block_ranker.cu](../src/cuda/block_ranker.cu)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
+   GPU 代表更新按本步 Key 和分数元素数确定线程块数量。单 token Decode 只派发所需的线程块，多 token Prefill 保留网格步进处理。设备分数模式仅返回设备指针和元素数，省去同尺寸的 CPU 分数向量分配及清零。稀疏基线收到 attention 完成回执后先提交下一层 SSD 固定窗口读取，再更新本层代表分数。下一层读取和本层代表更新使用独立的数据。 [block_ranker.cu](../src/cuda/block_ranker.cu)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
 
    设备概率回执的就绪节点同时依赖 attention 输出和当前设备 KV，保证 CPU 使用设备指针前两者已完成。输出依赖节点持有设备 KV 和近期分数，覆盖代表更新的输入捕获过程。近期分数直接作为就绪节点输入，省去额外的连续副本。 [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
 
@@ -84,11 +84,11 @@
 
 6. **原版 InfLLM 代表构造对照**
 
-   `third_party/infllm` 保存 thunlp/InfLLM 提交 `12b70798f56e56ebb23c53c7018091a3f540a028` 的原始 Python 包及 MIT 许可证，`ORIGIN` 记录提交、来源和源码归档 SHA256。`infllm_reference_fixture.py` 直接调用这份源码的 `append_global`、`get_block_k`、GQA 展开及 `VectorTensor` 写入，生成 CPU 张量参考数据；初始化时只将存储放到 CPU，保留原函数。参考包含 32-token 检索块、28 个 query heads 对 4 个 KV heads、512-token Prefill、逐 token Decode、环形缓冲周转、未对齐 init 及 7/256-token 兼容块。
+   `third_party/infllm` 保存 thunlp/InfLLM 提交 `12b70798f56e56ebb23c53c7018091a3f540a028` 的原始 Python 包及 MIT 许可证，`ORIGIN` 记录提交、来源和源码归档 SHA256。`infllm_reference_fixture.py` 直接调用这份源码的 `append_global`、`get_block_k`、GQA 展开及 `VectorTensor` 写入，生成 CPU 张量参考数据；初始化时只将存储放到 CPU，保留原函数。参考包含 32-token 检索块、28 个 query heads 对 4 个 KV heads、96/480/512-token Prefill、逐 token Decode、环形缓冲周转、未对齐 init 及 7/256-token 兼容块。每批输入均检查原版“组长不超过近期窗口”的前提。
 
    `infllm_reference_cases.hpp` 读取原版输出，逐批核对完整块发布边界、代表 Top-K 得分集合、选中的原始 Key 和 FP16 均值。分数唯一时核对原版代表集合；Top-K 边界同分时核对最优得分集合及实际所选 Key 的均值。随后直接调用原版 `calc_block_topk` 和 `VectorTensor.get_topk`，分别用 1、37 和最多 512 个 Q 生成检索参考。检索候选使用代表边界无歧义的完整块，确保移植版与原版拥有相同的代表 bank，再核对 Q 均值的 FP16 数值、GQA 返回列表和 Top-K 最优得分集合。
 
-   `infllm_reference_test.cpp` 接入 CPU 索引及均值函数，`cuda_prefill_test.cpp` 接入真实 CUDA 代表 bank、检索内核和 Prefill Q 均值内核。`CMakeLists.txt` 添加独立的 CPU 对照程序。已通过 CPU 对照的 4 组、127 批、69 个完整块及 12 组检索，以及服务器 54 项 CPU 回归和 66 项 Python 检查；CUDA 代表构造、评分选块和对照程序已完成编译。
+   `infllm_reference_test.cpp` 接入 CPU 索引及均值函数，`cuda_prefill_test.cpp` 接入真实 CUDA 代表 bank、检索内核和 Prefill Q 均值内核。`CMakeLists.txt` 添加独立的 CPU 对照程序。已通过 CPU 对照的 5 组、172 批、101 个完整块及 11 组检索，以及服务器 54 项 CPU 回归；CUDA 代表构造、评分选块和对照程序已完成编译。同分代表的构造样例单独核对合法集合；检索比较使用拥有相同代表 bank 的样例。
 
    [原版源码及许可](../third_party/infllm/)、[来源记录](../third_party/infllm/ORIGIN)、[infllm_reference_fixture.py](../scripts/infllm_reference_fixture.py)、[infllm_reference_cases.hpp](../tests/infllm_reference_cases.hpp)、[infllm_reference_test.cpp](../tests/infllm_reference_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)、[CMakeLists.txt](../CMakeLists.txt)。
 
@@ -224,7 +224,9 @@
 
    密集路径按一段历史行读入有界 tile，分离布局分别读 K、V，交织布局中相邻且无填充的物理行一次读取。当前批直接使用设备侧 K/V。CUDA 大批次使用 cuBLAS 批量矩阵乘法及跨 tile FP32 在线 softmax，纯卸载配置采用 512 token 微批和 1024 token 历史 tile。
 
-   Offload＋Sparse 和 SolidAttention 共用 InfLLM 稀疏预填充。每组最多 512 个输入 token，超出 25%／1K 预算后按组内 Q 的均值检索一次 32-token 历史 KV 块。预算内的起始前缀使用全量因果 attention。每组读取并上传一次历史工作集，组内各 token 共用初始位置和检索结果，各自应用因果掩码和滑动近期窗口。CUDA softmax 屏蔽已滑出窗口的临时位置，每个 token 可见的 KV 数按总预算限制。 [attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[ranker_test.cpp](../tests/ranker_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
+   Offload＋Sparse 和 SolidAttention 共用 InfLLM 稀疏预填充。每组长度上限取 `min(512, local)`，同时受模型微批剩余长度和 attention 工作区容量限制；跨越稀疏预算边界时先结束当前组。默认 1K/2K/至少 4K 输入分别采用 96/224/480-token 上限，25%／1K 总预算及 32-token 检索块沿用既定配置。超出预算后按组内 Q 的均值检索一次历史 KV 块。预算内的起始前缀使用全量因果 attention。每组读取并上传一次历史工作集，组内各 token 共用初始位置和检索结果，各自应用因果掩码和滑动近期窗口。CUDA softmax 屏蔽已滑出窗口的临时位置，每个 token 可见的 KV 数按总预算限制。 [attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[ranker_test.cpp](../tests/ranker_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
+
+   CUDA attention、Q 均值、CPU 参考及设备代表更新入口均检查组长约束。设备环形缓冲按 `local + 分组上限 + block_tokens` 分配，代表回执工作区按分组上限估算本次最多完成的块数。`llama_adapter.cpp` 用相同上限创建 CUDA attention 工作区。`session.hpp`、`session.cpp` 记录实际组长上限、总组数和进入稀疏阶段的组数；`baseline.cpp` 将其写入 `prefill_group_token_limit`、`prefill_groups`、`prefill_rank_groups`。CPU 回归用均匀 attention 独立核对分组边界变化后的输出及检索组数。
 
    cuBLAS 分别对可能参与历史 attention 的行和近期窗口的行计算 QK，CUDA 依据每个 token 的因果和窗口位置做联合 softmax 与 V 累积。GPU 上按 key 和 query head 汇总本组近期分数。设备代表模式在 GPU 环形缓冲中追加 Key、累加分数并生成代表，CPU 记录追加位置和已发布块的元数据。CPU 代表模式接收近期分数并累加，发布离开近期窗口的代表块。
 

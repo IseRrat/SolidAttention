@@ -122,7 +122,7 @@ void probability_representatives(int device) {
     cuda_check(cudaStreamCreateWithFlags(&queue, cudaStreamNonBlocking));
     std::unique_ptr<std::remove_pointer_t<cudaStream_t>, decltype(&cudaStreamDestroy)> compute(queue, cudaStreamDestroy);
     for (std::uint64_t first = 0; first < 800;) {
-        const std::uint32_t count = first < 768 ? 128 : 1;
+        const std::uint32_t count = first < 768 ? 96 : 1;
         const auto end = first + count;
         const auto origin = first + 1 - std::min<std::uint64_t>(first + 1, budget.local);
         std::vector<solid::Half> kv(count * 128);
@@ -195,7 +195,7 @@ int main(int argc,char ** argv) {
         std::unique_ptr<solid::TiledPrefill> fixture_mean;
         if (argc == 4) test_infllm::run(argv[3], [&](auto & index, auto geometry, auto heads, auto budget) {
             const auto kv_heads = geometry.heads;
-            fixture_mean = solid::make_cuda_tiled_prefill(geometry, heads, std::min(512u, geometry.capacity_tokens),
+            fixture_mean = solid::make_cuda_tiled_prefill(geometry, heads, budget.prefill_group_tokens(),
                 geometry.capacity_tokens, device, budget.local);
             geometry.heads = heads;
             auto ranker = solid::make_cuda_block_ranker(geometry, heads, 1, budget.total, device, 0, kv_heads);

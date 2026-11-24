@@ -1071,7 +1071,7 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
             for (std::size_t ordinal=0;ordinal<ggml_backend_reg_dev_count(registry);++ordinal) {
                 if (ggml_backend_reg_dev_get(registry,ordinal)!=ggml_backend_get_device(backend)) continue;
                 const auto budget = impl_->session->budget();
-                const auto queries = budget.infllm_attention ? std::min(impl_->prefill_queries, infllm_prefill_chunk_tokens)
+                const auto queries = budget.infllm_attention ? std::min(impl_->prefill_queries, budget.prefill_group_tokens())
                                                              : impl_->prefill_queries;
                 const auto sparse_tile = std::min<std::uint64_t>(impl_->session->geometry().capacity_tokens,
                     static_cast<std::uint64_t>(budget.total) + queries - 1);
