@@ -803,14 +803,19 @@ public:
     }
     std::vector<std::vector<std::uint64_t>> rank_device(std::uint32_t layer, DeviceQuery query,
                                                        const BlockCandidates & candidates) override {
+        return rank_device_after_event(layer, {query, nullptr}, candidates);
+    }
+    std::vector<std::vector<std::uint64_t>> rank_device_after_event(std::uint32_t layer, DeviceQueryWithEvent input,
+                                                                  const BlockCandidates & candidates) override {
+        const auto query = input.query;
         validate_device_query(query, DeviceMemory::cuda, query_heads_, geometry_.dimension);
         validate_pointer(query.data);
-        auto result = rank_impl(layer, query.data, candidates, true);
+        auto result = rank_impl(layer, query.data, candidates, true, input.cuda_ready_event);
         ++stats_.device_rank_queries;
         return result;
     }
     std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const float * query,
-                                                    const BlockCandidates & candidates, bool device) {
+                                                    const BlockCandidates & candidates, bool device, void * cuda_ready_event = nullptr) {
         check();
         if (probability_pending_) throw std::logic_error("block ranking requires its preceding probability receipt");
         if (deferred_query_ && (!device || *deferred_query_!=layer)) throw std::logic_error("ranking does not match deferred representative query");
@@ -829,6 +834,10 @@ public:
             if (device) {
                 DeviceScope scope(device_);
                 try {
+                    if (cuda_ready_event) {
+                        checked(cudaStreamWaitEvent(stream_, static_cast<cudaEvent_t>(cuda_ready_event), 0), "order empty ranking after query mean");
+                        ++stats_.query_ready_event_waits;
+                    }
                     checked(cudaMemsetAsync(error_device_,0,sizeof(int),stream_),"clear empty rank status");
                     const auto count=product(query_heads_,geometry_.dimension);
                     const auto grid=static_cast<unsigned>(std::min<std::size_t>((count+255)/256,65535));
@@ -849,6 +858,10 @@ public:
         const auto bytes = product(product(lists, stride), sizeof(std::uint64_t));
         DeviceScope scope(device_);
         try {
+            if (cuda_ready_event) {
+                checked(cudaStreamWaitEvent(stream_, static_cast<cudaEvent_t>(cuda_ready_event), 0), "order ranking after query mean");
+                ++stats_.query_ready_event_waits;
+            }
             if (!device) {
                 const auto bytes = product(product(query_heads_, geometry_.dimension), sizeof(float));
                 checked(cudaMemcpyAsync(query_, query, bytes, cudaMemcpyHostToDevice, stream_), "upload rank query");

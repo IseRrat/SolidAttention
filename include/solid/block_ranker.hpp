@@ -30,6 +30,7 @@ struct RankerStats {
     std::uint64_t device_builder_batches = 0;
     std::uint64_t builder_rank_shared_waits = 0;
     std::uint64_t builder_compute_appends = 0;
+    std::uint64_t query_ready_event_waits = 0;
 };
 struct RepresentativeSeed {
     std::uint64_t length = 0;
@@ -96,6 +97,11 @@ public:
     virtual std::optional<DeviceMemory> direct_memory() const { return {}; }
     virtual std::vector<std::vector<std::uint64_t>> rank_device(std::uint32_t, DeviceQuery, const BlockCandidates &) {
         throw std::logic_error("direct device ranking is disabled");
+    }
+    virtual std::vector<std::vector<std::uint64_t>> rank_device_after_event(std::uint32_t layer, DeviceQueryWithEvent query,
+                                                                          const BlockCandidates & candidates) {
+        if (query.cuda_ready_event) throw std::logic_error("event-dependent device ranking is disabled");
+        return rank_device(layer, query.query, candidates);
     }
     virtual std::optional<BuiltRepresentatives> build_query_device(std::uint32_t, std::uint64_t, DeviceQuery) {
         throw std::logic_error("direct device representative query is disabled");

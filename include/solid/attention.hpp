@@ -68,6 +68,8 @@ public:
                                                        const BlockCandidates & candidates) const;
     std::vector<std::vector<std::uint64_t>> rank_blocks(std::uint32_t layer, DeviceQuery query,
                                                        const BlockCandidates & candidates) const;
+    std::vector<std::vector<std::uint64_t>> rank_blocks(std::uint32_t layer, DeviceQueryWithEvent query,
+                                                       const BlockCandidates & candidates) const;
 private:
     struct Representative { std::uint64_t position; double score; std::vector<Half> key; };
     struct Block { std::uint32_t finalized = 0; std::vector<Representative> tokens; };
@@ -94,7 +96,8 @@ private:
     std::size_t index(std::uint32_t layer, std::uint32_t head) const;
     double infllm_shared_score(std::uint32_t layer, std::uint64_t block, const std::vector<float> & query) const;
     std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const std::vector<float> * query,
-                                                     const DeviceQuery * device, const BlockCandidates & candidates) const;
+                                                     const DeviceQuery * device, const BlockCandidates & candidates,
+                                                     void * cuda_ready_event = nullptr) const;
 };
 
 struct HeadSelection {
@@ -119,6 +122,9 @@ PrefillContext select_prefill_context(const KvGeometry & geometry, const SparseB
 PrefillContext select_prefill_context(const KvGeometry & geometry, const SparseBudget & budget,
     const RepresentativeIndex & representatives, std::uint32_t layer, std::uint64_t first, std::uint32_t count,
     DeviceQuery mean_query);
+PrefillContext select_prefill_context(const KvGeometry & geometry, const SparseBudget & budget,
+    const RepresentativeIndex & representatives, std::uint32_t layer, std::uint64_t first, std::uint32_t count,
+    DeviceQueryWithEvent mean_query);
 
 // Q contains query-head-major vectors. K/V retain absolute positions and FP16 precision.
 std::vector<float> streamed_attention(KvStore & store, std::uint32_t layer, std::uint64_t position,

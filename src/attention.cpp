@@ -534,7 +534,8 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
     return rank_impl(layer, nullptr, &query, candidates);
 }
 std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
-    std::uint32_t layer, const std::vector<float> * query, const DeviceQuery * device, const BlockCandidates & candidates) const {
+    std::uint32_t layer, const std::vector<float> * query, const DeviceQuery * device, const BlockCandidates & candidates,
+    void * cuda_ready_event) const {
     if (layer >= geometry_.layers || candidates.blocks.size() != candidates.tokens.size() || candidates.remaining > budget_.total) {
         throw std::invalid_argument("block ranking shape or budget");
     }
@@ -552,7 +553,7 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
     if (candidates.shared_heads && available <= candidates.remaining) {
         return std::vector<std::vector<std::uint64_t>>(kv_heads_, candidates.blocks);
     }
-    if (device) result = ranker_->rank_device(layer, *device, candidates);
+    if (device) result = ranker_->rank_device_after_event(layer, {*device, cuda_ready_event}, candidates);
     else if (ranker_) result = ranker_->rank(layer, *query, candidates);
     else for (std::uint32_t head = 0; head < (candidates.shared_heads ? 1u : geometry_.heads); ++head) {
         std::vector<std::pair<double, std::uint64_t>> best;
@@ -592,6 +593,15 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
     }
     result.resize(kv_heads_);
     return result;
+}
+std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
+    std::uint32_t layer, DeviceQueryWithEvent query, const BlockCandidates & candidates) const {
+    const auto memory = rank_memory();
+    if (!memory || (query.cuda_ready_event && *memory != DeviceMemory::cuda)) {
+        throw std::logic_error("event-dependent query requires its CUDA ranker");
+    }
+    validate_device_query(query.query, *memory, query_heads_, geometry_.dimension);
+    return rank_impl(layer, nullptr, &query.query, candidates, query.cuda_ready_event);
 }
 double RepresentativeIndex::infllm_shared_score(std::uint32_t layer, std::uint64_t block, const std::vector<float> & query) const {
     // ContextManager.calc_block_topk flattens all query heads into one
@@ -750,6 +760,11 @@ PrefillContext select_prefill_context(const KvGeometry & g, const SparseBudget &
 PrefillContext select_prefill_context(const KvGeometry & g, const SparseBudget & budget,
     const RepresentativeIndex & representatives, std::uint32_t layer, std::uint64_t first, std::uint32_t count,
     DeviceQuery mean_query) {
+    return select_prefill_context_impl(g, budget, representatives, layer, first, count, mean_query);
+}
+PrefillContext select_prefill_context(const KvGeometry & g, const SparseBudget & budget,
+    const RepresentativeIndex & representatives, std::uint32_t layer, std::uint64_t first, std::uint32_t count,
+    DeviceQueryWithEvent mean_query) {
     return select_prefill_context_impl(g, budget, representatives, layer, first, count, mean_query);
 }
 std::vector<float> streamed_attention(KvStore & store, std::uint32_t layer, std::uint64_t position,

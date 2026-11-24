@@ -160,7 +160,7 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
             const auto selection_start = Clock::now();
             const auto context = [&] {
                 if (archived) {
-                    const auto mean_query = position >= budget_.total ? prefill_->mean_sparse_query(chunk_query, count) : DeviceQuery{};
+                    const auto mean_query = position >= budget_.total ? prefill_->mean_sparse_query_async(chunk_query, count) : DeviceQueryWithEvent{};
                     return select_prefill_context(g, budget_, *representatives_, layer, position, count, mean_query);
                 }
                 if (position >= budget_.total) {

@@ -80,6 +80,26 @@ void sparse_prefill(int device) {
         }
         for (auto & value : expected_mean) value = solid::from_half(solid::to_half(value / queries));
         test_tiled::close(host_mean, expected_mean, 1e-6f);
+
+        auto event_ranker = solid::make_cuda_block_ranker(geometry, query_heads, 1, 16, device);
+        std::vector<solid::Half> representatives(2 * heads * width);
+        for (std::size_t i = 0; i < representatives.size(); ++i) {
+            representatives[i] = solid::to_half((static_cast<int>(i % 13) - 6) / 8.f);
+        }
+        event_ranker->publish(0, 0, 2, representatives);
+        const solid::BlockCandidates request{{0, 1}, {4, 4}, 4, true};
+        const auto expected_ranking = event_ranker->rank_device(0, mean, request);
+        const auto prior_waits = backend->stats().retrieval_mean_host_waits;
+        const auto queued = backend->mean_sparse_query_async(query, queries);
+        const auto queued_ranking = event_ranker->rank_device_after_event(0, queued, request);
+        test_tiled::require(queued_ranking == expected_ranking && event_ranker->stats().query_ready_event_waits == 1 &&
+            backend->stats().retrieval_mean_host_waits == prior_waits,
+            "event-dependent retrieval changed ranking or waited on the host for its mean");
+        const auto empty_query = backend->mean_sparse_query_async(query, queries);
+        const auto empty_ranking = event_ranker->rank_device_after_event(0, empty_query, {{}, {}, 0, true});
+        test_tiled::require(empty_ranking == std::vector<std::vector<std::uint64_t>>(heads) &&
+            event_ranker->stats().query_ready_event_waits == 2 && backend->stats().retrieval_mean_host_waits == prior_waits,
+            "empty event-dependent ranking ignored query readiness");
         const auto before = backend->stats();
         const auto direct = backend->sparse({first, queries, 0.125f, local, rope, positions, {}, packed, fixed, query,
             {device_result.get(), q.size(), solid::DeviceMemory::cuda},

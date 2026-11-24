@@ -2,6 +2,7 @@
 #include "solid/projection.hpp"
 #include "solid/ggml_prefetch.hpp"
 #include "solid/device_ops.hpp"
+#include "solid/device_timing.hpp"
 #include "solid/trace.hpp"
 #include "solid/dense_offload.hpp"
 #include "solid/thread_affinity.hpp"
@@ -68,7 +69,7 @@ struct PrefillOutput {
 }
 class InfllmSelectedCache {
 public:
-    InfllmSelectedCache(AttentionSession & session, ggml_backend_t backend) : session_(session), backend_(backend) {
+    InfllmSelectedCache(AttentionSession & session, ggml_backend_t backend) : session_(session), backend_(backend), copy_backend_(backend) {
         const auto & geometry = session.geometry();
         const auto budget = session.budget();
         const auto block = geometry.block_tokens;
@@ -96,7 +97,19 @@ public:
         if (!staging_buffer_) throw std::runtime_error("InfLLM read buffer allocation failed");
         staging_ = static_cast<Half *>(ggml_backend_buffer_get_base(staging_buffer_.get()));
         stats_.staging_bytes = ggml_backend_buffer_get_size(staging_buffer_.get());
+#ifdef SOLID_HAVE_CUDA_SELECTION
+        if (ggml_backend_is_cuda(backend_)) {
+            // InfLLM's GLOBAL_STREAM submits copies independently of model
+            // compute. A separate GGML backend owns that stream/context;
+            // the model backend remains confined to the inference thread.
+            copy_owner_.reset(ggml_backend_dev_init(device, nullptr));
+            if (!copy_owner_) throw std::runtime_error("InfLLM copy backend initialization failed");
+            copy_backend_ = copy_owner_.get();
+            trace::name_cuda_stream(solid_cuda_queue(copy_backend_), "sparse.kv.H2D");
+        }
+#endif
     }
+    ~InfllmSelectedCache() { synchronize_copy(); }
     ggml_backend_t backend() const { return backend_; }
     DeviceCacheStats stats() const { return stats_; }
     ggml_tensor * plane(ggml_context * context, bool values) const {
@@ -241,24 +254,37 @@ private:
             } else transfers.push_back(range);
         }
         try {
+#ifdef SOLID_HAVE_CUDA_SELECTION
+            // The queue accessor also selects this backend's CUDA device on
+            // the calling worker thread before submitting memory operations.
+            if (copy_owner_) (void) solid_cuda_queue(copy_backend_);
+#endif
             for (const auto & range : transfers) {
                 const auto bytes = static_cast<std::size_t>(range.count) * dim * sizeof(Half);
                 for (int plane = 0; plane < 2; ++plane) for (std::uint32_t h = 0; h < geometry.heads; ++h) {
                     const auto offset = plane * bank_->nb[3] + h * bank_->nb[2] + range.row * bank_->nb[1];
-                    ggml_backend_tensor_set_async(backend_, bank_, reinterpret_cast<const char *>(staging_) + offset, offset, bytes);
+                    ggml_backend_tensor_set_async(copy_backend_, bank_, reinterpret_cast<const char *>(staging_) + offset, offset, bytes);
                     ++stats_.uploads;
                     stats_.upload_bytes += bytes;
                 }
             }
             // One receipt protects the read buffer for reuse by the next SSD job.
-            ggml_backend_synchronize(backend_);
+            synchronize_copy();
         } catch (...) {
-            ggml_backend_synchronize(backend_);
+            synchronize_copy();
             throw;
         }
     }
+    void synchronize_copy() {
+#ifdef SOLID_HAVE_CUDA_SELECTION
+        if (copy_owner_) (void) solid_cuda_queue(copy_backend_);
+#endif
+        ggml_backend_synchronize(copy_backend_);
+    }
     AttentionSession & session_;
     ggml_backend_t backend_;
+    ggml_backend_t copy_backend_;
+    std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> copy_owner_{nullptr, ggml_backend_free};
     std::unique_ptr<ggml_context, decltype(&ggml_free)> context_{nullptr, ggml_free};
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer_{nullptr, ggml_backend_buffer_free};
     ggml_tensor * bank_ = nullptr;
@@ -281,7 +307,10 @@ SparseBaselineLookahead::SparseBaselineLookahead(AttentionSession & session, Inf
     session_(session), workspace_(workspace), reader_(use_uring ? make_uring_reader(queue_depth) : nullptr) {}
 void SparseBaselineLookahead::begin(std::uint32_t layer, std::uint64_t position) {
     if (frame_ || layer >= session_.geometry().layers) throw std::logic_error("invalid sparse prefetch frontier");
-    worker_.submit([this, layer, position] { workspace_.prefetch_fixed(layer, position, reader_.get(), queue_depth); });
+    worker_.submit([this, layer, position] {
+        workspace_.prefetch_fixed(layer, position, reader_.get(), queue_depth);
+        workspace_.upload_fixed();
+    });
     frame_ = std::make_pair(layer, position);
 }
 void SparseBaselineLookahead::upload(std::uint32_t layer, std::uint64_t position) {
@@ -289,7 +318,6 @@ void SparseBaselineLookahead::upload(std::uint32_t layer, std::uint64_t position
     const auto start = std::chrono::steady_clock::now();
     worker_.join();
     session_.account_sparse_prefetch(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
-    workspace_.upload_fixed();
     frame_.reset();
 }
 void SparseBaselineLookahead::completed(std::uint32_t layer, std::uint64_t position) {

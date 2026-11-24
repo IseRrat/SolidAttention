@@ -56,6 +56,12 @@
 
    [attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[block_ranker.hpp](../include/solid/block_ranker.hpp)。
 
+   CUDA Prefill 的均值与排名之间采用设备事件衔接。`mean_sparse_query_async` 在 attention 队列生成 FP16 均值，记录完成事件，返回均值指针和事件；选块器在评分队列插入该事件依赖，随后执行块点积和 Top-K，在所选编号回传处收取结果。模型推理调用这条异步均值入口，省去均值阶段单独的 CPU 等待。输入 Q、均值缓冲和事件由生产者持有，覆盖排名使用期；候选直接全部采用时，后续同队列 attention 完成输入读取。`DeviceQueryWithEvent` 单独表达这项依赖，普通 `DeviceQuery` 继续要求输入已完成生产。同步均值接口按均值事件收取结果。
+
+   结果中的 `prefill_mean_events`、`prefill_mean_host_waits` 分别记录均值事件和同步均值收取次数，`query_ready_event_waits` 记录插入评分队列的 GPU 事件依赖次数。CUDA 对照用例分别调用同步、异步均值排名，核对选块一致，并检查普通候选、空候选两条路径的事件依赖及 CPU 均值等待计数。代码和 CUDA 对照用例已编译，原版 CPU 对照及 54 项 CPU 回归通过。
+
+   [device_input.hpp](../include/solid/device_input.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[baseline.cpp](../src/baseline.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
+
 4. **SYCL 评分和选块**
 
    设备维护代表 bank、窗口更新、定稿和排名，接入图内 Q/K 及批量构造。按设备能力使用 FP64 或双 FP32 分量。共享选择模式先评分、聚合所有头的分数，再执行一份 Top-K。定稿前将累计分数除以 local，与 CPU、CUDA 的代表种子和分数回填使用同一规则。
@@ -67,6 +73,8 @@
    CUDA 对照配置下，两条稀疏路径保存 RoPE 前的 K，将 Query 固定旋转到窗口末尾。近期 Key 按距当前 token 的位置旋转，历史、初始和过期尾部的 Key 使用原值。GGML 矩阵乘法算 logits，联合 softmax 后通过矩阵乘法得到 attention 输出。设备槽位同时记录近期位置，输出完成后把近期 token 的概率交给代表索引。SolidAttention 的物理槽位和 SSD 预取仍由自身调度器管理。兼容配置继续使用原有 strided Flash Attention 接口。`generate_adapter.py` 生成的位置输入回调只向仍在图中、已经分配缓冲的绝对位置张量写入数据。
 
    两条稀疏路径的 K/V 在矩阵乘法中使用 FP16，累加精度设为 FP32。近期槽位索引按 query head 和时间顺序生成，设备上的 GET_ROWS 从概率表中只取近期分数。CPU 回执接收近期分数和一个 attention 完成标量，确认本层归档后更新代表索引。attention 输出通过带回执依赖的原地设备节点直接交给后续层。CPU、CUDA、SYCL 均实现该节点，数值回归覆盖解码图复用、近期索引和原生完成通知。
+
+   初始、历史和近期位置合并为唯一的 KV 位置列表。Prefill 按每个 query 的距离选择近期或历史 logits，同一位置在联合 softmax 和 V 累积中只计入一次；分组内已过期的临时近期行按掩码处理。
 
    CUDA 选块器启用设备概率累计时，近期分数和当前 FP16 Key 直接交给 GPU 的环形缓冲。每个 query head 独立累加分数，整块退出近期窗口时在 GPU 生成均值代表。CPU 接收新完成块的代表位置、分数和状态。Prefill 的按 key 汇总分数与 Decode 的单 token 分数接入同一条更新路径。回归用例覆盖 96-token 输入组、逐 token 解码和环形缓冲周转；CPU 参考按同样的 Prefill 分组、Decode 单步边界累计 FP16 分数。[attention.cpp](../src/attention.cpp)、[attention.hpp](../include/solid/attention.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[session.cpp](../src/session.cpp)、[session.hpp](../include/solid/session.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
 
@@ -246,7 +254,9 @@
 
 6. **运行与结果记录**
 
-   `llama_adapter.cpp` 的 `SparseBaselineLookahead` 在解码输入就绪时准备首层初始和近期窗口，在当前层 attention 回执后准备下一层同类窗口。所有层共用一份显存工作缓冲，每次切换层或解码步时重新从 SSD 读取所需的历史 KV。GGML 上传节点先交付本层预取的固定窗口，正式选块后再批量补读、上传剩余历史 KV。本步 K/V 直接取自回传的投影结果，已满的写缓冲在选块期间后台落盘。GGML 按逻辑位置聚集分离的 K、V 并计算原有 InfLLM attention。解码回归检查连续两步均读取历史 KV，并与参考 attention 对照。 [llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
+   `llama_adapter.cpp` 的 `SparseBaselineLookahead` 在解码输入就绪时准备首层初始和近期窗口，在当前层 attention 回执后准备下一层同类窗口。读取线程在 SSD 读取完成后立即提交固定窗口上传，等待这批上传完成后归还主机源缓冲；GGML 固定窗口消费节点收取该后台任务。CUDA 上传使用同一设备上的独立 GGML backend，队列命名为 `sparse.kv.H2D`，与模型计算队列分开。后台线程通过既有队列接口选择正确的 CUDA 设备；上传出错及工作区销毁时排空复制队列。
+
+   所有层共用一份显存工作缓冲，每次切换层或解码步时重新从 SSD 读取所需的历史 KV。正式选块后再批量补读、上传剩余历史 KV。本步 K/V 直接取自回传的投影结果，已满的写缓冲在选块期间后台落盘。GGML 按逻辑位置聚集分离的 K、V 并计算原有 InfLLM attention。解码回归检查连续两步均读取历史 KV，并与参考 attention 对照。 [llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
 
    `kv_store.hpp`、`kv_store.cpp` 的分离 KV 区间批读按队列深度提交 `io_uring`，从待写缓冲补齐尚未落盘的行。`session.hpp`、`session.cpp` 提供读取及等待计时，`llama_adapter.hpp` 将预取及缓存绑定到解码节点，`baseline.cpp` 记录固定窗口等待、上传、命中和淘汰。`gather_test.cpp` 对照连续解码两步的输出和读请求计数。
 
@@ -270,7 +280,7 @@
 
    `dense_offload.cpp`、`llama_adapter.cpp` 分别记录两条基线的整层或固定窗口预取，以及正式选中 KV 的补读、上传。`kv_store.cpp` 在写缓冲有数据且实际执行同步写回时记录 Store。三组保留原有 32 KiB 每层聚合写规则，缓冲攒满和请求结束排空时产生实际写盘阶段。
 
-   CPU 线程职责名为 `sa.infer`、`sa.coordinator`、`sa.ssd-io`、`off.ssd-read`、`sp.window-read`；`sa.infer` 只用于实际推理进程，配置检查和构建信息查询保留原进程名。Python 调度与监控分别为 `sa.matrix`、`sa.monitor`，GGML 持久 CPU worker 按编号命名。CUDA stream 保留模型计算、KV 上传、评分与代表更新、Prefill attention 的职责名。对应实现位于 `scheduler.hpp`、`scheduler.cpp`、`llama_adapter.hpp`、`ggml_prefetch.cpp`、`io_worker.cpp`、`process_lifetime.py`、`experiments.py`、`run_baseline.py`、`tiled_prefill.cu`。
+   CPU 线程职责名为 `sa.infer`、`sa.coordinator`、`sa.ssd-io`、`off.ssd-read`、`sp.window-io`；后者执行稀疏基线固定窗口的 SSD 读取与上传。`sa.infer` 只用于实际推理进程，配置检查和构建信息查询保留原进程名。Python 调度与监控分别为 `sa.matrix`、`sa.monitor`，GGML 持久 CPU worker 按编号命名。CUDA stream 保留模型计算、KV 上传、评分与代表更新、Prefill attention 的职责名。对应实现位于 `scheduler.hpp`、`scheduler.cpp`、`llama_adapter.hpp`、`llama_adapter.cpp`、`ggml_prefetch.cpp`、`io_worker.cpp`、`process_lifetime.py`、`experiments.py`、`run_baseline.py`、`tiled_prefill.cu`。
 
    `scripts/solid-nsys.sh` 开启 CUDA、NVTX、系统库调用与 CUDA Graph 节点采集。`scripts/profile_matrix.sh` 为每个任务生成独立 `.nsys-rep` 和 `INDEX.tsv`，记录方法、输入长度、模型、任务 ID、配置文件；续跑按执行清单跳过已有任务，并核对采集对应任务已完成。`run_baseline.py` 在运行清单记录标记开关。CPU 阶段条记录主机观察到的区间，GPU kernel 和 memory 行记录实际计算与传输。
 

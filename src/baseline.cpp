@@ -505,6 +505,8 @@ int main(int argc, char ** argv) {
                 {"prefill_device_query_tokens",stats.prefill.device_query_tokens},{"prefill_device_kv_tokens",stats.prefill.device_kv_tokens},
                 {"prefill_output_download_bytes",stats.prefill.output_download_bytes},{"prefill_output_device_copy_bytes",stats.prefill.output_device_copy_bytes},
                 {"prefill_probability_download_bytes",stats.prefill.probability_download_bytes},
+                {"prefill_mean_events",stats.prefill.retrieval_mean_events},{"prefill_mean_host_waits",stats.prefill.retrieval_mean_host_waits},
+                {"query_ready_event_waits",stats.ranking.query_ready_event_waits},
                 {"block_tokens", config.attention.block_tokens}, {"context_budget_tokens", budget.total},
                 {"init_tokens", budget.initial}, {"local_tokens", budget.local}, {"representative_count", budget.representatives},
                 {"head_aggregation", budget.shared_heads ? "shared_across_heads" : "mean"},

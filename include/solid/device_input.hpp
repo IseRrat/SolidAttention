@@ -15,6 +15,13 @@ struct DeviceQuery {
     std::size_t elements = 0;
     DeviceMemory memory = DeviceMemory::cuda;
 };
+// CUDA producer event accompanying a query that is still being computed.
+// The producer owns the query and event through the consuming rank call.
+// Plain DeviceQuery retains its producer-complete contract.
+struct DeviceQueryWithEvent {
+    DeviceQuery query;
+    void * cuda_ready_event = nullptr;
+};
 struct DeviceKeys {
     const Half * data = nullptr;
     std::size_t elements = 0;

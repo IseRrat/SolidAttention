@@ -405,6 +405,7 @@ public:
                 allocate(previous_scale_, product(rows, sizeof(float)), stats_.workspace_device_bytes);
             }
             if (sparse_local_) {
+                checked(cudaEventCreateWithFlags(&mean_ready_, cudaEventDisableTiming), "create sparse query mean event");
                 allocate(local_scores_, product(cells, sizeof(float)), stats_.workspace_device_bytes);
                 allocate(local_feedback_, product(product(qh_, tile_), sizeof(float)), stats_.workspace_device_bytes);
                 allocate(key_positions_, product(tile_, sizeof(std::uint64_t)), stats_.workspace_device_bytes);
@@ -550,6 +551,15 @@ public:
         checked(cudaGetLastError(), "merge prefill value tiles");
     }
     DeviceQuery mean_sparse_query(DeviceQuery query, std::uint32_t count) override {
+        const auto result = mean_sparse_query_async(query, count);
+        DeviceScope scope(device_);
+        try {
+            checked(cudaEventSynchronize(mean_ready_), "collect sparse retrieval query");
+            ++stats_.retrieval_mean_host_waits;
+        } catch (...) { fail(); throw; }
+        return result.query;
+    }
+    DeviceQueryWithEvent mean_sparse_query_async(DeviceQuery query, std::uint32_t count) override {
         if (!supports_sparse() || open_ || count > queries_ || count > std::min(512u, sparse_local_)) throw std::invalid_argument("sparse prefill mean frame");
         validate_device_query(query, DeviceMemory::cuda, qh_, g_.dimension, count);
         validate_pointer(query.data);
@@ -558,9 +568,10 @@ public:
         try {
             mean_sparse_queries<<<grid(width), 256, 0, stream_>>>(query.data, query_, width, count);
             checked(cudaGetLastError(), "average sparse prefill queries");
-            checked(cudaStreamSynchronize(stream_), "make sparse retrieval query available");
+            checked(cudaEventRecord(mean_ready_, stream_), "record sparse retrieval query readiness");
+            ++stats_.retrieval_mean_events;
         } catch (...) { fail(); throw; }
-        return {query_, width, DeviceMemory::cuda};
+        return {{query_, width, DeviceMemory::cuda}, mean_ready_};
     }
     SparsePrefillOutput sparse(const SparsePrefillFrame & frame) override {
         check();
@@ -732,6 +743,7 @@ private:
         if (key_positions_) (void) cudaFree(key_positions_);
         if (frequencies_) (void) cudaFree(frequencies_);
         if (copied_) (void) cudaEventDestroy(copied_);
+        if (mean_ready_) (void) cudaEventDestroy(mean_ready_);
         if (stream_) (void) cudaStreamDestroy(stream_);
         if (restore && previous!=device_) (void) cudaSetDevice(previous);
     }
@@ -743,7 +755,7 @@ private:
     float scale_=1;
     bool open_=false,failed_=false;
     cudaStream_t stream_=nullptr;
-    cudaEvent_t copied_=nullptr;
+    cudaEvent_t copied_=nullptr, mean_ready_=nullptr;
     cublasHandle_t blas_ = nullptr;
     __half * packed_query_ = nullptr, * packed_kv_ = nullptr, * probabilities_ = nullptr;
     float * scores_ = nullptr, * tile_output_ = nullptr, * previous_scale_ = nullptr;

@@ -39,6 +39,7 @@ struct PrefillStats {
     std::uint64_t query_upload_bytes = 0, output_download_bytes = 0, output_device_copy_bytes = 0;
     std::uint64_t probability_download_bytes = 0;
     std::uint64_t device_query_tokens = 0, device_kv_tokens = 0;
+    std::uint64_t retrieval_mean_events = 0, retrieval_mean_host_waits = 0;
 };
 class TiledPrefill {
 public:
@@ -61,6 +62,11 @@ public:
     virtual const char * name() const = 0;
     virtual bool supports_sparse() const { return false; }
     virtual DeviceQuery mean_sparse_query(DeviceQuery, std::uint32_t) { throw std::logic_error("device sparse query is disabled"); }
+    // Retain the input Q until the ranker has consumed the returned event, or
+    // this backend has completed its following sparse()/abort() call.
+    virtual DeviceQueryWithEvent mean_sparse_query_async(DeviceQuery query, std::uint32_t count) {
+        return {mean_sparse_query(query, count), nullptr};
+    }
     virtual SparsePrefillOutput sparse(const SparsePrefillFrame &) { throw std::logic_error("sparse prefill is disabled"); }
 };
 std::unique_ptr<TiledPrefill> make_cuda_tiled_prefill(const KvGeometry & geometry, std::uint32_t query_heads,
