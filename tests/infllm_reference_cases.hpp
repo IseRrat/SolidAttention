@@ -120,7 +120,14 @@ void run(const std::string & path, Configure configure, Submit submit, Mean mean
             const auto mean = mean_query(queries, count, heads * width);
             require(mean.size() == upstream_mean.size(), "retrieval mean shape differs from upstream");
             for (std::size_t i = 0; i < mean.size(); ++i) {
-                require(mean[i] == solid::from_half(upstream_mean[i]), "retrieval mean dtype/rounding differs from upstream");
+                if (mean[i] != solid::from_half(upstream_mean[i])) {
+                    throw std::runtime_error("retrieval mean differs from upstream: case=" + std::to_string(c) +
+                        " tokens=" + std::to_string(count) + " element=" + std::to_string(i) +
+                        " expected_half=" + std::to_string(upstream_mean[i]) +
+                        " actual_half=" + std::to_string(solid::to_half(mean[i])) +
+                        " expected=" + std::to_string(solid::from_half(upstream_mean[i])) +
+                        " actual=" + std::to_string(mean[i]));
+                }
             }
             const solid::BlockCandidates request{ids, std::vector<std::uint32_t>(candidates, block), topk * block, true};
             const auto ranked = index.rank_blocks(0, mean, request);

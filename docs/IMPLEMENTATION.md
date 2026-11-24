@@ -96,7 +96,9 @@
 
    `infllm_reference_cases.hpp` 读取原版输出，逐批核对完整块发布边界、代表 Top-K 得分集合、选中的原始 Key 和 FP16 均值。分数唯一时核对原版代表集合；Top-K 边界同分时核对最优得分集合及实际所选 Key 的均值。随后直接调用原版 `calc_block_topk` 和 `VectorTensor.get_topk`，分别用 1、37 和最多 512 个 Q 生成检索参考。检索候选使用代表边界无歧义的完整块，确保移植版与原版拥有相同的代表 bank，再核对 Q 均值的 FP16 数值、GQA 返回列表和 Top-K 最优得分集合。
 
-   `infllm_reference_test.cpp` 接入 CPU 索引及均值函数，`cuda_prefill_test.cpp` 接入真实 CUDA 代表 bank、检索内核和 Prefill Q 均值内核。`CMakeLists.txt` 添加独立的 CPU 对照程序。已通过 CPU 对照的 5 组、172 批、101 个完整块及 11 组检索，以及服务器 54 项 CPU 回归；CUDA 代表构造、评分选块和对照程序已完成编译。同分代表的构造样例单独核对合法集合；检索比较使用拥有相同代表 bank 的样例。
+   `infllm_reference_test.cpp` 接入 CPU 索引及均值函数，`cuda_prefill_test.cpp` 接入真实 CUDA 代表 bank、检索内核和 Prefill Q 均值内核。`CMakeLists.txt` 添加独立的 CPU 对照程序。CPU 和 CUDA 均已通过 5 组、172 批、101 个完整块及 11 组检索的原版对照；服务器 54 项 CPU 回归通过，CUDA 基础评分选块与 tiled Prefill 检查通过。同分代表的构造样例单独核对合法集合；检索比较使用拥有相同代表 bank 的样例。
+
+   CUDA 对照的输入上传由 `upload_ready` 收取默认上传队列完成后，再交给独立计算队列，保证借用输入已就绪。`infllm_reference_cases.hpp` 的均值检查在失败时报告样例、组长、元素及双方 FP16 编码，保持原版数值判据。
 
    [原版源码及许可](../third_party/infllm/)、[来源记录](../third_party/infllm/ORIGIN)、[infllm_reference_fixture.py](../scripts/infllm_reference_fixture.py)、[infllm_reference_cases.hpp](../tests/infllm_reference_cases.hpp)、[infllm_reference_test.cpp](../tests/infllm_reference_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)、[CMakeLists.txt](../CMakeLists.txt)。
 

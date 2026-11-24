@@ -11,6 +11,14 @@ void cuda_check(cudaError_t status) {
     if (status != cudaSuccess) throw std::runtime_error(cudaGetErrorString(status));
 }
 template<class T>
+void upload_ready(T * destination, const T * source, std::size_t elements) {
+    cuda_check(cudaMemcpy(destination, source, elements * sizeof(T), cudaMemcpyHostToDevice));
+    // A pageable H2D cudaMemcpy may return after staging, before DMA ends.
+    // The borrowed-input APIs consume on nonblocking streams and require a
+    // producer-complete allocation, so drain the upload's default stream.
+    cuda_check(cudaStreamSynchronize(nullptr));
+}
+template<class T>
 auto device_buffer(std::size_t count) {
     void * data = nullptr;
     cuda_check(cudaMalloc(&data, count * sizeof(T)));
@@ -69,8 +77,8 @@ void sparse_prefill(int device) {
         auto device_q = device_buffer<float>(q.size());
         auto device_kv = device_buffer<solid::Half>(current.size());
         auto device_result = device_buffer<float>(q.size());
-        cuda_check(cudaMemcpy(device_q.get(), q.data(), q.size() * sizeof(float), cudaMemcpyHostToDevice));
-        cuda_check(cudaMemcpy(device_kv.get(), current.data(), current.size() * sizeof(solid::Half), cudaMemcpyHostToDevice));
+        upload_ready(device_q.get(), q.data(), q.size());
+        upload_ready(device_kv.get(), current.data(), current.size());
         const solid::DeviceQuery query{device_q.get(), q.size(), solid::DeviceMemory::cuda};
         const auto mean = backend->mean_sparse_query(query, queries);
         std::vector<float> host_mean(mean.elements), expected_mean(mean.elements);
@@ -170,8 +178,8 @@ void probability_representatives(int device) {
         }
         auto device_kv = device_buffer<solid::Half>(kv.size());
         auto device_scores = device_buffer<float>(scores.size());
-        cuda_check(cudaMemcpy(device_kv.get(), kv.data(), kv.size() * sizeof(solid::Half), cudaMemcpyHostToDevice));
-        cuda_check(cudaMemcpy(device_scores.get(), scores.data(), scores.size() * sizeof(float), cudaMemcpyHostToDevice));
+        upload_ready(device_kv.get(), kv.data(), kv.size());
+        upload_ready(device_scores.get(), scores.data(), scores.size());
         const solid::DeviceKvBatch current{device_kv.get(), kv.size(), solid::DeviceMemory::cuda};
         const solid::DeviceQuery probabilities{device_scores.get(), scores.size(), solid::DeviceMemory::cuda};
         if (count != 1) observed.observe_prefill_device_scores(0, first, count, current, probabilities);
@@ -225,14 +233,14 @@ int main(int argc,char ** argv) {
         }, [](auto & index, auto first, auto count, const auto & kv, const auto & scores) {
             auto device_kv = device_buffer<solid::Half>(kv.size());
             auto device_scores = device_buffer<float>(scores.size());
-            cuda_check(cudaMemcpy(device_kv.get(), kv.data(), kv.size() * sizeof(solid::Half), cudaMemcpyHostToDevice));
-            cuda_check(cudaMemcpy(device_scores.get(), scores.data(), scores.size() * sizeof(float), cudaMemcpyHostToDevice));
+            upload_ready(device_kv.get(), kv.data(), kv.size());
+            upload_ready(device_scores.get(), scores.data(), scores.size());
             index.observe_prefill_device_scores(0, first, count,
                 {device_kv.get(), kv.size(), solid::DeviceMemory::cuda},
                 {device_scores.get(), scores.size(), solid::DeviceMemory::cuda});
         }, [&](const auto & queries, auto count, auto width) {
             auto device_queries = device_buffer<float>(queries.size());
-            cuda_check(cudaMemcpy(device_queries.get(), queries.data(), queries.size() * sizeof(float), cudaMemcpyHostToDevice));
+            upload_ready(device_queries.get(), queries.data(), queries.size());
             const auto mean = fixture_mean->mean_sparse_query({device_queries.get(), queries.size(), solid::DeviceMemory::cuda}, count);
             test_tiled::require(mean.elements == width, "CUDA reference retrieval query shape");
             std::vector<float> result(width);
