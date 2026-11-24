@@ -81,7 +81,8 @@ __global__ void score_blocks(const __half * keys, const float * query, const std
 // Top-K over the shared list. GQA heads reference their existing KV rows.
 __global__ void score_shared_blocks(const __half * keys, const float * query, const std::uint64_t * ids,
                                     double * scores, int * error, std::uint64_t count, std::uint32_t heads,
-                                    std::uint32_t group, std::uint32_t representatives, std::uint32_t dimension) {
+                                    std::uint32_t group, std::uint32_t representatives, std::uint32_t dimension,
+                                    bool infllm_fp16) {
     __shared__ float warps[8];
     const auto lane = threadIdx.x % 32;
     const auto warp = threadIdx.x / 32;
@@ -97,7 +98,8 @@ __global__ void score_shared_blocks(const __half * keys, const float * query, co
                 key += __half2float(block[(head * representatives + r) * dimension + d]);
             }
             if (representatives > 1) key = __half2float(__float2half(key / representatives));
-            total += query[j] * key;
+            const auto q = infllm_fp16 ? __half2float(__float2half(query[j])) : query[j];
+            total += q * key;
         }
         for (unsigned offset = 16; offset; offset /= 2) total += __shfl_down_sync(0xffffffff, total, offset);
         if (!lane) warps[warp] = total;
@@ -106,6 +108,7 @@ __global__ void score_shared_blocks(const __half * keys, const float * query, co
             total = lane < 8 ? warps[lane] : 0;
             for (unsigned offset = 16; offset; offset /= 2) total += __shfl_down_sync(0xffffffff, total, offset);
             if (!lane) {
+                if (infllm_fp16) total = __half2float(__float2half(total));
                 if (!isfinite(total)) atomicExch(error, 1);
                 scores[i] = static_cast<double>(total);
             }
@@ -857,7 +860,8 @@ public:
             if (candidates.shared_heads) {
                 const auto grid = static_cast<unsigned>(std::min<std::uint64_t>(count, 65535));
                 score_shared_blocks<<<grid, 256, 0, stream_>>>(static_cast<const __half *>(banks_[layer]), device ? query : query_,
-                    ids_, scores_, error_device_, count, geometry_.heads, query_heads_ / geometry_.heads, representatives_, geometry_.dimension);
+                    ids_, scores_, error_device_, count, geometry_.heads, query_heads_ / geometry_.heads, representatives_, geometry_.dimension,
+                    probability_local_ != 0);
             } else {
                 const auto grid = static_cast<unsigned>(std::min<std::uint64_t>((count * geometry_.heads + 7) / 8, 65535));
                 score_blocks<<<grid, 256, 0, stream_>>>(static_cast<const __half *>(banks_[layer]), device ? query : query_, ids_, scores_, error_device_,
@@ -887,7 +891,7 @@ public:
         return result;
     }
     RankerStats stats() const override { return stats_; }
-    const char * name() const override { return shared_ranking_ ? "cuda_shared_fp32_topk" : "cuda_fp64_topk"; }
+    const char * name() const override { return probability_local_ ? "cuda_infllm_fp16_topk" : shared_ranking_ ? "cuda_shared_fp32_topk" : "cuda_fp64_topk"; }
     bool owns_representative_keys() const override { return true; }
     std::vector<Half> read_representatives(std::uint32_t layer, std::uint64_t block) override {
         check();

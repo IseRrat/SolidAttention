@@ -76,8 +76,9 @@ void sparse_prefill(int device) {
         std::vector<float> host_mean(mean.elements), expected_mean(mean.elements);
         cuda_check(cudaMemcpy(host_mean.data(), mean.data, mean.elements * sizeof(float), cudaMemcpyDeviceToHost));
         for (std::uint32_t i = 0; i < queries; ++i) for (std::size_t d = 0; d < mean.elements; ++d) {
-            expected_mean[d] += q[i * mean.elements + d] / queries;
+            expected_mean[d] += solid::from_half(solid::to_half(q[i * mean.elements + d]));
         }
+        for (auto & value : expected_mean) value = solid::from_half(solid::to_half(value / queries));
         test_tiled::close(host_mean, expected_mean, 1e-6f);
         const auto before = backend->stats();
         const auto direct = backend->sparse({first, queries, 0.125f, local, rope, positions, {}, packed, fixed, query,
@@ -191,8 +192,11 @@ int main(int argc,char ** argv) {
         test_tiled::frames(factory, 128, false, 32, 1e-3f);
         sparse_prefill(device);
         probability_representatives(device);
-        if (argc == 4) test_infllm::run(argv[3], [=](auto & index, auto geometry, auto heads, auto budget) {
+        std::unique_ptr<solid::TiledPrefill> fixture_mean;
+        if (argc == 4) test_infllm::run(argv[3], [&](auto & index, auto geometry, auto heads, auto budget) {
             const auto kv_heads = geometry.heads;
+            fixture_mean = solid::make_cuda_tiled_prefill(geometry, heads, std::min(512u, geometry.capacity_tokens),
+                geometry.capacity_tokens, device, budget.local);
             geometry.heads = heads;
             auto ranker = solid::make_cuda_block_ranker(geometry, heads, 1, budget.total, device, 0, kv_heads);
             test_infllm::require(ranker->configure_probability_builder(budget.initial, budget.local, budget.representatives),
@@ -206,6 +210,14 @@ int main(int argc,char ** argv) {
             index.observe_prefill_device_scores(0, first, count,
                 {device_kv.get(), kv.size(), solid::DeviceMemory::cuda},
                 {device_scores.get(), scores.size(), solid::DeviceMemory::cuda});
+        }, [&](const auto & queries, auto count, auto width) {
+            auto device_queries = device_buffer<float>(queries.size());
+            cuda_check(cudaMemcpy(device_queries.get(), queries.data(), queries.size() * sizeof(float), cudaMemcpyHostToDevice));
+            const auto mean = fixture_mean->mean_sparse_query({device_queries.get(), queries.size(), solid::DeviceMemory::cuda}, count);
+            test_tiled::require(mean.elements == width, "CUDA reference retrieval query shape");
+            std::vector<float> result(width);
+            cuda_check(cudaMemcpy(result.data(), mean.data, result.size() * sizeof(float), cudaMemcpyDeviceToHost));
+            return result;
         });
         std::cout<<"CUDA tiled prefill device checks passed\n"; return 0;
     } catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }

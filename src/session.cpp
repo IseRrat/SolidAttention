@@ -163,10 +163,7 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
                     return select_prefill_context(g, budget_, *representatives_, layer, position, count, mean_query);
                 }
                 if (position >= budget_.total) {
-                    std::fill(mean.begin(), mean.end(), 0);
-                    for (std::uint32_t i = 0; i < count; ++i) {
-                        for (std::size_t d = 0; d < qwidth; ++d) mean[d] += query[i * qwidth + d] / count;
-                    }
+                    mean_infllm_query(query, mean.data(), qwidth, count);
                 }
                 return select_prefill_context(g, budget_, *representatives_, layer, position, count, mean);
             }();

@@ -6,6 +6,10 @@ int main(int argc, char ** argv) {
         test_infllm::run(argv[1], [](auto &, auto, auto, auto) {},
             [](auto & index, auto first, auto count, const auto & kv, const auto & scores) {
                 index.observe_prefill_scores(0, first, count, kv, scores);
+            }, [](const auto & queries, auto count, auto width) {
+                std::vector<float> mean(width);
+                solid::mean_infllm_query(queries.data(), mean.data(), width, count);
+                return mean;
             });
         return 0;
     } catch (const std::exception & error) { std::cerr << error.what() << '\n'; return 1; }

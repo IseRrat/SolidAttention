@@ -23,14 +23,14 @@ inline void require(bool condition, const char * message) {
 
 // The binary oracle is produced by the unmodified upstream append_global and
 // get_block_k methods. submit optionally exercises the real CUDA builder.
-template<class Configure, class Submit>
-void run(const std::string & path, Configure configure, Submit submit) {
+template<class Configure, class Submit, class Mean>
+void run(const std::string & path, Configure configure, Submit submit, Mean mean_query) {
     std::ifstream input(path, std::ios::binary);
     require(static_cast<bool>(input), "cannot open InfLLM reference fixture");
     const auto magic = read<char>(input, 8);
-    require(std::string(magic.begin(), magic.end()) == "IFLMREF1", "InfLLM fixture format");
+    require(std::string(magic.begin(), magic.end()) == "IFLMREF2", "InfLLM fixture format");
     const auto cases = read<std::uint32_t>(input);
-    std::uint64_t checked_blocks = 0, frames = 0, tied_sets = 0;
+    std::uint64_t checked_blocks = 0, frames = 0, tied_sets = 0, checked_rankings = 0;
     for (std::uint32_t c = 0; c < cases; ++c) {
         const auto kv_heads = read<std::uint32_t>(input), heads = read<std::uint32_t>(input);
         const auto width = read<std::uint32_t>(input), block = read<std::uint32_t>(input);
@@ -109,9 +109,43 @@ void run(const std::string & path, Configure configure, Submit submit) {
             require(published == geometry.blocks_per_head() || !index.ready(0, published), "partial block published too early");
             ++frames;
         }
+        const auto ranking_cases = read<std::uint32_t>(input);
+        for (std::uint32_t r = 0; r < ranking_cases; ++r) {
+            const auto count = read<std::uint32_t>(input), candidates = read<std::uint32_t>(input), topk = read<std::uint32_t>(input);
+            auto ids = read<std::uint64_t>(input, candidates);
+            auto queries = read<float>(input, static_cast<std::size_t>(count) * heads * width);
+            auto upstream_mean = read<solid::Half>(input, heads * width);
+            auto upstream_scores = read<solid::Half>(input, candidates);
+            auto upstream_topk = read<std::uint64_t>(input, topk);
+            const auto mean = mean_query(queries, count, heads * width);
+            require(mean.size() == upstream_mean.size(), "retrieval mean shape differs from upstream");
+            for (std::size_t i = 0; i < mean.size(); ++i) {
+                require(mean[i] == solid::from_half(upstream_mean[i]), "retrieval mean dtype/rounding differs from upstream");
+            }
+            const solid::BlockCandidates request{ids, std::vector<std::uint32_t>(candidates, block), topk * block, true};
+            const auto ranked = index.rank_blocks(0, mean, request);
+            require(ranked.size() == kv_heads, "retrieval KV-head mapping differs from upstream");
+            std::vector<float> optimal;
+            for (const auto value : upstream_scores) optimal.push_back(solid::from_half(value));
+            std::sort(optimal.begin(), optimal.end(), std::greater<float>());
+            for (const auto & selected : ranked) {
+                require(selected.size() == upstream_topk.size(), "retrieval Top-K count differs from upstream");
+                std::set<std::uint64_t> unique;
+                std::vector<float> selected_scores;
+                for (const auto id : selected) {
+                    const auto found = std::lower_bound(ids.begin(), ids.end(), id);
+                    require(found != ids.end() && *found == id && unique.insert(id).second, "retrieval candidate invalid/repeated");
+                    selected_scores.push_back(solid::from_half(upstream_scores[found - ids.begin()]));
+                }
+                std::sort(selected_scores.begin(), selected_scores.end(), std::greater<float>());
+                require(std::equal(selected_scores.begin(), selected_scores.end(), optimal.begin()),
+                    "retrieval selected inferior blocks compared with upstream calc_block_topk");
+            }
+            ++checked_rankings;
+        }
     }
     require(input.peek() == std::char_traits<char>::eof(), "trailing InfLLM fixture data");
     std::cout << "InfLLM upstream comparison: " << cases << " cases, " << frames << " frames, "
-              << checked_blocks << " complete blocks; valid tied Top-K sets=" << tied_sets << '\n';
+              << checked_blocks << " complete blocks, " << checked_rankings << " retrievals; valid tied Top-K sets=" << tied_sets << '\n';
 }
 } // namespace test_infllm

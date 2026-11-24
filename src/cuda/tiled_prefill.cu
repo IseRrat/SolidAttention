@@ -165,8 +165,8 @@ __global__ void mean_sparse_queries(const float * queries, float * mean, std::si
     for (auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < width; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
         float value = 0.f;
-        for (std::uint32_t q = 0; q < count; ++q) value += queries[q * width + i] / count;
-        mean[i] = value;
+        for (std::uint32_t q = 0; q < count; ++q) value += __half2float(__float2half(queries[q * width + i]));
+        mean[i] = __half2float(__float2half(value / count));
     }
 }
 

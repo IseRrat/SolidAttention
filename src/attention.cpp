@@ -39,6 +39,14 @@ void RelativeRope::rotate(float * row, std::uint32_t position) const {
         angle *= step;
     }
 }
+void mean_infllm_query(const float * queries, float * mean, std::size_t width, std::uint32_t count) {
+    if (!queries || !mean || !width || !count || count > 512) throw std::invalid_argument("InfLLM mean query shape");
+    for (std::size_t d = 0; d < width; ++d) {
+        float sum = 0;
+        for (std::uint32_t i = 0; i < count; ++i) sum += from_half(to_half(queries[i * width + d]));
+        mean[d] = from_half(to_half(sum / count));
+    }
+}
 std::uint32_t SparseBudget::cache_slots(const KvGeometry & geometry) const {
     const auto block = geometry.block_tokens;
     auto slots = (static_cast<std::uint64_t>(total) + block - 1) / block + 3;
@@ -547,8 +555,9 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
         std::vector<std::pair<double, std::uint64_t>> best;
         const auto better = [](const auto & a, const auto & b) { return a.first == b.first ? a.second < b.second : a.first > b.first; };
         for (const auto block : candidates.blocks) {
-            auto value = score(layer, head, block, *query);
-            if (candidates.shared_heads) {
+            auto value = budget_.infllm_attention && candidates.shared_heads ? infllm_shared_score(layer, block, *query) :
+                score(layer, head, block, *query);
+            if (candidates.shared_heads && !budget_.infllm_attention) {
                 for (std::uint32_t h = 1; h < geometry_.heads; ++h) value += score(layer, h, block, *query);
             }
             best.emplace_back(value, block);
@@ -580,6 +589,23 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
     }
     result.resize(kv_heads_);
     return result;
+}
+double RepresentativeIndex::infllm_shared_score(std::uint32_t layer, std::uint64_t block, const std::vector<float> & query) const {
+    // ContextManager.calc_block_topk flattens all query heads into one
+    // FP16 matrix-vector product; it rounds once after the complete dot.
+    float value = 0;
+    for (std::uint32_t h = 0; h < geometry_.heads; ++h) {
+        const auto & tokens = blocks_.at(index(layer, h)).at(block).tokens;
+        for (std::uint32_t d = 0; d < geometry_.dimension; ++d) {
+            float mean = 0;
+            for (const auto & token : tokens) mean += from_half(token.key.at(d));
+            const auto key = from_half(to_half(mean / tokens.size()));
+            value += from_half(to_half(query[static_cast<std::size_t>(h) * geometry_.dimension + d])) * key;
+        }
+    }
+    value = from_half(to_half(value));
+    if (!std::isfinite(value)) throw std::runtime_error("non-finite InfLLM block score");
+    return value;
 }
 std::vector<std::uint64_t> RepresentativeIndex::representative_positions(std::uint32_t layer, std::uint32_t head, std::uint64_t block) const {
     std::vector<std::uint64_t> result;

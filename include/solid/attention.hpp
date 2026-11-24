@@ -25,6 +25,9 @@ struct RelativeRope {
     bool split_halves;
     void rotate(float * row, std::uint32_t position) const;
 };
+// InfLLM retrieval averages FP16 global Q, accumulates in FP32, and stores
+// the mean in Q's FP16 dtype. The caller owns width output elements.
+void mean_infllm_query(const float * queries, float * mean, std::size_t width, std::uint32_t count);
 
 class RepresentativeIndex {
 public:
@@ -88,6 +91,7 @@ private:
     void release_published_keys(std::uint32_t layer, std::uint64_t block);
     void finalize_before(std::uint32_t layer, std::uint64_t first, double divisor);
     std::size_t index(std::uint32_t layer, std::uint32_t head) const;
+    double infllm_shared_score(std::uint32_t layer, std::uint64_t block, const std::vector<float> & query) const;
     std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const std::vector<float> * query,
                                                      const DeviceQuery * device, const BlockCandidates & candidates) const;
 };
