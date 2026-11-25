@@ -112,6 +112,8 @@
 
    CUDA 对照的输入上传由 `upload_ready` 收取默认上传队列完成后，再交给独立计算队列，保证借用输入已就绪。`infllm_reference_cases.hpp` 的 F32 均值检查采用由输入绝对值和浮点精度计算的归约误差界，失败时报告样例、组长、元素及双方数值；选块继续严格核对原版最优得分集合。
 
+   attention 另做过一次直接原版对照：在 CPU 分配频率表后，执行原版 `RotaryEmbeddingESM` 的旋转函数及 `TorchMultiStageDotProductionAttention.append/finalize`。按已约定的单 token 单次计入规则，为每个 Query 传入互不重复的近期与历史集合；缓存 FP16 K/V 提升为 F32 参与参考矩阵乘法。5 组样例覆盖全量因果前缀、组内滑出窗口、480-token Prefill、逐 token Decode、28 个 Query heads 对 4 个 KV heads，以及未成块尾部。CPU 输出与近期概率累计最大绝对差分别为 0.000068307、0.000035763；CUDA 为 0.000246644、0.000299931。参考使用 F32，CUDA GEMM 输入及概率含 FP16 舍入。结果和 Nsight 报告保存于 `results/server5090/infllm-original-attention-7fd2521/`。
+
    `7820c8d` 的服务器核验完成 Qwen2.5-7B Q4_0、8K 输入、8 步 Decode 的三方法短推理。三组均启用 Nsight、8 GiB 显存限制、16 GiB 主机内存限制及 Decode O_DIRECT。Prefill 分别为 Offload 1.575 秒、Offload＋Sparse 1.405 秒、SolidAttention 1.299 秒；两条稀疏路径均记录 784 个均值事件、0 次均值主机等待。结果、选块、逐阶段时间线及数值比较保存在 `results/server5090/nsys-infllm-8k-7820c8d/`，报告编号与方法由其中的 `capture/nsys/INDEX.tsv` 对应。
 
    [原版源码及许可](../third_party/infllm/)、[来源记录](../third_party/infllm/ORIGIN)、[infllm_reference_fixture.py](../scripts/infllm_reference_fixture.py)、[infllm_reference_cases.hpp](../tests/infllm_reference_cases.hpp)、[infllm_reference_test.cpp](../tests/infllm_reference_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)、[CMakeLists.txt](../CMakeLists.txt)。
