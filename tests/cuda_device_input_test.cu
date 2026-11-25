@@ -118,26 +118,52 @@ void operations() {
 // Model-free integration on the experiment machine: two actual CUDA/CPU split
 // layers, private ranker stream, native completion and one allocated graph reused
 // across decode positions. CPU scalar sparse attention is the numerical oracle.
-void decode(int device,bool packed,solid::ScheduleMode mode) {
+void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false) {
     const solid::KvGeometry g{2,2,128,2,32,64,solid::KvLayout::interleaved};
-    const solid::SparseBudget budget{6,1,1,1};
+    const solid::SparseBudget budget=infllm?solid::SparseBudget{6,1,2,2,true,true}:solid::SparseBudget{6,1,1,1};
+    const auto rope=infllm?std::optional<solid::RelativeRope>{{128,10000.f,true}}:std::nullopt;
     std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> gpu(ggml_backend_cuda_init(device),ggml_backend_free),
         cpu(ggml_backend_cpu_init(),ggml_backend_free);
     require(gpu && cpu,"decode check backends");
     solid::AttentionSession session(std::make_unique<solid::MemoryKvStore>(g),4,budget,true,6,{}, {},
-        std::make_unique<test_prefetch::Reader>(),6);
-    solid::AttentionSession reference(std::make_unique<solid::MemoryKvStore>(g),4,budget,true,6);
-    session.set_ranker(solid::make_cuda_block_ranker(g,4,1,6,device,1));
+        std::make_unique<test_prefetch::Reader>(),budget.cache_slots(g),{},rope);
+    solid::AttentionSession reference(std::make_unique<solid::MemoryKvStore>(g),4,budget,true,6,{}, {},{},0,{},rope);
+    auto ranker=solid::make_cuda_block_ranker(session.representative_geometry(),4,1,6,device,infllm?0:1,infllm?g.heads:0);
+    if (infllm) require(ranker->configure_probability_builder(budget.initial,budget.local,budget.representatives),"native decode probability builder");
+    session.set_ranker(std::move(ranker));
     std::vector<float> q(512),k(256),v(256);
     const float scale=1/std::sqrt(128.0f);
     const auto fill=[&](int layer,int p) {
         for (std::size_t i=0;i<q.size();++i) q[i]=static_cast<float>(static_cast<int>((i*13+p*17)%41)-20)/32;
+        if (rope) for (int h=0;h<4;++h) rope->rotate(q.data()+h*128,budget.local-1);
         for (std::size_t i=0;i<k.size();++i) {
             k[i]=static_cast<float>(static_cast<int>((i*7+p*11+layer*19)%29)-14)/16;
             v[i]=static_cast<float>(static_cast<int>((i*3+p*5+layer*17)%37)-18)/16;
         }
     };
-    for (int p=0;p<6;++p) for (int layer=0;layer<2;++layer) {
+    if (infllm) {
+        session.set_prefill(solid::make_cuda_tiled_prefill(g,4,2,12,device,budget.local));
+        for (int layer=0;layer<2;++layer) {
+            std::vector<float> queries;
+            std::vector<solid::Half> current;
+            for (int p=0;p<6;++p) {
+                fill(layer,p); (void) reference.process(layer,p,1,q,k,v,scale);
+                queries.insert(queries.end(),q.begin(),q.end());
+                for (int h=0;h<2;++h) {
+                    for (int d=0;d<128;++d) current.push_back(solid::to_half(k[h*128+d]));
+                    for (int d=0;d<128;++d) current.push_back(solid::to_half(v[h*128+d]));
+                }
+            }
+            DeviceBuffer dq(queries.size()*sizeof(float)),dkv(current.size()*sizeof(solid::Half)),out(queries.size()*sizeof(float));
+            checked(cudaMemcpy(dq.data,queries.data(),queries.size()*sizeof(float),cudaMemcpyHostToDevice),"upload native prefill Q");
+            checked(cudaMemcpy(dkv.data,current.data(),current.size()*sizeof(solid::Half),cudaMemcpyHostToDevice),"upload native prefill KV");
+            checked(cudaStreamSynchronize(nullptr),"native prefill inputs ready");
+            session.process_prefill_device(layer,0,6,{static_cast<float *>(dq.data),queries.size(),solid::DeviceMemory::cuda},
+                {static_cast<solid::Half *>(dkv.data),current.size(),solid::DeviceMemory::cuda},current,scale,
+                {static_cast<float *>(out.data),queries.size(),solid::DeviceMemory::cuda});
+        }
+        session.release_prefill_if_complete();
+    } else for (int p=0;p<6;++p) for (int layer=0;layer<2;++layer) {
         fill(layer,p); (void) session.process(layer,p,1,q,k,v,scale); (void) reference.process(layer,p,1,q,k,v,scale);
     }
     const auto before=session.stats();
@@ -149,6 +175,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
         ggml_backend_sched_new(backends,nullptr,2,1024,false,true),ggml_backend_sched_free);
     Observer observer{cache}; ggml_backend_sched_set_eval_callback(scheduler.get(),Observer::evaluate,&observer);
     auto * query=ggml_new_tensor_3d(context.get(),GGML_TYPE_F32,128,4,1); ggml_set_input(query);
+    auto * absolute=infllm?ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,1):nullptr;
+    if (absolute) ggml_set_input(absolute);
     ggml_tensor * keys[2],* values[2],* outputs[2];
     std::shared_ptr<solid::AttentionFrame> frames[2];
     std::unique_ptr<solid::AttentionNode> nodes[2];
@@ -166,7 +194,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
         }
         frames[layer]=std::make_shared<solid::AttentionFrame>();
         nodes[layer]=std::make_unique<solid::AttentionNode>(session,frames[layer],layer,scale,nullptr,true,&cache);
-        outputs[layer]=nodes[layer]->build(context.get(),current_q,key,value,kv,scheduler.get(),gpu.get());
+        outputs[layer]=nodes[layer]->build(context.get(),current_q,key,value,kv,scheduler.get(),gpu.get(),graph,absolute);
         ggml_set_output(outputs[layer]);
         nodes[layer]->set_query_proof(layer!=0);
         if (layer) nodes[layer-1]->defer_completion();
@@ -175,11 +203,18 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
             ggml_backend_sched_set_tensor_backend(scheduler.get(),nodes[layer]->selection_node(),cpu.get());
             ggml_build_forward_expand(graph,nodes[layer]->selection_node());
         }
+        if (infllm) {
+            require(nodes[layer]->local_attention_node()!=nullptr,"native local attention graph missing");
+            ggml_build_forward_expand(graph,nodes[layer]->local_attention_node());
+            ggml_backend_sched_set_tensor_backend(scheduler.get(),nodes[layer]->metadata_node(),cpu.get());
+            ggml_build_forward_expand(graph,nodes[layer]->metadata_node());
+        }
     }
     nodes[1]->defer_completion();
     ggml_build_forward_expand(graph,outputs[1]);
     require(ggml_backend_sched_alloc_graph(scheduler.get(),graph),"allocate CUDA split graph");
     for (int p=6;p<14;++p) {
+        if (absolute) { const std::int32_t position=p; ggml_backend_tensor_set(absolute,&position,0,sizeof(position)); }
         cache.begin_prefetch(0,p);
         std::vector<float> expected[2];
         for (int layer=0;layer<2;++layer) {
@@ -201,10 +236,10 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
     const auto after=session.stats();
     require(cache.stats().current_device_rows==32 && cache.stats().current_device_bytes==32ull*g.dimension*2*sizeof(solid::Half),
         "CUDA decode did not copy current KV rows on device");
-    require(after.direct_decode_queries==16 && after.ranking.device_builder_queries==16 && after.ranking.device_builder_appends==16 &&
+    require(after.direct_decode_queries==16 && (infllm || (after.ranking.device_builder_queries==16 && after.ranking.device_builder_appends==16)) &&
         after.ranking.device_rank_queries>0 && after.ranking.query_upload_bytes==before.ranking.query_upload_bytes &&
         after.ranking.builder_key_upload_bytes==before.ranking.builder_key_upload_bytes,"direct decode re-uploaded Q/K or skipped device inputs");
-    require(after.ranking.builder_rank_shared_waits>0,"CUDA decode did not reuse the block ranking wait");
+    if (!infllm) require(after.ranking.builder_rank_shared_waits>0,"CUDA decode did not reuse the block ranking wait");
     const auto schedule=cache.schedule_stats();
     if (mode==solid::ScheduleMode::sync_reuse) {
         require(schedule.device_event_completions+schedule.device_boundary_fallbacks==16,
@@ -213,7 +248,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode) {
             "CUDA KV archive did not share the attention completion");
         require(schedule.stream_waits==16 && schedule.batch_waits==0,
             "CUDA decode blocked the host on an attention upload batch");
-        require(after.ranking.builder_compute_appends==16,"CUDA decode waited for representative key append on the host");
+        if (!infllm) require(after.ranking.builder_compute_appends==16,"CUDA decode waited for representative key append on the host");
     } else if (mode==solid::ScheduleMode::overlap) {
         require(schedule.archive_attention_reuses==0 && schedule.archive_separate_completions==16,
             "CUDA overlap did not retain independent KV archive completions");
@@ -228,6 +263,7 @@ int main(int argc,char ** argv) {
         const int device=argc==3?std::stoi(argv[2]):0; checked(cudaSetDevice(device),"select device");
         operations();
         for (bool packed:{false,true}) for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) decode(device,packed,mode);
+        for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) decode(device,false,mode,true);
         std::cout<<"CUDA borrowed Q/K, FP16 kernels, split graphs and replay checks passed\n"; return 0;
     } catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }
