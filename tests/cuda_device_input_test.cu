@@ -118,7 +118,7 @@ void operations() {
 // Model-free integration on the experiment machine: two actual CUDA/CPU split
 // layers, private ranker stream, native completion and one allocated graph reused
 // across decode positions. CPU scalar sparse attention is the numerical oracle.
-void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false) {
+void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bool baseline=false) {
     const solid::KvGeometry g{2,2,128,2,32,64,solid::KvLayout::interleaved};
     const solid::SparseBudget budget=infllm?solid::SparseBudget{6,1,2,2,true,true}:solid::SparseBudget{6,1,1,1};
     const auto rope=infllm?std::optional<solid::RelativeRope>{{128,10000.f,true}}:std::nullopt;
@@ -168,6 +168,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false) {
     }
     const auto before=session.stats();
     solid::GgmlPrefetch cache(session,gpu.get(),{},mode);
+    auto selected_cache=baseline?solid::make_infllm_selected_cache(session,gpu.get()):nullptr;
     require(cache.direct_memory()==solid::DeviceMemory::cuda,"actual CUDA direct mode missing");
     std::unique_ptr<ggml_context,decltype(&ggml_free)> context(ggml_init({4*1024*1024,nullptr,true}),ggml_free);
     ggml_backend_t backends[]{gpu.get(),cpu.get()};
@@ -193,7 +194,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false) {
             value=ggml_view_3d(context.get(),kv,128,2,1,256*sizeof(float),512*sizeof(float),128*sizeof(float));
         }
         frames[layer]=std::make_shared<solid::AttentionFrame>();
-        nodes[layer]=std::make_unique<solid::AttentionNode>(session,frames[layer],layer,scale,nullptr,true,&cache);
+        nodes[layer]=std::make_unique<solid::AttentionNode>(session,frames[layer],layer,scale,nullptr,true,
+            baseline?nullptr:&cache,nullptr,selected_cache.get());
         outputs[layer]=nodes[layer]->build(context.get(),current_q,key,value,kv,scheduler.get(),gpu.get(),graph,absolute);
         ggml_set_output(outputs[layer]);
         nodes[layer]->set_query_proof(layer!=0);
@@ -215,7 +217,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false) {
     require(ggml_backend_sched_alloc_graph(scheduler.get(),graph),"allocate CUDA split graph");
     for (int p=6;p<14;++p) {
         if (absolute) { const std::int32_t position=p; ggml_backend_tensor_set(absolute,&position,0,sizeof(position)); }
-        cache.begin_prefetch(0,p);
+        if (!baseline) cache.begin_prefetch(0,p);
         std::vector<float> expected[2];
         for (int layer=0;layer<2;++layer) {
             fill(layer,p); frames[layer]->positions={static_cast<std::uint64_t>(p)};
@@ -225,7 +227,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false) {
             ggml_backend_tensor_set(values[layer],v.data(),0,v.size()*sizeof(float));
         }
         require(ggml_backend_sched_graph_compute(scheduler.get(),graph)==GGML_STATUS_SUCCESS,"CUDA direct decode graph");
-        cache.process_complete();
+        if (!baseline) cache.process_complete();
         for (int layer=0;layer<2;++layer) {
             nodes[layer]->check(); std::vector<float> actual(512);
             ggml_backend_tensor_get(outputs[layer],actual.data(),0,actual.size()*sizeof(float));
@@ -234,6 +236,14 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false) {
     }
     cache.quiesce(); session.finish();
     const auto after=session.stats();
+    if (baseline) {
+        require(after.ranking.device_rank_queries>before.ranking.device_rank_queries &&
+            after.ranking.query_upload_bytes==before.ranking.query_upload_bytes &&
+            after.ranking.builder_key_upload_bytes==before.ranking.builder_key_upload_bytes,
+            "native sparse baseline re-uploaded GPU retrieval input");
+        ggml_backend_sched_reset(scheduler.get());
+        return;
+    }
     require(cache.stats().current_device_rows==32 && cache.stats().current_device_bytes==32ull*g.dimension*2*sizeof(solid::Half),
         "CUDA decode did not copy current KV rows on device");
     require(after.direct_decode_queries==16 && (infllm || (after.ranking.device_builder_queries==16 && after.ranking.device_builder_appends==16)) &&
@@ -264,6 +274,7 @@ int main(int argc,char ** argv) {
         operations();
         for (bool packed:{false,true}) for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) decode(device,packed,mode);
         for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) decode(device,false,mode,true);
+        decode(device,false,solid::ScheduleMode::naive,true,true);
         std::cout<<"CUDA borrowed Q/K, FP16 kernels, split graphs and replay checks passed\n"; return 0;
     } catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }
