@@ -56,7 +56,9 @@
 
    共享选块且候选块 token 成本相同时，`block_ranker.cu` 复用上游 llama.cpp CUDA argsort 使用的 CUB `DeviceRadixSort::SortPairsDescending`，对完整跨头块分数排序后取足以覆盖预算的前缀。候选编号按递增顺序提交，稳定排序保留同分时较小编号优先的规则。排序输出和临时工作区按最大候选数一次分配，持续调用复用，释放时统一归还；显存统计包括这部分分配。逐头或不同 token 成本的兼容入口沿用既有预算归约。两条稀疏实验路径使用相同的 CUB 入口。
 
-   `cuda_ranker_test.cpp` 用 31、513、4,096、8,192 个候选块，覆盖同分、正反评分、不同预算及等成本和变成本，与独立的稳定全排序结果核对，并检查持续选块无新增显存分配。服务器 CUDA 评分选块检查及 15 组原版 InfLLM 检索对照通过。[block_ranker.cu](../src/cuda/block_ranker.cu)、[cuda_ranker_test.cpp](../tests/cuda_ranker_test.cpp)。
+   InfLLM 的候选范围使用连续代表表的块数及固定块长表达，对应原版 `VectorTensor.data[:length]`。`BlockCandidates` 提供这项范围表示；`RepresentativeIndex` 在完整块定稿时更新每层连续块数并检查顺序，Prefill 和 Decode 共用。CUDA 路径按数量校验就绪范围，省去 CPU 枚举、逐项核对全部候选及编号/成本表 H2D。评分 kernel 直接读取第 i 个代表，写入逻辑编号 i；CUB 排序后的前缀直接回传，省去输出清零及额外 D2D 前缀复制。CPU 参考读取同一候选范围，外接评分后端由统一入口展开列表，选块和预算规则一致。完整块计数纳入主机内存统计。[block_ranker.hpp](../include/solid/block_ranker.hpp)、[attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)。
+
+   `cuda_ranker_test.cpp` 用 31、513、4,096、8,192 个候选块，覆盖同分、正反评分、不同预算及等成本和变成本，与独立的稳定全排序结果核对，并检查持续选块无新增显存分配。等成本用例逐项核对连续代表表与显式列表结果；非法长度、块长、混用表示和非共享范围在提交前拒绝。`cuda_prefill_test.cpp` 核对范围表示的异步回执，并检查旧回执不能收取新的结果。服务器 CUDA 评分选块检查、15 组原版 InfLLM 检索对照及 54 项 CPU 检查通过。[block_ranker.cu](../src/cuda/block_ranker.cu)、[cuda_ranker_test.cpp](../tests/cuda_ranker_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
 
    [attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[block_ranker.hpp](../include/solid/block_ranker.hpp)。
 

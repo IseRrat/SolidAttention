@@ -71,7 +71,7 @@ std::uint64_t SparseBudget::recent_start(const KvGeometry & geometry, std::uint6
 }
 RepresentativeIndex::RepresentativeIndex(KvGeometry geometry, std::uint32_t query_heads, SparseBudget budget) :
     geometry_(geometry), query_heads_(query_heads), kv_heads_(geometry.heads), budget_(budget), pending_(geometry.layers),
-    lengths_(geometry.layers, 0), query_pending_(geometry.layers, false), probability_lengths_(geometry.layers, 0) {
+    lengths_(geometry.layers, 0), complete_blocks_(geometry.layers, 0), query_pending_(geometry.layers, false), probability_lengths_(geometry.layers, 0) {
     geometry_.validate();
     budget_.validate(geometry_);
     if (query_heads == 0 || query_heads % geometry.heads != 0) throw std::invalid_argument("invalid GQA head mapping");
@@ -150,9 +150,13 @@ void RepresentativeIndex::finalize_before(std::uint32_t layer, std::uint64_t fir
             ++block.finalized;
         }
         const auto block = (token.position - origin) / geometry_.block_tokens;
-        if (ranker_ && ready(layer, block)) {
-            publish(*ranker_, layer, block, 1);
-            release_published_keys(layer, block);
+        if (ready(layer, block)) {
+            if (block != complete_blocks_[layer]) throw std::logic_error("representative completion has a gap");
+            ++complete_blocks_[layer];
+            if (ranker_) {
+                publish(*ranker_, layer, block, 1);
+                release_published_keys(layer, block);
+            }
         }
         pending.pop_front();
     }
@@ -428,6 +432,7 @@ void RepresentativeIndex::finish_device_probabilities() {
 }
 void RepresentativeIndex::accept_probability_blocks(std::uint32_t layer, const std::vector<BuiltRepresentatives> & built) {
     for (const auto & item : built) {
+        if (item.block != complete_blocks_.at(layer)) throw std::runtime_error("device representative completion has a gap");
         if (item.positions.size() != static_cast<std::size_t>(geometry_.heads) * budget_.representatives ||
             item.scores.size() != item.positions.size()) throw std::runtime_error("device representative metadata shape");
         for (std::uint32_t h = 0; h < geometry_.heads; ++h) {
@@ -441,6 +446,7 @@ void RepresentativeIndex::accept_probability_blocks(std::uint32_t layer, const s
             }
             block.finalized = geometry_.block_tokens;
         }
+        ++complete_blocks_[layer];
     }
 }
 void RepresentativeIndex::observe_prefill_device_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
@@ -491,6 +497,7 @@ void RepresentativeIndex::accept_built(std::uint32_t layer, std::uint64_t positi
     if (built.has_value() != complete) throw std::runtime_error("representative builder completion boundary");
     if (!built) return;
     const auto block = (position-budget_.local)/geometry_.block_tokens;
+    if (block != complete_blocks_.at(layer)) throw std::runtime_error("device representative completion has a gap");
     const auto count = static_cast<std::size_t>(geometry_.heads)*budget_.representatives;
     if (built->block != block || built->keys.size() != count*geometry_.dimension || built->positions.size() != count || built->scores.size() != count) {
         throw std::runtime_error("representative builder output shape or block");
@@ -520,6 +527,7 @@ void RepresentativeIndex::accept_built(std::uint32_t layer, std::uint64_t positi
         }
         target.finalized = geometry_.block_tokens;
     }
+    ++complete_blocks_[layer];
 }
 std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
     std::uint32_t layer, const std::vector<float> & query, const BlockCandidates & candidates) const {
@@ -535,13 +543,21 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
     return rank_impl(layer, nullptr, &query, candidates);
 }
 std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
-    std::uint32_t layer, const std::vector<float> * query, const DeviceQuery * device, const BlockCandidates & candidates,
+    std::uint32_t layer, const std::vector<float> * query, const DeviceQuery * device, const BlockCandidates & input,
     void * cuda_ready_event, RankCompletion * completion) const {
-    if (layer >= geometry_.layers || candidates.blocks.size() != candidates.tokens.size() || candidates.remaining > budget_.total) {
+    input.validate_shape();
+    if (layer >= geometry_.layers || input.size() > geometry_.blocks_per_head() || input.remaining > budget_.total ||
+        (input.is_prefix() && (input.prefix_tokens > geometry_.block_tokens || input.size() > complete_blocks_[layer]))) {
         throw std::invalid_argument("block ranking shape or budget");
     }
+    // Existing external rankers keep their explicit-list contract. CUDA consumes
+    // InfLLM's contiguous bank prefix directly, with no host enumeration.
+    std::optional<BlockCandidates> expanded;
+    if (input.is_prefix() && ranker_ && !ranker_->prefix_candidates()) expanded = input.expanded();
+    const auto & candidates = expanded ? *expanded : input;
     std::uint64_t available = 0;
-    for (std::size_t i = 0; i < candidates.blocks.size(); ++i) {
+    if (candidates.is_prefix()) available = candidates.size() * candidates.prefix_tokens;
+    else for (std::size_t i = 0; i < candidates.blocks.size(); ++i) {
         if ((i && candidates.blocks[i] <= candidates.blocks[i-1]) || candidates.blocks[i] >= geometry_.blocks_per_head() ||
             !ready(layer, candidates.blocks[i]) || candidates.tokens[i] == 0 || candidates.tokens[i] > geometry_.block_tokens) {
             throw std::invalid_argument("invalid block candidate");
@@ -557,7 +573,9 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
     };
     if (!needed) return ready(RankedBlocks(kv_heads_));
     if (candidates.shared_heads && available <= candidates.remaining) {
-        return ready(RankedBlocks(kv_heads_, candidates.blocks));
+        auto blocks = candidates.blocks;
+        if (candidates.is_prefix()) { blocks.resize(candidates.size()); std::iota(blocks.begin(), blocks.end(), std::uint64_t{0}); }
+        return ready(RankedBlocks(kv_heads_, blocks));
     }
     const auto validate = [](const BlockCandidates & candidates, std::uint64_t needed,
                              std::uint32_t heads, std::uint32_t kv_heads, RankedBlocks result) {
@@ -566,11 +584,12 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
             std::set<std::uint64_t> unique;
             std::uint64_t covered = 0;
             for (const auto block : head) {
-                const auto found = std::lower_bound(candidates.blocks.begin(), candidates.blocks.end(), block);
-                if (found == candidates.blocks.end() || *found != block || !unique.insert(block).second || covered >= needed) {
+                const auto offset = candidates.is_prefix() ? block : static_cast<std::uint64_t>(
+                    std::lower_bound(candidates.blocks.begin(), candidates.blocks.end(), block) - candidates.blocks.begin());
+                if (offset >= candidates.size() || candidates.block(offset) != block || !unique.insert(block).second || covered >= needed) {
                     throw std::runtime_error("ranker returned invalid, duplicate or excess block");
                 }
-                covered += candidates.tokens[found - candidates.blocks.begin()];
+                covered += candidates.cost(offset);
             }
             if (covered < needed) throw std::runtime_error("ranker returned insufficient token coverage");
         }
@@ -590,7 +609,8 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
     else for (std::uint32_t head = 0; head < (candidates.shared_heads ? 1u : geometry_.heads); ++head) {
         std::vector<std::pair<double, std::uint64_t>> best;
         const auto better = [](const auto & a, const auto & b) { return a.first == b.first ? a.second < b.second : a.first > b.first; };
-        for (const auto block : candidates.blocks) {
+        for (std::size_t i = 0; i < candidates.size(); ++i) {
+            const auto block = candidates.block(i);
             auto value = budget_.infllm_attention && candidates.shared_heads ? infllm_shared_score(layer, block, *query) :
                 score(layer, head, block, *query);
             if (candidates.shared_heads && !budget_.infllm_attention) {
@@ -604,8 +624,9 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
         std::uint64_t covered = 0;
         for (const auto & item : best) {
             result[head].push_back(item.second);
-            const auto offset = std::lower_bound(candidates.blocks.begin(), candidates.blocks.end(), item.second) - candidates.blocks.begin();
-            covered += candidates.tokens[offset];
+            const auto offset = candidates.is_prefix() ? item.second : static_cast<std::uint64_t>(
+                std::lower_bound(candidates.blocks.begin(), candidates.blocks.end(), item.second) - candidates.blocks.begin());
+            covered += candidates.cost(offset);
             if (covered >= needed) break;
         }
         if (candidates.shared_heads) std::fill(result.begin() + 1, result.end(), result.front());
@@ -653,7 +674,7 @@ std::vector<std::uint64_t> RepresentativeIndex::representative_positions(std::ui
     return result;
 }
 std::uint64_t RepresentativeIndex::resident_bytes() const {
-    std::uint64_t total = lengths_.capacity() * sizeof(std::uint64_t) + (query_pending_.capacity() + 7) / 8;
+    std::uint64_t total = (lengths_.capacity() + complete_blocks_.capacity()) * sizeof(std::uint64_t) + (query_pending_.capacity() + 7) / 8;
     for (const auto & blocks : blocks_) {
         total += blocks.capacity() * sizeof(Block);
         for (const auto & block : blocks) {
@@ -683,7 +704,10 @@ template<class Query> static std::vector<HeadSelection> select_blocks_impl(const
                                                                            local_first - initial_end));
     candidates.shared_heads = budget.shared_heads;
     if (budget.shared_heads) candidates.remaining -= candidates.remaining % geometry.block_tokens;
-    if (candidates.remaining) {
+    if (candidates.remaining && budget.infllm_attention) {
+        candidates.prefix_blocks = std::min(budget.complete_history_blocks(geometry, position), representatives.complete_blocks(layer));
+        candidates.prefix_tokens = geometry.block_tokens;
+    } else if (candidates.remaining) {
         const auto first = budget.shared_heads ? 0 : initial_end / geometry.block_tokens;
         const auto limit = budget.shared_heads ? budget.complete_history_blocks(geometry, position) :
             (local_first + geometry.block_tokens - 1) / geometry.block_tokens;
@@ -779,9 +803,8 @@ PrefillContext select_prefill_context_impl(const KvGeometry & g, const SparseBud
     candidates.shared_heads = true;
     candidates.remaining = (historical_tokens - remainder) / g.block_tokens * g.block_tokens;
     if (candidates.remaining) {
-        candidates.blocks.resize(complete);
-        std::iota(candidates.blocks.begin(), candidates.blocks.end(), std::uint64_t{0});
-        candidates.tokens.assign(complete, g.block_tokens);
+        candidates.prefix_blocks = complete;
+        candidates.prefix_tokens = g.block_tokens;
     }
     auto blocks = representatives.rank_blocks(layer, mean_query, candidates).front();
     std::sort(blocks.begin(), blocks.end());

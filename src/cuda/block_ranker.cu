@@ -80,15 +80,15 @@ __global__ void score_blocks(const __half * keys, const float * query, const std
 
 // Flatten the query heads into one score per historical block, then run one
 // Top-K over the shared list. GQA heads reference their existing KV rows.
-__global__ void score_shared_blocks(const __half * keys, const float * query, const std::uint64_t * ids,
+__global__ void score_shared_blocks(const __half * keys, const float * query, std::uint64_t * ids,
                                     double * scores, int * error, std::uint64_t count, std::uint32_t heads,
-                                    std::uint32_t group, std::uint32_t representatives, std::uint32_t dimension) {
+                                    std::uint32_t group, std::uint32_t representatives, std::uint32_t dimension, bool prefix) {
     __shared__ float warps[8];
     const auto lane = threadIdx.x % 32;
     const auto warp = threadIdx.x / 32;
     const auto width = static_cast<std::uint64_t>(heads) * group * dimension;
     for (auto i = static_cast<std::uint64_t>(blockIdx.x); i < count; i += gridDim.x) {
-        const auto * block = keys + ids[i] * heads * representatives * dimension;
+        const auto * block = keys + (prefix ? i : ids[i]) * heads * representatives * dimension;
         float total = 0;
         for (auto j = static_cast<std::uint64_t>(threadIdx.x); j < width; j += blockDim.x) {
             const auto head = j / dimension / group;
@@ -109,6 +109,7 @@ __global__ void score_shared_blocks(const __half * keys, const float * query, co
             if (!lane) {
                 if (!isfinite(total)) atomicExch(error, 1);
                 scores[i] = static_cast<double>(total);
+                if (prefix) ids[i] = i;
             }
         }
         __syncthreads();
@@ -844,19 +845,23 @@ public:
                                                     const BlockCandidates & candidates, bool device, void * cuda_ready_event = nullptr,
                                                     bool deferred = false) {
         check();
+        candidates.validate_shape();
         if (pending_rank_) throw std::logic_error("previous rank receipt must be collected");
         if (probability_pending_) throw std::logic_error("block ranking requires its preceding probability receipt");
         if (deferred_query_ && (!device || *deferred_query_!=layer)) throw std::logic_error("ranking does not match deferred representative query");
         if (layer >= geometry_.layers ||
-            candidates.blocks.size() != candidates.tokens.size() || candidates.blocks.size() > geometry_.blocks_per_head() ||
+            candidates.size() > geometry_.blocks_per_head() ||
             candidates.remaining > budget_) throw std::invalid_argument("CUDA ranking shape or budget");
         trace::Scope phase("GPU Score/select", layer,
             probability_local_ ? probability_lengths_[layer] : UINT64_MAX);
+        if (candidates.is_prefix() && (candidates.prefix_tokens > geometry_.block_tokens || candidates.size() > published_[layer])) {
+            throw std::invalid_argument("invalid CUDA rank prefix");
+        }
         for (std::size_t i = 0; i < candidates.blocks.size(); ++i) {
             if (candidates.blocks[i] >= published_[layer] || (i && candidates.blocks[i] <= candidates.blocks[i-1]) ||
                 !candidates.tokens[i] || candidates.tokens[i] > geometry_.block_tokens) throw std::invalid_argument("invalid CUDA rank candidate");
         }
-        if (!candidates.remaining || candidates.blocks.empty()) {
+        if (!candidates.remaining || !candidates.size()) {
             finish_query_for_rank_device();
             if (device) {
                 DeviceScope scope(device_);
@@ -878,12 +883,15 @@ public:
             ++rank_ticket_;
             return deferred ? RankedBlocks{} : finish_rank();
         }
-        const auto count = candidates.blocks.size();
-        const auto smallest = *std::min_element(candidates.tokens.begin(), candidates.tokens.end());
+        const auto count = candidates.size();
+        const auto smallest = candidates.is_prefix() ? candidates.prefix_tokens : *std::min_element(candidates.tokens.begin(), candidates.tokens.end());
         const auto max_selected = (static_cast<std::uint64_t>(candidates.remaining) + smallest - 1) / smallest;
         const auto stride = static_cast<std::uint32_t>(std::min<std::uint64_t>(max_selected, count));
         const auto lists = candidates.shared_heads ? 1u : geometry_.heads;
         const auto bytes = product(product(lists, stride), sizeof(std::uint64_t));
+        const bool uniform_shared = candidates.shared_heads && (candidates.is_prefix() ||
+            std::all_of(candidates.tokens.begin(), candidates.tokens.end(),
+                [smallest](std::uint32_t cost) { return cost == smallest; }));
         DeviceScope scope(device_);
         try {
             if (cuda_ready_event) {
@@ -895,35 +903,34 @@ public:
                 checked(cudaMemcpyAsync(query_, query, bytes, cudaMemcpyHostToDevice, stream_), "upload rank query");
                 stats_.query_upload_bytes += bytes;
             }
-            std::copy(candidates.blocks.begin(), candidates.blocks.end(), ids_host_);
-            std::copy(candidates.tokens.begin(), candidates.tokens.end(), costs_host_);
-            checked(cudaMemcpyAsync(ids_, ids_host_, product(count, sizeof(std::uint64_t)), cudaMemcpyHostToDevice, stream_), "upload rank candidates");
-            checked(cudaMemcpyAsync(costs_, costs_host_, product(count, sizeof(std::uint32_t)), cudaMemcpyHostToDevice, stream_), "upload rank costs");
+            if (!candidates.is_prefix()) {
+                std::copy(candidates.blocks.begin(), candidates.blocks.end(), ids_host_);
+                std::copy(candidates.tokens.begin(), candidates.tokens.end(), costs_host_);
+                checked(cudaMemcpyAsync(ids_, ids_host_, product(count, sizeof(std::uint64_t)), cudaMemcpyHostToDevice, stream_), "upload rank candidates");
+                checked(cudaMemcpyAsync(costs_, costs_host_, product(count, sizeof(std::uint32_t)), cudaMemcpyHostToDevice, stream_), "upload rank costs");
+            }
             if (!deferred_query_) checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear rank status");
-            checked(cudaMemsetAsync(output_device_, 0xff, bytes, stream_), "clear rank output");
+            if (!uniform_shared) checked(cudaMemsetAsync(output_device_, 0xff, bytes, stream_), "clear rank output");
             if (candidates.shared_heads) {
                 const auto grid = static_cast<unsigned>(std::min<std::uint64_t>(count, 65535));
                 score_shared_blocks<<<grid, 256, 0, stream_>>>(static_cast<const __half *>(banks_[layer]), device ? query : query_,
-                    ids_, scores_, error_device_, count, geometry_.heads, query_heads_ / geometry_.heads, representatives_, geometry_.dimension);
+                    ids_, scores_, error_device_, count, geometry_.heads, query_heads_ / geometry_.heads, representatives_, geometry_.dimension,
+                    candidates.is_prefix());
             } else {
                 const auto grid = static_cast<unsigned>(std::min<std::uint64_t>((count * geometry_.heads + 7) / 8, 65535));
                 score_blocks<<<grid, 256, 0, stream_>>>(static_cast<const __half *>(banks_[layer]), device ? query : query_, ids_, scores_, error_device_,
                     count, geometry_.heads, query_heads_ / geometry_.heads, representatives_, geometry_.dimension);
             }
             checked(cudaGetLastError(), "launch block relevance kernel");
-            const bool uniform_shared = candidates.shared_heads &&
-                std::all_of(candidates.tokens.begin(), candidates.tokens.end(),
-                    [smallest](std::uint32_t cost) { return cost == smallest; });
             if (uniform_shared) {
                 auto workspace_bytes = sort_temp_bytes_;
                 checked(cub::DeviceRadixSort::SortPairsDescending(sort_temp_, workspace_bytes, scores_, sorted_scores_,
                     ids_, sorted_ids_, static_cast<std::uint64_t>(count), 0, sizeof(double) * 8, stream_), "sort shared block relevance with CUB");
-                checked(cudaMemcpyAsync(output_device_, sorted_ids_, bytes, cudaMemcpyDeviceToDevice, stream_), "take shared block top-k prefix");
             } else {
                 select_top_blocks<<<lists, 256, 0, stream_>>>(scores_, ids_, costs_, output_device_, count, candidates.remaining, stride);
                 checked(cudaGetLastError(), "launch block top-k kernel");
             }
-            checked(cudaMemcpyAsync(output_host_, output_device_, bytes, cudaMemcpyDeviceToHost, stream_), "download selected block IDs");
+            checked(cudaMemcpyAsync(output_host_, uniform_shared ? sorted_ids_ : output_device_, bytes, cudaMemcpyDeviceToHost, stream_), "download selected block IDs");
             checked(cudaMemcpyAsync(rank_error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, stream_), "download rank status");
         } catch (...) { fail(); throw; }
         pending_rank_ = PendingRank{count, lists, stride, candidates.shared_heads};
@@ -959,6 +966,7 @@ public:
         return result;
     }
     RankerStats stats() const override { return stats_; }
+    bool prefix_candidates() const override { return true; }
     const char * name() const override { return probability_local_ ? "cuda_infllm_fp32_topk" : shared_ranking_ ? "cuda_shared_fp32_topk" : "cuda_fp64_topk"; }
     bool owns_representative_keys() const override { return true; }
     std::vector<Half> read_representatives(std::uint32_t layer, std::uint64_t block) override {

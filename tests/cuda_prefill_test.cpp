@@ -146,6 +146,12 @@ void sparse_prefill(int device) {
         cuda_check(cudaStreamDestroy(producer));
         test_tiled::require(returned && uncollected && rejects_reuse && rejects_receipt && deferred_ranking == expected_ranking,
             "deferred rank waited before the consumer, reused live metadata, or changed selected IDs");
+        auto prefix_receipt = event_ranker->submit_rank_device(0, {mean, nullptr}, {{}, {}, 4, true, 2, 4});
+        bool rejects_old_receipt = false;
+        try { (void) receipt(); }
+        catch (const std::logic_error &) { rejects_old_receipt = true; }
+        test_tiled::require(rejects_old_receipt && prefix_receipt() == expected_ranking,
+            "bank-prefix submission changed retrieval or let an old receipt consume a new result");
         const auto before = backend->stats();
         const auto direct = backend->sparse({first, queries, 0.125f, local, rope, positions, {}, packed, fixed, query,
             {device_result.get(), q.size(), solid::DeviceMemory::cuda},

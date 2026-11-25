@@ -124,9 +124,19 @@ void shared_topk(int device) {
             }
             const auto selected = ranker->rank(0, query, candidates);
             for (const auto & head : selected) require(head == expected, "shared CUB/fallback Top-K differs from stable full-sort oracle");
+            if (uniform) {
+                const solid::BlockCandidates prefix{{}, {}, left, true, count, g.block_tokens};
+                const auto compact = ranker->rank(0, query, prefix);
+                require(compact == selected, "InfLLM bank-prefix ranking differs from explicit candidate IDs");
+            }
             require(ranker->stats().device_bytes == bytes, "shared Top-K workspace grew during retrieval");
         }
     }
+    rejects([&] { (void) ranker->rank(0, query, {{}, {}, 32, true, blocks + 1, 32}); });
+    rejects([&] { (void) ranker->rank(0, query, {{}, {}, 32, true, 1, 33}); });
+    rejects([&] { (void) ranker->rank(0, query, {{}, {}, 32, false, 1, 32}); });
+    rejects([&] { (void) ranker->rank(0, query, {{0}, {32}, 32, true, 1, 32}); });
+    rejects([&] { (void) ranker->rank(0, query, {{}, {}, 32, true, 1, 0}); });
 }
 } // namespace
 int main(int argc, char ** argv) {

@@ -17,6 +17,29 @@ struct BlockCandidates {
     std::vector<std::uint32_t> tokens;
     std::uint32_t remaining = 0;
     bool shared_heads = false;
+    // InfLLM's VectorTensor[:length]: all complete blocks, one uniform cost.
+    // The prefix form carries no per-block CPU arrays.
+    std::uint64_t prefix_blocks = 0;
+    std::uint32_t prefix_tokens = 0;
+    bool is_prefix() const { return prefix_tokens != 0; }
+    std::uint64_t size() const { return is_prefix() ? prefix_blocks : blocks.size(); }
+    std::uint64_t block(std::size_t i) const { return is_prefix() ? i : blocks[i]; }
+    std::uint32_t cost(std::size_t i) const { return is_prefix() ? prefix_tokens : tokens[i]; }
+    void validate_shape() const {
+        if (is_prefix() ? (!shared_heads || !blocks.empty() || !tokens.empty()) :
+            (prefix_blocks || blocks.size() != tokens.size())) throw std::invalid_argument("invalid block candidate representation");
+    }
+    BlockCandidates expanded() const {
+        validate_shape();
+        if (!is_prefix()) return *this;
+        BlockCandidates result;
+        result.shared_heads = shared_heads;
+        result.remaining = remaining;
+        result.blocks.resize(prefix_blocks);
+        result.tokens.assign(prefix_blocks, prefix_tokens);
+        for (std::size_t i = 0; i < result.blocks.size(); ++i) result.blocks[i] = i;
+        return result;
+    }
 };
 struct RankerStats {
     std::uint64_t device_bytes = 0;
@@ -76,6 +99,7 @@ public:
                                                         const BlockCandidates & candidates) = 0;
     virtual RankerStats stats() const = 0;
     virtual const char * name() const = 0;
+    virtual bool prefix_candidates() const { return false; }
     virtual bool configure_probability_builder(std::uint32_t, std::uint32_t, std::uint32_t) { return false; }
     virtual bool device_probabilities() const { return false; }
     virtual std::vector<BuiltRepresentatives> probability_update(const ProbabilityFrame &) {

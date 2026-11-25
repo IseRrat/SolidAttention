@@ -54,6 +54,7 @@ public:
     std::optional<DeviceMemory> direct_memory() const { return ranker_ && ranker_->builder_window() ? ranker_->direct_memory() : std::optional<DeviceMemory>{}; }
     std::optional<DeviceMemory> rank_memory() const { return ranker_ ? ranker_->direct_memory() : std::optional<DeviceMemory>{}; }
     bool ready(std::uint32_t layer, std::uint64_t block) const;
+    std::uint64_t complete_blocks(std::uint32_t layer) const { return complete_blocks_.at(layer); }
     double score(std::uint32_t layer, std::uint32_t head, std::uint64_t block, const std::vector<float> & query) const;
     std::vector<std::uint64_t> representative_positions(std::uint32_t layer, std::uint32_t head, std::uint64_t block) const;
     std::uint64_t resident_bytes() const;
@@ -82,6 +83,7 @@ private:
     std::vector<std::deque<Pending>> pending_;
     std::vector<std::vector<Block>> blocks_;
     std::vector<std::uint64_t> lengths_;
+    std::vector<std::uint64_t> complete_blocks_;
     std::vector<bool> query_pending_;
     std::vector<std::uint64_t> probability_lengths_;
     std::unique_ptr<BlockRanker> ranker_;
