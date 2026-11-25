@@ -102,12 +102,13 @@ public:
     virtual bool prefix_candidates() const { return false; }
     virtual bool configure_probability_builder(std::uint32_t, std::uint32_t, std::uint32_t) { return false; }
     virtual bool device_probabilities() const { return false; }
+    virtual bool host_representative_metadata() const { return true; }
     virtual std::vector<BuiltRepresentatives> probability_update(const ProbabilityFrame &) {
         throw std::logic_error("device probability builder is disabled");
     }
-    // A single outstanding update owns snapshots of the borrowed inputs. The
-    // compute queue protects their capture before the graph may reuse them.
-    virtual void submit_probability_update(const ProbabilityFrame &, void *) {
+    // One outstanding receipt. A separate queue snapshots borrowed inputs;
+    // on_compute preserves upstream's update-before-FFN GPU queue order.
+    virtual void submit_probability_update(const ProbabilityFrame &, void *, bool = false) {
         throw std::logic_error("asynchronous probability builder is disabled");
     }
     virtual std::vector<BuiltRepresentatives> finish_probability_update() {
@@ -168,7 +169,8 @@ public:
 // operations restore the calling thread's previous device on exit.
 std::unique_ptr<BlockRanker> make_cuda_block_ranker(const KvGeometry & geometry, std::uint32_t query_heads,
                                                    std::uint32_t representatives, std::uint32_t budget, int device,
-                                                   std::uint32_t local = 0, std::uint32_t input_heads = 0);
+                                                   std::uint32_t local = 0, std::uint32_t input_heads = 0,
+                                                   bool representative_diagnostics = false);
 std::unique_ptr<BlockRanker> make_sycl_block_ranker(const KvGeometry & geometry, std::uint32_t query_heads,
                                                    std::uint32_t representatives, std::uint32_t budget, void * backend_queue,
                                                    std::uint32_t local, std::uint32_t input_heads = 0);

@@ -48,7 +48,9 @@
 
 3. **CUDA 代表构造和选块**
 
-   设备维护代表 bank、pending K 环和 FP16 窗口分数。完整块退出近期窗口后，每个“历史块、query head”对应一个 CUDA 线程块，独立执行块内 Top-K。32-token 实验块及不超过 128-token 的兼容块调用 CUB 稳定基数排序；更大的兼容块调用 CUB 并行归约选出代表。后续 gather/mean 内核并行读取代表 Key、计算各维均值，生成 FP16 块代表。待定环保留尚未完整退出窗口的块，代表构造按完整块提交，省去逐 token 插入及搬移代表 Key。位置、分数和状态通过一次分配的页锁定回执缓冲返回主机，同步、异步入口复用该缓冲。
+   设备维护代表 bank、pending K 环和 FP16 窗口分数。环容量为 `local + min(512, local) + block_tokens`；Key 按 KV head 保存，分数按 Query head 保存。完整块退出近期窗口后，每个“历史块、query head”对应一个 CUDA 线程块，独立执行块内 Top-K。32-token 实验块及不超过 128-token 的兼容块调用 CUB 稳定基数排序；更大的兼容块调用 CUB 并行归约选出代表。后续 gather/mean 内核并行读取代表 Key、计算各维均值，生成 FP16 块代表。待定环保留尚未完整退出窗口的块，代表构造按完整块提交，省去逐 token 插入及搬移代表 Key。
+
+   正常 CUDA 推理只保留 GPU 代表表；CPU 按输入位置和完成块数量推进索引，接收有限值检查状态。`make_cuda_block_ranker` 默认关闭 `representative_diagnostics`，省去代表位置、分数 D2H 和逐块主机元数据。显式数值核对才返回位置及分数，同步、异步入口复用预分配的页锁定回执区。主机的块元数据按需分配；设备独占代表时释放主机块表和待定队列，主机占用保持为按层的固定计数数组。`score` 诊断按需读回一个 GPU 均值代表，`representative_positions` 仅在启用诊断的索引中提供。主机内存统计包含块表外层、待定队列容器和概率位置计数。
 
    两条稀疏实验路径使用相同的 CUDA 评分与 Top-K。检索 Q 保留 llama.cpp 的 F32 计算类型，组内均值、跨头块点积和排序分数使用 FP32；FP16 代表 bank 在计算时提升为 FP32。每个线程块并行归约一个历史块的跨头点积，共享 Top-K 只回传一份块编号。已就绪的全部候选放得进预算时直接使用。原有逐头 FP64 评分及增量代表构造接口继续提供给既有调用。各选块接口同分时按逻辑块 ID 排序。
 
@@ -88,7 +90,7 @@
 
    初始、历史和近期位置合并为唯一的 KV 位置列表。Prefill 按每个 query 的距离选择近期或历史 logits，同一位置在联合 softmax 和 V 累积中只计入一次；分组内已过期的临时近期行按掩码处理。
 
-   CUDA 选块器启用设备概率累计时，近期分数和当前 FP16 Key 直接交给 GPU 的环形缓冲。每个 query head 独立累加分数，整块退出近期窗口时在 GPU 生成均值代表。CPU 接收新完成块的代表位置、分数和状态。Prefill 的按 key 汇总分数与 Decode 的单 token 分数接入同一条更新路径。回归用例覆盖 96-token 输入组、逐 token 解码和环形缓冲周转；CPU 参考按同样的 Prefill 分组、Decode 单步边界累计 FP16 分数。[attention.cpp](../src/attention.cpp)、[attention.hpp](../include/solid/attention.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[session.cpp](../src/session.cpp)、[session.hpp](../include/solid/session.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
+   CUDA 选块器启用设备概率累计时，近期分数和当前 FP16 Key 直接交给 GPU 的环形缓冲。每个 query head 独立累加分数，整块退出近期窗口时在 GPU 生成均值代表。CPU 接收完成块数量和状态。Prefill 的按 key 汇总分数与 Decode 的单 token 分数接入同一条更新路径。回归用例覆盖 96-token 输入组、逐 token 解码和环形缓冲周转；CPU 参考按同样的 Prefill 分组、Decode 单步边界累计 FP16 分数。[attention.cpp](../src/attention.cpp)、[attention.hpp](../include/solid/attention.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[session.cpp](../src/session.cpp)、[session.hpp](../include/solid/session.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
 
    稀疏基线用设备 Q 直接评分，仅把所选块编号交给主机安排 SSD 读取。历史行直接读入与设备 bank 对应的页锁定主机位置。相邻目标行合并上传，每批上传共享一次完成等待，源缓冲在完成后复用。纯 Offload 的整层上传也使用页锁定缓冲。 [llama_adapter.cpp](../src/llama_adapter.cpp)、[dense_offload.cpp](../src/dense_offload.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
 
@@ -210,9 +212,11 @@
 
    [attention_events.cpp](../src/attention_events.cpp)、[attention_events.cu](../src/cuda/attention_events.cu)、[cuda_completion.cuh](../include/solid/cuda_completion.cuh)、[attention_events.cpp](../src/sycl/attention_events.cpp)。
 
-   SolidAttention 的 CUDA `overlap+sync_reuse` 路径异步更新 InfLLM 代表。本层 attention 回执在模型计算流上捕获当前 FP16 K/V 和近期概率，随后代表队列等待捕获事件，执行原有 Key 追加、分数累加和代表生成内核。后续 FFN 只需排在输入捕获之后，CPU 在下一次 Q 前沿收取代表完成事件和元数据，每次模型计算结束及会话排空时收齐剩余结果。异步任务最多一份，快照大小由单 token 的 K/V 和近期概率窗口决定；位置、分数和错误状态通过固定页锁定缓冲区回传。Offload＋Sparse 保持原同步更新入口，两条路径使用相同的代表算法。
+   SolidAttention 的 CUDA `overlap+sync_reuse` 路径异步更新 InfLLM 代表。本层 attention 回执在模型计算流上捕获当前 FP16 K/V 和近期概率，随后代表队列等待捕获事件，执行原有 Key 追加、分数累加和代表生成内核。后续 FFN 只需排在输入捕获之后，CPU 在下一次 Q 前沿收取代表完成事件和完成块数量，每次模型计算结束及会话排空时收齐剩余结果。异步任务最多一份，快照大小由单 token 的 K/V 和近期概率窗口决定；错误状态通过固定页锁定缓冲区回传。
 
-   `block_ranker.hpp`、`block_ranker.cu` 提供提交、收取、快照及失败排空；`attention.hpp`、`attention.cpp` 管理待收取的层和位置；`session.hpp`、`session.cpp` 传播错误并完成会话收尾；`llama_adapter.cpp`、`ggml_prefetch.hpp`、`ggml_prefetch.cpp` 将异步入口限定到 SolidAttention 的同步复用调度。`cuda_prefill_test.cpp` 在提交后立即覆盖原 K/V 和分数缓冲，再与 CPU 参考核对代表位置和发布边界。
+   稀疏基线及其他调度模式沿用原版 InfLLM 的计算队列顺序：`llama_adapter.cpp` 取得本层 CUDA 计算队列，把代表更新排在后续 attention 结果节点和 FFN 之前；提交后返回 CPU，由下一次检索前沿收取回执。同队列更新直接读取借用的 K/V 和近期分数，省去独立输入快照及每层额外的 CPU 流同步。GPU 仍按代表更新、后续计算的顺序执行。会话和索引转发 `on_compute` 队列约定；ranker 销毁或失败排空时收取在途事件后释放缓冲。[llama_adapter.cpp](../src/llama_adapter.cpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.hpp](../include/solid/session.hpp)、[session.cpp](../src/session.cpp)。
+
+   `cuda_prefill_test.cpp` 同时运行显式诊断索引和正常 GPU 索引，核对 96-token Prefill、逐 token Decode、代表值、发布边界及最终检索，检查正常索引的主机占用保持固定。门闩用例阻止 GPU 计算队列前进，要求同队列提交在门闩释放前返回；随后立即覆盖输入，核对代表与检索结果。原版 5 组、172 帧、101 个完整块、15 次检索对照和 54 项 CPU 检查通过。
 
 5. **统一内存和复制队列**
 

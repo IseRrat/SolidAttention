@@ -41,7 +41,8 @@ public:
                                 const std::vector<Half> & kv, const std::vector<float> & key_scores);
     bool device_probabilities() const { return device_probabilities_; }
     void observe_device_probabilities(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
-                                     DeviceKvBatch kv, DeviceQuery scores, bool key_major, void * compute_stream = nullptr);
+                                     DeviceKvBatch kv, DeviceQuery scores, bool key_major, void * compute_stream = nullptr,
+                                     bool on_compute = false);
     void finish_device_probabilities();
     void observe_prefill_device_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
         DeviceKvBatch kv, DeviceQuery scores);
@@ -88,6 +89,7 @@ private:
     std::vector<std::uint64_t> probability_lengths_;
     std::unique_ptr<BlockRanker> ranker_;
     bool device_probabilities_ = false;
+    bool device_only_representatives_ = false;
     struct ProbabilityReceipt { std::uint32_t layer; std::uint64_t end; };
     std::optional<ProbabilityReceipt> pending_probability_;
     void accept_probability_blocks(std::uint32_t layer, const std::vector<BuiltRepresentatives> & built);
@@ -97,6 +99,7 @@ private:
     void release_published_keys(std::uint32_t layer, std::uint64_t block);
     void finalize_before(std::uint32_t layer, std::uint64_t first, double divisor);
     std::size_t index(std::uint32_t layer, std::uint32_t head) const;
+    Block & host_block(std::uint32_t layer, std::uint32_t head, std::uint64_t block);
     double infllm_shared_score(std::uint32_t layer, std::uint64_t block, const std::vector<float> & query) const;
     std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const std::vector<float> * query,
                                                      const DeviceQuery * device, const BlockCandidates & candidates,

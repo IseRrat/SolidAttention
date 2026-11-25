@@ -185,11 +185,18 @@ void probability_representatives(int device) {
     solid::RepresentativeIndex reference(geometry, 2, budget);
     auto scoring_geometry = geometry;
     scoring_geometry.heads = 2;
-    auto ranker = solid::make_cuda_block_ranker(scoring_geometry, 2, 1, budget.total, device, 0, 1);
+    auto ranker = solid::make_cuda_block_ranker(scoring_geometry, 2, 1, budget.total, device, 0, 1, true);
     test_tiled::require(ranker->configure_probability_builder(budget.initial, budget.local, budget.representatives),
                         "probability builder configuration");
     solid::RepresentativeIndex observed(geometry, 2, budget);
     observed.set_ranker(std::move(ranker));
+    auto production_ranker = solid::make_cuda_block_ranker(scoring_geometry, 2, 1, budget.total, device, 0, 1);
+    test_tiled::require(production_ranker->configure_probability_builder(budget.initial, budget.local, budget.representatives) &&
+        !production_ranker->host_representative_metadata(), "production representative diagnostics were enabled");
+    solid::RepresentativeIndex production(geometry, 2, budget);
+    production.set_ranker(std::move(production_ranker));
+    const auto fixed_host_bytes = production.resident_bytes();
+    std::uint64_t checked_means = 0;
     cudaStream_t queue = nullptr;
     cuda_check(cudaStreamCreateWithFlags(&queue, cudaStreamNonBlocking));
     std::unique_ptr<std::remove_pointer_t<cudaStream_t>, decltype(&cudaStreamDestroy)> compute(queue, cudaStreamDestroy);
@@ -226,27 +233,65 @@ void probability_representatives(int device) {
         upload_ready(device_scores.get(), scores.data(), scores.size());
         const solid::DeviceKvBatch current{device_kv.get(), kv.size(), solid::DeviceMemory::cuda};
         const solid::DeviceQuery probabilities{device_scores.get(), scores.size(), solid::DeviceMemory::cuda};
-        if (count != 1) observed.observe_prefill_device_scores(0, first, count, current, probabilities);
+        if (count != 1) {
+            observed.observe_prefill_device_scores(0, first, count, current, probabilities);
+            production.observe_prefill_device_scores(0, first, count, current, probabilities);
+        }
         else {
             observed.begin_probability_query(0, first);
+            production.begin_probability_query(0, first);
             observed.append_keys(0, first, {kv.begin(), kv.begin() + 64});
+            production.append_keys(0, first, {kv.begin(), kv.begin() + 64});
             observed.observe_device_probabilities(0, first, count, current, probabilities, false, compute.get());
+            if (first == 768) {
+                std::promise<void> release;
+                auto gate = release.get_future().share();
+                cuda_check(cudaLaunchHostFunc(compute.get(), [](void * value) {
+                    static_cast<std::shared_future<void> *>(value)->wait();
+                }, &gate));
+                auto submission = std::async(std::launch::async, [&] {
+                    production.observe_device_probabilities(0, first, count, current, probabilities, false, compute.get(), true);
+                });
+                const bool returned = submission.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+                release.set_value();
+                submission.get();
+                test_tiled::require(returned, "upstream compute-queue probability update waited on the host");
+            } else production.observe_device_probabilities(0, first, count, current, probabilities, false, compute.get(), true);
             // The next graph nodes may immediately reuse both borrowed inputs.
             cuda_check(cudaMemsetAsync(device_kv.get(), 0xff, kv.size() * sizeof(solid::Half), compute.get()));
             cuda_check(cudaMemsetAsync(device_scores.get(), 0xff, scores.size() * sizeof(float), compute.get()));
             cuda_check(cudaStreamSynchronize(compute.get()));
             observed.finish_device_probabilities();
+            production.finish_device_probabilities();
         }
         for (std::uint64_t block = 0; block < geometry.blocks_per_head(); ++block) {
             test_tiled::require(observed.ready(0, block) == reference.ready(0, block), "GPU representative publication boundary");
+            test_tiled::require(production.ready(0, block) == reference.ready(0, block), "production representative publication boundary");
             if (!reference.ready(0, block)) continue;
             for (std::uint32_t h = 0; h < 2; ++h) {
                 test_tiled::require(reference.representative_positions(0, h, block) == observed.representative_positions(0, h, block),
                                     "GPU probability representatives differ from InfLLM reference");
+                if (block >= checked_means) for (const auto d : {0u, 31u, 63u}) {
+                    std::vector<float> unit(128, 0);
+                    unit[h * 64 + d] = 1;
+                    test_tiled::require(production.score(0, h, block, unit) == observed.score(0, h, block, unit),
+                        "production bank mean differs from the audited representative");
+                }
             }
         }
+        checked_means = production.complete_blocks(0);
+        const solid::BlockCandidates request{{}, {}, 64, true, checked_means, geometry.block_tokens};
+        const std::vector<float> query(128, .125f);
+        test_tiled::require(production.rank_blocks(0, query, request) == observed.rank_blocks(0, query, request),
+            "production-only representative storage changed retrieval");
+        test_tiled::require(production.resident_bytes() == fixed_host_bytes,
+            "production accumulated per-block host representative metadata");
         first = end;
     }
+    bool rejects_positions = false;
+    try { (void) production.representative_positions(0, 0, 0); }
+    catch (const std::logic_error &) { rejects_positions = true; }
+    test_tiled::require(rejects_positions, "production exposed disabled representative diagnostics");
 }
 }
 
@@ -270,7 +315,7 @@ int main(int argc,char ** argv) {
             fixture_mean = solid::make_cuda_tiled_prefill(geometry, heads, budget.prefill_group_tokens(),
                 geometry.capacity_tokens, device, budget.local);
             geometry.heads = heads;
-            auto ranker = solid::make_cuda_block_ranker(geometry, heads, 1, budget.total, device, 0, kv_heads);
+            auto ranker = solid::make_cuda_block_ranker(geometry, heads, 1, budget.total, device, 0, kv_heads, true);
             test_infllm::require(ranker->configure_probability_builder(budget.initial, budget.local, budget.representatives),
                 "upstream fixture probability builder configuration");
             index.set_ranker(std::move(ranker));

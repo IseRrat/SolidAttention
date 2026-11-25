@@ -77,11 +77,16 @@ RepresentativeIndex::RepresentativeIndex(KvGeometry geometry, std::uint32_t quer
     if (query_heads == 0 || query_heads % geometry.heads != 0) throw std::invalid_argument("invalid GQA head mapping");
     if (budget_.shared_heads) geometry_.heads = query_heads_;
     blocks_.resize(static_cast<std::size_t>(geometry_.layers) * geometry_.heads);
-    for (auto & blocks : blocks_) blocks.resize(geometry.blocks_per_head());
 }
 std::size_t RepresentativeIndex::index(std::uint32_t layer, std::uint32_t head) const {
     if (layer >= geometry_.layers || head >= geometry_.heads) throw std::out_of_range("representative identity");
     return static_cast<std::size_t>(layer) * geometry_.heads + head;
+}
+RepresentativeIndex::Block & RepresentativeIndex::host_block(std::uint32_t layer, std::uint32_t head, std::uint64_t block) {
+    if (device_only_representatives_ || block >= geometry_.blocks_per_head()) throw std::out_of_range("host representative block");
+    auto & blocks = blocks_.at(index(layer, head));
+    if (blocks.size() <= block) blocks.resize(block + 1);
+    return blocks[block];
 }
 void RepresentativeIndex::observe(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                   const std::vector<Half> & keys) {
@@ -138,7 +143,7 @@ void RepresentativeIndex::finalize_before(std::uint32_t layer, std::uint64_t fir
     while (!pending.empty() && pending.front().position < first_position) {
         auto & token = pending.front();
         for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
-            auto & block = blocks_[index(layer, head)].at((token.position - origin) / geometry_.block_tokens);
+            auto & block = host_block(layer, head, (token.position - origin) / geometry_.block_tokens);
             Representative representative{token.position, token.scores[head] / divisor, {}};
             const auto first = token.keys.begin() + (head / key_group) * geometry_.dimension;
             representative.key.assign(first, first + geometry_.dimension);
@@ -150,7 +155,7 @@ void RepresentativeIndex::finalize_before(std::uint32_t layer, std::uint64_t fir
             ++block.finalized;
         }
         const auto block = (token.position - origin) / geometry_.block_tokens;
-        if (ready(layer, block)) {
+        if (blocks_[index(layer, 0)][block].finalized == geometry_.block_tokens) {
             if (block != complete_blocks_[layer]) throw std::logic_error("representative completion has a gap");
             ++complete_blocks_[layer];
             if (ranker_) {
@@ -165,7 +170,7 @@ void RepresentativeIndex::observe_probabilities(std::uint32_t layer, std::uint64
                                                   const std::vector<float> & probabilities) {
     const auto count = std::min<std::uint64_t>(position + 1, budget_.local);
     const auto first = position + 1 - count;
-    if (!budget_.infllm_attention || lengths_.at(layer) != position + 1 || probability_lengths_[layer] != position ||
+    if (!budget_.infllm_attention || device_probabilities_ || lengths_.at(layer) != position + 1 || probability_lengths_[layer] != position ||
         probabilities.size() != count * query_heads_) throw std::invalid_argument("representative probability frame");
     for (const auto probability : probabilities) {
         if (!std::isfinite(probability) || probability < 0 || probability > 1) {
@@ -196,7 +201,7 @@ void RepresentativeIndex::append_keys(std::uint32_t layer, std::uint64_t positio
 void RepresentativeIndex::observe_prefill_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
                                                 const std::vector<Half> & kv, const std::vector<float> & key_scores) {
     const auto width = static_cast<std::size_t>(kv_heads_) * geometry_.dimension;
-    if (!budget_.infllm_attention || !count || count > budget_.prefill_group_tokens() || first != lengths_.at(layer) ||
+    if (!budget_.infllm_attention || device_probabilities_ || !count || count > budget_.prefill_group_tokens() || first != lengths_.at(layer) ||
         probability_lengths_[layer] != first || query_pending_[layer] ||
         first >= geometry_.capacity_tokens || count > geometry_.capacity_tokens - first ||
         kv.size() != count * 2 * width) {
@@ -295,16 +300,19 @@ void RepresentativeIndex::observe_batch_device(std::uint32_t layer,std::uint64_t
     lengths_[layer] = end;
 }
 bool RepresentativeIndex::ready(std::uint32_t layer, std::uint64_t block) const {
-    return blocks_.at(index(layer, 0)).at(block).finalized == geometry_.block_tokens;
+    if (block >= geometry_.blocks_per_head()) throw std::out_of_range("representative block");
+    return block < complete_blocks_.at(layer);
 }
 double RepresentativeIndex::score(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
                                   const std::vector<float> & query) const {
     if (query.size() != static_cast<std::size_t>(query_heads_) * geometry_.dimension || !ready(layer, block)) {
         throw std::invalid_argument("block representative is not ready or query has wrong shape");
     }
-    const auto & tokens = blocks_.at(index(layer, head)).at(block).tokens;
+    const auto slot = index(layer, head);
+    static const std::vector<Representative> empty;
+    const auto & tokens = device_only_representatives_ ? empty : blocks_.at(slot).at(block).tokens;
     std::vector<Half> device_keys;
-    if (std::any_of(tokens.begin(), tokens.end(), [](const auto & token) { return token.key.empty(); })) {
+    if (device_only_representatives_ || std::any_of(tokens.begin(), tokens.end(), [](const auto & token) { return token.key.empty(); })) {
         if (!ranker_ || !ranker_->owns_representative_keys()) throw std::logic_error("representative key owner is missing");
         device_keys = ranker_->read_representatives(layer, block);
         const auto elements = static_cast<std::size_t>(geometry_.heads) *
@@ -396,7 +404,7 @@ void RepresentativeIndex::set_ranker(std::unique_ptr<BlockRanker> ranker) {
         const auto length = lengths_[layer] - std::min(lengths_[layer], history_start());
         const auto matured = length - std::min<std::uint64_t>(length, budget_.local);
         for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
-            auto & partial = blocks_[index(layer, head)].at(matured/geometry_.block_tokens);
+            auto & partial = host_block(layer, head, matured/geometry_.block_tokens);
             partial.tokens.clear(); partial.finalized = 0;
         }
     }
@@ -405,10 +413,14 @@ void RepresentativeIndex::set_ranker(std::unique_ptr<BlockRanker> ranker) {
             release_published_keys(layer, block);
         }
     }
+    device_only_representatives_ = device_probabilities_ && !ranker_->host_representative_metadata();
+    if (device_only_representatives_) std::vector<std::vector<Block>>().swap(blocks_);
+    if (device_probabilities_) std::vector<std::deque<Pending>>().swap(pending_);
 }
 void RepresentativeIndex::observe_device_probabilities(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
-    DeviceKvBatch kv, DeviceQuery scores, bool key_major, void * compute_stream) {
+    DeviceKvBatch kv, DeviceQuery scores, bool key_major, void * compute_stream, bool on_compute) {
     if (pending_probability_) throw std::logic_error("previous device probability receipt is pending");
+    if (on_compute && !compute_stream) throw std::invalid_argument("probability compute queue is missing");
     if (!device_probabilities_ || !count || probability_lengths_.at(layer) != first ||
         query_pending_.at(layer) || lengths_.at(layer) != first + count) {
         throw std::logic_error("device probability receipt has no matching appended keys");
@@ -416,7 +428,7 @@ void RepresentativeIndex::observe_device_probabilities(std::uint32_t layer, std:
     const auto origin = first + 1 - std::min<std::uint64_t>(first + 1, budget_.local);
     const ProbabilityFrame frame{layer, first, count, origin, kv, scores, key_major};
     if (compute_stream) {
-        ranker_->submit_probability_update(frame, compute_stream);
+        ranker_->submit_probability_update(frame, compute_stream, on_compute);
         pending_probability_ = ProbabilityReceipt{layer, first + count};
         return;
     }
@@ -433,10 +445,17 @@ void RepresentativeIndex::finish_device_probabilities() {
 void RepresentativeIndex::accept_probability_blocks(std::uint32_t layer, const std::vector<BuiltRepresentatives> & built) {
     for (const auto & item : built) {
         if (item.block != complete_blocks_.at(layer)) throw std::runtime_error("device representative completion has a gap");
+        if (device_only_representatives_) {
+            if (!item.keys.empty() || !item.positions.empty() || !item.scores.empty()) {
+                throw std::runtime_error("unexpected host representative payload");
+            }
+            ++complete_blocks_[layer];
+            continue;
+        }
         if (item.positions.size() != static_cast<std::size_t>(geometry_.heads) * budget_.representatives ||
             item.scores.size() != item.positions.size()) throw std::runtime_error("device representative metadata shape");
         for (std::uint32_t h = 0; h < geometry_.heads; ++h) {
-            auto & block = blocks_[index(layer, h)].at(item.block);
+            auto & block = host_block(layer, h, item.block);
             if (block.finalized) throw std::runtime_error("device representative block repeated");
             for (std::uint32_t r = 0; r < budget_.representatives; ++r) {
                 const auto i = static_cast<std::size_t>(h) * budget_.representatives + r;
@@ -481,7 +500,9 @@ RepresentativeSeed RepresentativeIndex::builder_seed(std::uint32_t layer) const 
     seed.partial_keys.assign(count*geometry_.dimension, 0);
     const auto matured = seed.length - std::min<std::uint64_t>(seed.length, budget_.local);
     for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
-        const auto & block = blocks_[index(layer, head)].at(matured/geometry_.block_tokens);
+        const auto & blocks = blocks_[index(layer, head)];
+        if (matured/geometry_.block_tokens >= blocks.size()) continue;
+        const auto & block = blocks[matured/geometry_.block_tokens];
         for (std::size_t r = 0; r < block.tokens.size(); ++r) {
             const auto offset = static_cast<std::size_t>(head)*budget_.representatives+r;
             seed.partial_positions[offset] = block.tokens[r].position - history_start();
@@ -515,7 +536,7 @@ void RepresentativeIndex::accept_built(std::uint32_t layer, std::uint64_t positi
         }
     }
     for (std::uint32_t head = 0; head < geometry_.heads; ++head) {
-        auto & target = blocks_[index(layer, head)].at(block);
+        auto & target = host_block(layer, head, block);
         if (target.finalized == geometry_.block_tokens) throw std::runtime_error("representative builder repeated a complete block");
         target.tokens.clear();
         for (std::uint32_t r = 0; r < budget_.representatives; ++r) {
@@ -669,12 +690,18 @@ double RepresentativeIndex::infllm_shared_score(std::uint32_t layer, std::uint64
     return value;
 }
 std::vector<std::uint64_t> RepresentativeIndex::representative_positions(std::uint32_t layer, std::uint32_t head, std::uint64_t block) const {
+    if (device_only_representatives_) throw std::logic_error("representative position diagnostics are disabled");
+    if (block >= geometry_.blocks_per_head()) throw std::out_of_range("representative block");
     std::vector<std::uint64_t> result;
-    for (const auto & token : blocks_.at(index(layer, head)).at(block).tokens) result.push_back(token.position);
+    const auto & blocks = blocks_.at(index(layer, head));
+    if (block < blocks.size()) for (const auto & token : blocks[block].tokens) result.push_back(token.position);
     return result;
 }
 std::uint64_t RepresentativeIndex::resident_bytes() const {
-    std::uint64_t total = (lengths_.capacity() + complete_blocks_.capacity()) * sizeof(std::uint64_t) + (query_pending_.capacity() + 7) / 8;
+    std::uint64_t total = blocks_.capacity() * sizeof(std::vector<Block>) +
+        pending_.capacity() * sizeof(std::deque<Pending>) +
+        (lengths_.capacity() + complete_blocks_.capacity() + probability_lengths_.capacity()) * sizeof(std::uint64_t) +
+        (query_pending_.capacity() + 7) / 8;
     for (const auto & blocks : blocks_) {
         total += blocks.capacity() * sizeof(Block);
         for (const auto & block : blocks) {

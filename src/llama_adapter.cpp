@@ -358,6 +358,7 @@ struct AttentionNode::Impl {
     bool packed_inputs = false;
     std::optional<DeviceMemory> direct = {};
     std::optional<DeviceMemory> selected_device = {};
+    void * probability_stream = nullptr;
     ggml_tensor * device_query = nullptr;
     ggml_tensor * device_kv = nullptr;
     ggml_tensor * device_scores = nullptr;
@@ -429,10 +430,12 @@ struct AttentionNode::Impl {
                 if (!self.device_kv || !self.device_scores) throw std::logic_error("device probability inputs missing");
                 if (self.prefetch) self.prefetch->completed(self.epoch);
                 if (self.sparse_lookahead) self.sparse_lookahead->completed(self.layer, position);
+                auto * overlap_stream = self.prefetch ? self.prefetch->probability_compute_stream() : nullptr;
+                auto * probability_stream = overlap_stream ? overlap_stream : self.probability_stream;
                 self.session.observe_device_probabilities(self.layer, position,
                     {static_cast<const Half *>(self.device_kv->data), static_cast<std::size_t>(ggml_nelements(self.device_kv)), DeviceMemory::cuda},
                     {static_cast<const float *>(self.device_scores->data), static_cast<std::size_t>(ggml_nelements(self.device_scores)), DeviceMemory::cuda},
-                    self.prefetch ? self.prefetch->probability_compute_stream() : nullptr);
+                    probability_stream, !overlap_stream && probability_stream);
                 *static_cast<float *>(destination->data) = 0;
                 return;
             }
@@ -655,6 +658,11 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
                                   ggml_tensor * packed_kv, ggml_backend_sched * scheduler, ggml_backend * decode_backend,
                                   ggml_cgraph * graph) {
     const auto & g = impl_->session.geometry();
+#ifdef SOLID_HAVE_CUDA_SELECTION
+    if (impl_->session.device_probabilities() && decode_backend && ggml_backend_is_cuda(decode_backend)) {
+        impl_->probability_stream = solid_cuda_queue(decode_backend);
+    }
+#endif
     if (!std::isfinite(impl_->scale) || impl_->scale <= 0) throw std::invalid_argument("invalid attention scale");
     if (impl_->gathered && impl_->session.gather_elements() > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max()) / sizeof(Half)) {
         throw std::overflow_error("gather allocation exceeds backend limits");

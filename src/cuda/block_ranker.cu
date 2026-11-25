@@ -282,7 +282,7 @@ __global__ void probability_block_topk(const Half * scores, std::uint64_t * posi
     if (threadIdx.x < representatives) {
         const auto result = static_cast<std::uint64_t>(blockIdx.x) * representatives + threadIdx.x;
         positions[result] = first + index[0];
-        result_scores[result] = value[0];
+        if (result_scores) result_scores[result] = value[0];
     }
 }
 
@@ -312,7 +312,7 @@ __global__ void probability_large_block_topk(const Half * scores, std::uint64_t 
             previous = winner;
             const auto result = static_cast<std::uint64_t>(blockIdx.x) * representatives + rank;
             positions[result] = winner.block;
-            result_scores[result] = winner.score;
+            if (result_scores) result_scores[result] = winner.score;
         }
         __syncthreads();
     }
@@ -356,9 +356,9 @@ class CudaBlockRanker final : public BlockRanker {
     };
 public:
     CudaBlockRanker(KvGeometry geometry, std::uint32_t query_heads, std::uint32_t representatives,
-                    std::uint32_t budget, int device, std::uint32_t local, std::uint32_t input_heads) :
+                    std::uint32_t budget, int device, std::uint32_t local, std::uint32_t input_heads, bool representative_diagnostics) :
         geometry_(geometry), query_heads_(query_heads), representatives_(representatives), budget_(budget), local_(local),
-        input_heads_(input_heads ? input_heads : geometry.heads), device_(device) {
+        input_heads_(input_heads ? input_heads : geometry.heads), device_(device), representative_diagnostics_(representative_diagnostics) {
         geometry_.validate();
         if (!query_heads || query_heads % geometry.heads || !representatives || representatives > geometry.block_tokens ||
             geometry.heads % input_heads_ || !budget || budget > geometry.capacity_tokens || local > budget || device < 0)
@@ -448,9 +448,10 @@ public:
         const auto before = stats_.device_bytes;
         const auto blocks = (group_tokens + geometry_.block_tokens - 1) / geometry_.block_tokens + 1;
         try {
+            checked(cudaEventCreateWithFlags(&probability_done_, cudaEventDisableTiming), "create probability completion event");
             allocate(built_positions_, product(product(blocks, geometry_.heads), representatives * sizeof(std::uint64_t)));
-            allocate(built_scores_, product(product(blocks, geometry_.heads), representatives * sizeof(double)));
-            const auto slots = product(product(blocks, geometry_.heads), probability_top_);
+            if (representative_diagnostics_) allocate(built_scores_, product(product(blocks, geometry_.heads), representatives * sizeof(double)));
+            const auto slots = representative_diagnostics_ ? product(product(blocks, geometry_.heads), probability_top_) : 0;
             const auto bytes = slots * (sizeof(std::uint64_t) + sizeof(double)) + sizeof(int);
             checked(cudaHostAlloc(&probability_host_, bytes, cudaHostAllocDefault), "allocate pinned probability receipt");
             stats_.host_bytes += bytes;
@@ -462,12 +463,13 @@ public:
         return true;
     }
     bool device_probabilities() const override { return probability_local_ != 0; }
+    bool host_representative_metadata() const override { return !probability_local_ || representative_diagnostics_; }
     std::vector<BuiltRepresentatives> probability_update(const ProbabilityFrame & frame) override {
         return probability_update_impl(frame, nullptr);
     }
-    void submit_probability_update(const ProbabilityFrame & frame, void * compute_stream) override {
+    void submit_probability_update(const ProbabilityFrame & frame, void * compute_stream, bool on_compute) override {
         if (!compute_stream || frame.count != 1) throw std::invalid_argument("asynchronous probability update requires one decode token and its compute queue");
-        (void) probability_update_impl(frame, compute_stream);
+        (void) probability_update_impl(frame, compute_stream, on_compute);
     }
     std::vector<BuiltRepresentatives> finish_probability_update() override {
         check();
@@ -481,7 +483,7 @@ public:
             return result;
         } catch (...) { fail(); throw; }
     }
-    std::vector<BuiltRepresentatives> probability_update_impl(ProbabilityFrame frame, void * compute_stream) {
+    std::vector<BuiltRepresentatives> probability_update_impl(ProbabilityFrame frame, void * compute_stream, bool on_compute = false) {
         check();
         if (probability_pending_) throw std::logic_error("previous probability receipt must be collected");
         if (!probability_local_ || frame.layer >= geometry_.layers || !frame.count || frame.count > std::min(512u, probability_local_) ||
@@ -495,6 +497,7 @@ public:
         validate_pointer(frame.kv.data);
         validate_pointer(frame.scores.data);
         DeviceScope scope(device_);
+        const auto queue = on_compute ? static_cast<cudaStream_t>(compute_stream) : stream_;
         auto & state = probability_states_[frame.layer];
         const auto mature_end = std::max<std::uint64_t>(probability_initial_, end - std::min<std::uint64_t>(end, probability_local_));
         const auto first_block = published_[frame.layer];
@@ -506,45 +509,47 @@ public:
                 const auto before = stats_.device_bytes;
                 allocate(state.keys, product(product(probability_capacity_, input_heads_), geometry_.dimension * sizeof(Half)));
                 allocate(state.scores, product(product(probability_capacity_, geometry_.heads), sizeof(Half)));
-                checked(cudaMemsetAsync(state.scores, 0, product(product(probability_capacity_, geometry_.heads), sizeof(Half)), stream_), "initialize probability scores");
+                checked(cudaMemsetAsync(state.scores, 0, product(product(probability_capacity_, geometry_.heads), sizeof(Half)), queue), "initialize probability scores");
                 stats_.builder_device_bytes += stats_.device_bytes - before;
             }
             if (!banks_[frame.layer]) allocate(banks_[frame.layer], layer_bytes_);
-            if (compute_stream) capture_probability_inputs(frame, static_cast<cudaStream_t>(compute_stream));
-            checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear probability status");
+            if (compute_stream && !on_compute) capture_probability_inputs(frame, static_cast<cudaStream_t>(compute_stream));
+            checked(cudaMemsetAsync(error_device_, 0, sizeof(int), queue), "clear probability status");
             const auto key_items = product(product(frame.count, input_heads_), geometry_.dimension);
             const auto score_items = product(end - origin, geometry_.heads);
             const auto key_grid = static_cast<unsigned>(std::min<std::size_t>((key_items + 255) / 256, 256));
             const auto score_grid = static_cast<unsigned>(std::min<std::size_t>((score_items + 255) / 256, 256));
-            probability_append_keys<<<key_grid, 256, 0, stream_>>>(frame.kv.data, state.keys, state.scores, error_device_,
+            probability_append_keys<<<key_grid, 256, 0, queue>>>(frame.kv.data, state.keys, state.scores, error_device_,
                 frame.first, frame.count, probability_capacity_, input_heads_, geometry_.heads, geometry_.dimension);
             checked(cudaGetLastError(), "append probability keys");
-            probability_add_scores<<<score_grid, 256, 0, stream_>>>(frame.scores.data, state.scores, error_device_,
+            probability_add_scores<<<score_grid, 256, 0, queue>>>(frame.scores.data, state.scores, error_device_,
                 origin, static_cast<std::uint32_t>(end - origin), geometry_.heads, probability_capacity_, frame.key_major);
             checked(cudaGetLastError(), "accumulate probability scores");
             if (metadata) {
                 const auto grid = static_cast<unsigned>((block_end - first_block) * geometry_.heads);
                 if (geometry_.block_tokens <= 128) {
-                    probability_block_topk<<<grid, 128, 0, stream_>>>(state.scores, built_positions_, built_scores_,
+                    probability_block_topk<<<grid, 128, 0, queue>>>(state.scores, built_positions_, built_scores_,
                         first_block, probability_initial_, probability_capacity_, geometry_.heads, probability_top_, geometry_.block_tokens);
                 } else {
-                    probability_large_block_topk<<<grid, 128, 0, stream_>>>(state.scores, built_positions_, built_scores_,
+                    probability_large_block_topk<<<grid, 128, 0, queue>>>(state.scores, built_positions_, built_scores_,
                         first_block, probability_initial_, probability_capacity_, geometry_.heads, probability_top_, geometry_.block_tokens);
                 }
                 checked(cudaGetLastError(), "select probability block representatives");
-                probability_gather_mean<<<grid, 128, 0, stream_>>>(state.keys, built_positions_, static_cast<Half *>(banks_[frame.layer]),
+                probability_gather_mean<<<grid, 128, 0, queue>>>(state.keys, built_positions_, static_cast<Half *>(banks_[frame.layer]),
                     first_block, probability_capacity_, geometry_.heads, input_heads_, geometry_.dimension, probability_top_);
                 checked(cudaGetLastError(), "gather and average probability representatives");
-                checked(cudaMemcpyAsync(probability_host_positions_, built_positions_, metadata * sizeof(std::uint64_t), cudaMemcpyDeviceToHost, stream_), "download representative positions");
-                checked(cudaMemcpyAsync(probability_host_scores_, built_scores_, metadata * sizeof(double), cudaMemcpyDeviceToHost, stream_), "download representative scores");
+                if (representative_diagnostics_) {
+                    checked(cudaMemcpyAsync(probability_host_positions_, built_positions_, metadata * sizeof(std::uint64_t), cudaMemcpyDeviceToHost, queue), "download representative positions");
+                    checked(cudaMemcpyAsync(probability_host_scores_, built_scores_, metadata * sizeof(double), cudaMemcpyDeviceToHost, queue), "download representative scores");
+                }
             }
-            checked(cudaMemcpyAsync(probability_host_error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, stream_), "download probability status");
+            checked(cudaMemcpyAsync(probability_host_error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, queue), "download probability status");
             if (compute_stream) {
-                checked(cudaEventRecord(probability_done_, stream_), "record probability completion");
+                checked(cudaEventRecord(probability_done_, queue), "record probability completion");
                 probability_pending_ = receipt;
                 return {};
             }
-            checked(cudaStreamSynchronize(stream_), "complete probability receipt");
+            checked(cudaStreamSynchronize(queue), "complete probability receipt");
             if (*probability_host_error_) throw std::runtime_error("non-finite probability keys or scores");
         } catch (...) {
             // A failed capture must drain borrowed sources as well as the
@@ -560,8 +565,10 @@ public:
         const auto stride = static_cast<std::size_t>(geometry_.heads) * probability_top_;
         for (std::size_t i = 0; i < result.size(); ++i) {
             result[i].block = receipt.first_block + i;
-            result[i].positions.assign(positions + i * stride, positions + (i + 1) * stride);
-            result[i].scores.assign(scores + i * stride, scores + (i + 1) * stride);
+            if (representative_diagnostics_) {
+                result[i].positions.assign(positions + i * stride, positions + (i + 1) * stride);
+                result[i].scores.assign(scores + i * stride, scores + (i + 1) * stride);
+            }
         }
         published_[receipt.layer] = receipt.block_end;
         probability_lengths_[receipt.layer] = receipt.end;
@@ -989,7 +996,6 @@ private:
             allocate(probability_snapshot_scores_, product(product(probability_local_, geometry_.heads), sizeof(float)));
             stats_.builder_device_bytes += stats_.device_bytes - before;
             checked(cudaEventCreateWithFlags(&probability_captured_, cudaEventDisableTiming), "create probability input capture event");
-            checked(cudaEventCreateWithFlags(&probability_done_, cudaEventDisableTiming), "create probability completion event");
         }
         // These snapshots precede all subsequent graph work on compute. Once
         // they finish, the graph may overwrite its K/V and probability tensors.
@@ -1021,6 +1027,7 @@ private:
     }
     void fail() noexcept {
         failed_ = true;
+        if (probability_pending_ && probability_done_) (void) cudaEventSynchronize(probability_done_);
         if (stream_) (void) cudaStreamSynchronize(stream_);
         deferred_query_.reset();
         pending_rank_.reset();
@@ -1029,6 +1036,7 @@ private:
         int previous = 0;
         const bool restore = cudaGetDevice(&previous) == cudaSuccess;
         if (cudaSetDevice(device_) != cudaSuccess) return;
+        if (probability_pending_ && probability_done_) (void) cudaEventSynchronize(probability_done_);
         if (stream_) (void) cudaStreamSynchronize(stream_);
         for (auto * bank : banks_) if (bank) (void) cudaFree(bank);
         for (const auto & state : builders_) {
@@ -1103,6 +1111,7 @@ private:
     unsigned char * sort_temp_ = nullptr;
     std::size_t sort_temp_bytes_ = 0;
     bool shared_ranking_ = false;
+    bool representative_diagnostics_ = false;
     std::uint64_t * output_device_ = nullptr;
     int * error_device_ = nullptr;
     int error_ = 0;
@@ -1112,7 +1121,7 @@ private:
 } // namespace
 std::unique_ptr<BlockRanker> make_cuda_block_ranker(const KvGeometry & geometry, std::uint32_t query_heads,
                                                    std::uint32_t representatives, std::uint32_t budget, int device, std::uint32_t local,
-                                                   std::uint32_t input_heads) {
-    return std::make_unique<CudaBlockRanker>(geometry, query_heads, representatives, budget, device, local, input_heads);
+                                                   std::uint32_t input_heads, bool representative_diagnostics) {
+    return std::make_unique<CudaBlockRanker>(geometry, query_heads, representatives, budget, device, local, input_heads, representative_diagnostics);
 }
 } // namespace solid

@@ -264,9 +264,9 @@ void AttentionSession::observe_probabilities(std::uint32_t layer, std::uint64_t 
     catch (...) { failed_ = true; throw; }
 }
 void AttentionSession::observe_device_probabilities(std::uint32_t layer, std::uint64_t position, DeviceKvBatch kv, DeviceQuery scores,
-    void * compute_stream) {
+    void * compute_stream, bool on_compute) {
     if (failed_ || !rope_ || early_) throw std::logic_error("device probability receipt without an active query");
-    try { representatives_->observe_device_probabilities(layer, position, 1, kv, scores, false, compute_stream); }
+    try { representatives_->observe_device_probabilities(layer, position, 1, kv, scores, false, compute_stream, on_compute); }
     catch (...) { failed_ = true; throw; }
 }
 void AttentionSession::finish_device_probabilities() {
