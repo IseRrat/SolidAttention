@@ -58,6 +58,8 @@
 
    InfLLM 的候选范围使用连续代表表的块数及固定块长表达，对应原版 `VectorTensor.data[:length]`。`BlockCandidates` 提供这项范围表示；`RepresentativeIndex` 在完整块定稿时更新每层连续块数并检查顺序，Prefill 和 Decode 共用。CUDA 路径按数量校验就绪范围，省去 CPU 枚举、逐项核对全部候选及编号/成本表 H2D。评分 kernel 直接读取第 i 个代表，写入逻辑编号 i；CUB 排序后的前缀直接回传，省去输出清零及额外 D2D 前缀复制。CPU 参考读取同一候选范围，外接评分后端由统一入口展开列表，选块和预算规则一致。完整块计数纳入主机内存统计。[block_ranker.hpp](../include/solid/block_ranker.hpp)、[attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)。
 
+   `920f5a2` 的 8K、8 步 Decode 短核验中，两条稀疏路径各有 784 次 Prefill 评分和 224 次 Decode 评分。对照 `2d5232c`，评分队列的候选表 H2D 次数分别由 1,568、448 降为 0，GPU 内部前缀复制由 784、224 降为 0；编号、状态和代表回执的 D2H 次数与字节数保持一致。两条路径生成的 9 个 token 相同。稀疏基线 Prefill 为 1.394 秒、Decode 为 515.0 ms；SolidAttention 为 1.336 秒、348.9 ms，短测吞吐与上一提交接近。额外调试输出均关闭，保留 Nsight、8 GiB 显存和 16 GiB 主机内存限制及 Decode O_DIRECT。原始记录、时间线与评分队列搬运比较保存于 `results/server5090/nsys-infllm-8k-920f5a2.ipqpbcc7/`，逐阶段计数见 `bank-prefix-transfers.json`。
+
    `cuda_ranker_test.cpp` 用 31、513、4,096、8,192 个候选块，覆盖同分、正反评分、不同预算及等成本和变成本，与独立的稳定全排序结果核对，并检查持续选块无新增显存分配。等成本用例逐项核对连续代表表与显式列表结果；非法长度、块长、混用表示和非共享范围在提交前拒绝。`cuda_prefill_test.cpp` 核对范围表示的异步回执，并检查旧回执不能收取新的结果。服务器 CUDA 评分选块检查、15 组原版 InfLLM 检索对照及 54 项 CPU 检查通过。[block_ranker.cu](../src/cuda/block_ranker.cu)、[cuda_ranker_test.cpp](../tests/cuda_ranker_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
 
    [attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[block_ranker.hpp](../include/solid/block_ranker.hpp)。
