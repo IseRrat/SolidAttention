@@ -559,7 +559,8 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
     if (candidates.shared_heads && available <= candidates.remaining) {
         return ready(RankedBlocks(kv_heads_, candidates.blocks));
     }
-    const auto validate = [candidates, needed, heads = geometry_.heads, kv_heads = kv_heads_](RankedBlocks result) {
+    const auto validate = [](const BlockCandidates & candidates, std::uint64_t needed,
+                             std::uint32_t heads, std::uint32_t kv_heads, RankedBlocks result) {
         if (result.size() != heads) throw std::runtime_error("ranker returned wrong head count");
         for (const auto & head : result) {
             std::set<std::uint64_t> unique;
@@ -578,7 +579,10 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
     };
     if (device && completion) {
         auto pending = ranker_->submit_rank_device(layer, {*device, cuda_ready_event}, candidates);
-        *completion = [pending = std::move(pending), validate]() mutable { return validate(pending()); };
+        *completion = [pending = std::move(pending), validate, candidates, needed,
+                       heads = geometry_.heads, kv_heads = kv_heads_]() mutable {
+            return validate(candidates, needed, heads, kv_heads, pending());
+        };
         return {};
     }
     if (device) result = ranker_->rank_device_after_event(layer, {*device, cuda_ready_event}, candidates);
@@ -606,7 +610,7 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
         }
         if (candidates.shared_heads) std::fill(result.begin() + 1, result.end(), result.front());
     }
-    return validate(std::move(result));
+    return validate(candidates, needed, geometry_.heads, kv_heads_, std::move(result));
 }
 RankCompletion RepresentativeIndex::submit_rank_blocks(
     std::uint32_t layer, DeviceQuery query, const BlockCandidates & candidates) const {
@@ -691,7 +695,7 @@ template<class Query> static std::vector<HeadSelection> select_blocks_impl(const
             candidates.tokens.push_back(static_cast<std::uint32_t>(end - begin));
         }
     }
-    const auto assemble = [geometry, budget, initial_end, local_first, origin,
+    auto assemble = [geometry, budget, initial_end, local_first, origin,
                            deterministic = std::move(deterministic)](const RankedBlocks & ranked) {
         std::vector<HeadSelection> result(geometry.heads);
         for (std::uint32_t head = 0; head < geometry.heads; ++head) {
@@ -715,7 +719,7 @@ template<class Query> static std::vector<HeadSelection> select_blocks_impl(const
     if constexpr (std::is_same_v<Query, DeviceQuery>) {
         if (completion) {
             auto pending = representatives.submit_rank_blocks(layer, query, candidates);
-            *completion = [pending = std::move(pending), assemble]() mutable { return assemble(pending()); };
+            *completion = [pending = std::move(pending), assemble = std::move(assemble)]() mutable { return assemble(pending()); };
             return {};
         }
     }
