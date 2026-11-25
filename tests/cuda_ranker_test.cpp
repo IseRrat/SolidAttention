@@ -87,6 +87,47 @@ void run(int device,std::uint32_t dimension) {
     query[0] = std::numeric_limits<float>::quiet_NaN();
     rejects([&] { (void) ranker->rank(0, query, {{0},{1},1}); });
 }
+
+void shared_topk(int device) {
+    const solid::KvGeometry g{1, 4, 32, 32, 262144, 64};
+    constexpr std::uint32_t query_heads = 28, budget = 1024;
+    auto ranker = solid::make_cuda_block_ranker(g, query_heads, 1, budget, device);
+    const auto blocks = g.blocks_per_head();
+    std::vector<solid::Half> keys(blocks * g.heads * g.dimension, 0);
+    for (std::uint64_t b = 0; b < blocks; ++b) {
+        keys[b * g.heads * g.dimension] = solid::to_half(static_cast<float>(static_cast<int>((b * 37) % 4096) - 2048));
+    }
+    ranker->publish(0, 0, blocks, keys);
+    const auto bytes = ranker->stats().device_bytes;
+    std::vector<float> query(query_heads * g.dimension, 0);
+    for (const auto count : {31u, 513u, 4096u, 8192u}) for (const auto left : {1u, 37u, 512u, 1024u}) {
+        for (const auto sign : {-1.f, 0.f, 1.f}) for (const bool uniform : {false, true}) {
+            query[0] = sign;
+            solid::BlockCandidates candidates;
+            candidates.remaining = left;
+            candidates.shared_heads = true;
+            std::vector<std::pair<float,std::uint64_t>> scores;
+            for (std::uint64_t b = 0; b < count; ++b) {
+                candidates.blocks.push_back(b);
+                candidates.tokens.push_back(uniform ? g.block_tokens : b % g.block_tokens + 1);
+                scores.emplace_back(sign * solid::from_half(keys[b * g.heads * g.dimension]), b);
+            }
+            std::sort(scores.begin(), scores.end(), [](auto a, auto b) {
+                return a.first == b.first ? a.second < b.second : a.first > b.first;
+            });
+            std::vector<std::uint64_t> expected;
+            std::uint32_t covered = 0;
+            for (const auto & item : scores) {
+                if (covered >= left) break;
+                expected.push_back(item.second);
+                covered += candidates.tokens[item.second];
+            }
+            const auto selected = ranker->rank(0, query, candidates);
+            for (const auto & head : selected) require(head == expected, "shared CUB/fallback Top-K differs from stable full-sort oracle");
+            require(ranker->stats().device_bytes == bytes, "shared Top-K workspace grew during retrieval");
+        }
+    }
+}
 } // namespace
 int main(int argc, char ** argv) {
     // Device checks are opt-in and excluded from local CTest/check.sh runs.
@@ -98,6 +139,7 @@ int main(int argc, char ** argv) {
         if (argc > 3) throw std::invalid_argument("unexpected device-check argument");
         const auto device = argc == 3 ? std::stoi(argv[2]) : 0;
         for (const auto dimension:{7u,32u,33u,128u}) run(device,dimension);
+        shared_topk(device);
         test_builder::run_cases([&](auto geometry,auto query_heads,auto budget) {
             return solid::make_cuda_block_ranker(geometry,query_heads,budget.representatives,budget.total,device,budget.local);
         });

@@ -54,6 +54,10 @@
 
    CPU 的 `mean_infllm_query` 和共享块评分使用相同的 F32 输入与累加规则；`session.cpp` 的主机输入 Prefill 与 `tiled_prefill.cu` 的设备输入 Prefill 分别接入对应均值入口。InfLLM CUDA 结果中的 ranker 名称为 `cuda_infllm_fp32_topk`。原版 `calc_block_topk` 跟随模型张量类型，上游 `benchmark/pred.py` 加载 BF16 模型。真实模型核验在第 0 层、位置 1024 确认过：有限的 FP32 块分数压成 FP16 后溢出。评分入口已去掉这项额外转换，KV、代表 bank 和近期概率累计仍为 FP16。
 
+   共享选块且候选块 token 成本相同时，`block_ranker.cu` 复用上游 llama.cpp CUDA argsort 使用的 CUB `DeviceRadixSort::SortPairsDescending`，对完整跨头块分数排序后取足以覆盖预算的前缀。候选编号按递增顺序提交，稳定排序保留同分时较小编号优先的规则。排序输出和临时工作区按最大候选数一次分配，持续调用复用，释放时统一归还；显存统计包括这部分分配。逐头或不同 token 成本的兼容入口沿用既有预算归约。两条稀疏实验路径使用相同的 CUB 入口。
+
+   `cuda_ranker_test.cpp` 用 31、513、4,096、8,192 个候选块，覆盖同分、正反评分、不同预算及等成本和变成本，与独立的稳定全排序结果核对，并检查持续选块无新增显存分配。服务器 CUDA 评分选块检查及 15 组原版 InfLLM 检索对照通过。[block_ranker.cu](../src/cuda/block_ranker.cu)、[cuda_ranker_test.cpp](../tests/cuda_ranker_test.cpp)。
+
    [attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[block_ranker.hpp](../include/solid/block_ranker.hpp)。
 
    CUDA Prefill 的均值与排名之间采用设备事件衔接。`mean_sparse_query_async` 在 attention 队列生成 FP32 均值，记录完成事件，返回均值指针和事件；选块器在评分队列插入该事件依赖，随后执行块点积和 Top-K，在所选编号回传处收取结果。模型推理调用这条异步均值入口，省去均值阶段单独的 CPU 等待。输入 Q、均值缓冲和事件由生产者持有，覆盖排名使用期；候选直接全部采用时，后续同队列 attention 完成输入读取。`DeviceQueryWithEvent` 单独表达这项依赖，普通 `DeviceQuery` 继续要求输入已完成生产。同步均值接口按均值事件收取结果。

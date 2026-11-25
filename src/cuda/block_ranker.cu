@@ -6,6 +6,7 @@
 #include <cuda_fp16.h>
 #include <cub/block/block_radix_sort.cuh>
 #include <cub/block/block_reduce.cuh>
+#include <cub/device/device_radix_sort.cuh>
 #include <math_constants.h>
 #include <algorithm>
 #include <cmath>
@@ -382,6 +383,13 @@ public:
             allocate(ids_, product(geometry.blocks_per_head(), sizeof(std::uint64_t)));
             allocate(costs_, product(geometry.blocks_per_head(), sizeof(std::uint32_t)));
             allocate(scores_, product(product(geometry.heads, geometry.blocks_per_head()), sizeof(double)));
+            allocate(sorted_scores_, product(geometry.blocks_per_head(), sizeof(double)));
+            allocate(sorted_ids_, product(geometry.blocks_per_head(), sizeof(std::uint64_t)));
+            // The pinned llama.cpp CUDA argsort uses this CUB primitive for
+            // one row. Stable sorting also preserves our ascending-ID tie rule.
+            checked(cub::DeviceRadixSort::SortPairsDescending(nullptr, sort_temp_bytes_, scores_, sorted_scores_,
+                ids_, sorted_ids_, geometry.blocks_per_head(), 0, sizeof(double) * 8, stream_), "size shared block sort workspace");
+            allocate(sort_temp_, sort_temp_bytes_);
             allocate(output_device_, product(output_.size(), sizeof(std::uint64_t)));
             allocate(error_device_, sizeof(int));
             if (local_) {
@@ -878,8 +886,18 @@ public:
                     count, geometry_.heads, query_heads_ / geometry_.heads, representatives_, geometry_.dimension);
             }
             checked(cudaGetLastError(), "launch block relevance kernel");
-            select_top_blocks<<<lists, 256, 0, stream_>>>(scores_, ids_, costs_, output_device_, count, candidates.remaining, stride);
-            checked(cudaGetLastError(), "launch block top-k kernel");
+            const bool uniform_shared = candidates.shared_heads &&
+                std::all_of(candidates.tokens.begin(), candidates.tokens.end(),
+                    [smallest](std::uint32_t cost) { return cost == smallest; });
+            if (uniform_shared) {
+                auto workspace_bytes = sort_temp_bytes_;
+                checked(cub::DeviceRadixSort::SortPairsDescending(sort_temp_, workspace_bytes, scores_, sorted_scores_,
+                    ids_, sorted_ids_, static_cast<std::uint64_t>(count), 0, sizeof(double) * 8, stream_), "sort shared block relevance with CUB");
+                checked(cudaMemcpyAsync(output_device_, sorted_ids_, bytes, cudaMemcpyDeviceToDevice, stream_), "take shared block top-k prefix");
+            } else {
+                select_top_blocks<<<lists, 256, 0, stream_>>>(scores_, ids_, costs_, output_device_, count, candidates.remaining, stride);
+                checked(cudaGetLastError(), "launch block top-k kernel");
+            }
             checked(cudaMemcpyAsync(output_.data(), output_device_, bytes, cudaMemcpyDeviceToHost, stream_), "download selected block IDs");
             checked(cudaMemcpyAsync(&error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, stream_), "download rank status");
             checked(cudaStreamSynchronize(stream_), "complete CUDA block ranking");
@@ -975,6 +993,9 @@ private:
         if (ids_) (void) cudaFree(ids_);
         if (costs_) (void) cudaFree(costs_);
         if (scores_) (void) cudaFree(scores_);
+        if (sorted_scores_) (void) cudaFree(sorted_scores_);
+        if (sorted_ids_) (void) cudaFree(sorted_ids_);
+        if (sort_temp_) (void) cudaFree(sort_temp_);
         if (output_device_) (void) cudaFree(output_device_);
         if (error_device_) (void) cudaFree(error_device_);
         if (probability_snapshot_keys_) (void) cudaFree(probability_snapshot_keys_);
@@ -1012,6 +1033,10 @@ private:
     std::uint64_t * ids_ = nullptr;
     std::uint32_t * costs_ = nullptr;
     double * scores_ = nullptr;
+    double * sorted_scores_ = nullptr;
+    std::uint64_t * sorted_ids_ = nullptr;
+    unsigned char * sort_temp_ = nullptr;
+    std::size_t sort_temp_bytes_ = 0;
     bool shared_ranking_ = false;
     std::uint64_t * output_device_ = nullptr;
     int * error_device_ = nullptr;
