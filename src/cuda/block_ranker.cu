@@ -366,10 +366,10 @@ public:
         layer_bytes_ = product(product(geometry.blocks_per_head(), block_elements_), sizeof(Half));
         banks_.resize(geometry.layers, nullptr);
         published_.resize(geometry.layers, 0);
-        output_.resize(product(geometry.heads, budget));
+        output_capacity_ = product(geometry.heads, budget);
         if (local_) builders_.resize(geometry.layers);
         stats_.host_bytes = banks_.capacity() * sizeof(void *) + published_.capacity() * sizeof(std::uint64_t) +
-                            output_.capacity() * sizeof(std::uint64_t) + sizeof(error_) + builders_.capacity()*sizeof(BuilderState);
+                            sizeof(error_) + builders_.capacity()*sizeof(BuilderState);
         DeviceScope scope(device_);
         try {
             cudaDeviceProp properties{};
@@ -390,7 +390,16 @@ public:
             checked(cub::DeviceRadixSort::SortPairsDescending(nullptr, sort_temp_bytes_, scores_, sorted_scores_,
                 ids_, sorted_ids_, geometry.blocks_per_head(), 0, sizeof(double) * 8, stream_), "size shared block sort workspace");
             allocate(sort_temp_, sort_temp_bytes_);
-            allocate(output_device_, product(output_.size(), sizeof(std::uint64_t)));
+            allocate(output_device_, product(output_capacity_, sizeof(std::uint64_t)));
+            const auto candidates = geometry.blocks_per_head();
+            const auto host_bytes = product(output_capacity_ + candidates, sizeof(std::uint64_t)) +
+                product(candidates, sizeof(std::uint32_t)) + sizeof(int);
+            checked(cudaHostAlloc(&rank_host_, host_bytes, cudaHostAllocDefault), "allocate pinned rank metadata and receipt");
+            stats_.host_bytes += host_bytes;
+            output_host_ = static_cast<std::uint64_t *>(rank_host_);
+            ids_host_ = output_host_ + output_capacity_;
+            costs_host_ = reinterpret_cast<std::uint32_t *>(ids_host_ + candidates);
+            rank_error_ = reinterpret_cast<int *>(costs_host_ + candidates);
             allocate(error_device_, sizeof(int));
             if (local_) {
                 const auto before = stats_.device_bytes;
@@ -819,9 +828,23 @@ public:
         ++stats_.device_rank_queries;
         return result;
     }
+    RankCompletion submit_rank_device(std::uint32_t layer, DeviceQueryWithEvent input,
+                                     const BlockCandidates & candidates) override {
+        validate_device_query(input.query, DeviceMemory::cuda, query_heads_, geometry_.dimension);
+        validate_pointer(input.query.data);
+        (void) rank_impl(layer, input.query.data, candidates, true, input.cuda_ready_event, true);
+        ++stats_.device_rank_queries;
+        const auto ticket = rank_ticket_;
+        return [this, ticket] {
+            if (!pending_rank_ || ticket != rank_ticket_) throw std::logic_error("expired CUDA rank receipt");
+            return finish_rank();
+        };
+    }
     std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const float * query,
-                                                    const BlockCandidates & candidates, bool device, void * cuda_ready_event = nullptr) {
+                                                    const BlockCandidates & candidates, bool device, void * cuda_ready_event = nullptr,
+                                                    bool deferred = false) {
         check();
+        if (pending_rank_) throw std::logic_error("previous rank receipt must be collected");
         if (probability_pending_) throw std::logic_error("block ranking requires its preceding probability receipt");
         if (deferred_query_ && (!device || *deferred_query_!=layer)) throw std::logic_error("ranking does not match deferred representative query");
         if (layer >= geometry_.layers ||
@@ -833,7 +856,6 @@ public:
             if (candidates.blocks[i] >= published_[layer] || (i && candidates.blocks[i] <= candidates.blocks[i-1]) ||
                 !candidates.tokens[i] || candidates.tokens[i] > geometry_.block_tokens) throw std::invalid_argument("invalid CUDA rank candidate");
         }
-        std::vector<std::vector<std::uint64_t>> result(geometry_.heads);
         if (!candidates.remaining || candidates.blocks.empty()) {
             finish_query_for_rank_device();
             if (device) {
@@ -848,12 +870,13 @@ public:
                     const auto grid=static_cast<unsigned>(std::min<std::size_t>((count+255)/256,65535));
                     validate_query_values<<<grid,256,0,stream_>>>(query,count,error_device_);
                     checked(cudaGetLastError(),"validate empty rank query");
-                    checked(cudaMemcpyAsync(&error_,error_device_,sizeof(int),cudaMemcpyDeviceToHost,stream_),"download empty rank status");
-                    checked(cudaStreamSynchronize(stream_),"complete empty rank validation");
-                    if (error_) throw std::runtime_error("non-finite device ranking query");
+                    checked(cudaMemcpyAsync(rank_error_,error_device_,sizeof(int),cudaMemcpyDeviceToHost,stream_),"download empty rank status");
                 } catch (...) { fail(); throw; }
             }
-            return result;
+            if (!device) *rank_error_ = 0;
+            pending_rank_ = PendingRank{0, geometry_.heads, 0, candidates.shared_heads};
+            ++rank_ticket_;
+            return deferred ? RankedBlocks{} : finish_rank();
         }
         const auto count = candidates.blocks.size();
         const auto smallest = *std::min_element(candidates.tokens.begin(), candidates.tokens.end());
@@ -872,8 +895,10 @@ public:
                 checked(cudaMemcpyAsync(query_, query, bytes, cudaMemcpyHostToDevice, stream_), "upload rank query");
                 stats_.query_upload_bytes += bytes;
             }
-            checked(cudaMemcpyAsync(ids_, candidates.blocks.data(), product(count, sizeof(std::uint64_t)), cudaMemcpyHostToDevice, stream_), "upload rank candidates");
-            checked(cudaMemcpyAsync(costs_, candidates.tokens.data(), product(count, sizeof(std::uint32_t)), cudaMemcpyHostToDevice, stream_), "upload rank costs");
+            std::copy(candidates.blocks.begin(), candidates.blocks.end(), ids_host_);
+            std::copy(candidates.tokens.begin(), candidates.tokens.end(), costs_host_);
+            checked(cudaMemcpyAsync(ids_, ids_host_, product(count, sizeof(std::uint64_t)), cudaMemcpyHostToDevice, stream_), "upload rank candidates");
+            checked(cudaMemcpyAsync(costs_, costs_host_, product(count, sizeof(std::uint32_t)), cudaMemcpyHostToDevice, stream_), "upload rank costs");
             if (!deferred_query_) checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear rank status");
             checked(cudaMemsetAsync(output_device_, 0xff, bytes, stream_), "clear rank output");
             if (candidates.shared_heads) {
@@ -898,24 +923,39 @@ public:
                 select_top_blocks<<<lists, 256, 0, stream_>>>(scores_, ids_, costs_, output_device_, count, candidates.remaining, stride);
                 checked(cudaGetLastError(), "launch block top-k kernel");
             }
-            checked(cudaMemcpyAsync(output_.data(), output_device_, bytes, cudaMemcpyDeviceToHost, stream_), "download selected block IDs");
-            checked(cudaMemcpyAsync(&error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, stream_), "download rank status");
-            checked(cudaStreamSynchronize(stream_), "complete CUDA block ranking");
+            checked(cudaMemcpyAsync(output_host_, output_device_, bytes, cudaMemcpyDeviceToHost, stream_), "download selected block IDs");
+            checked(cudaMemcpyAsync(rank_error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, stream_), "download rank status");
+        } catch (...) { fail(); throw; }
+        pending_rank_ = PendingRank{count, lists, stride, candidates.shared_heads};
+        ++rank_ticket_;
+        return deferred ? RankedBlocks{} : finish_rank();
+    }
+    RankedBlocks finish_rank() {
+        check(true);
+        if (!pending_rank_) throw std::logic_error("no pending CUDA rank receipt");
+        DeviceScope scope(device_);
+        try {
+            checked(cudaStreamSynchronize(stream_), "collect CUDA block ranking");
             if (deferred_query_) ++stats_.builder_rank_shared_waits;
             deferred_query_.reset();
-            if (error_) throw std::runtime_error("non-finite CUDA representative score or block relevance");
+            if (*rank_error_) throw std::runtime_error("non-finite CUDA representative score or block relevance");
         } catch (...) { fail(); throw; }
-        for (std::uint32_t head = 0; head < lists; ++head) {
-            for (std::uint32_t i = 0; i < stride; ++i) {
-                const auto block = output_[static_cast<std::size_t>(head) * stride + i];
+        const auto pending = *pending_rank_;
+        pending_rank_.reset();
+        RankedBlocks result(geometry_.heads);
+        for (std::uint32_t head = 0; head < pending.lists; ++head) {
+            for (std::uint32_t i = 0; i < pending.stride; ++i) {
+                const auto block = output_host_[static_cast<std::size_t>(head) * pending.stride + i];
                 if (block == UINT64_MAX) break;
                 result[head].push_back(block);
             }
         }
-        if (candidates.shared_heads) std::fill(result.begin() + 1, result.end(), result.front());
-        ++stats_.calls;
-        stats_.scored_blocks += count * lists;
-        shared_ranking_ = candidates.shared_heads;
+        if (pending.shared) std::fill(result.begin() + 1, result.end(), result.front());
+        if (pending.count) {
+            ++stats_.calls;
+            stats_.scored_blocks += pending.count * pending.lists;
+            shared_ranking_ = pending.shared;
+        }
         return result;
     }
     RankerStats stats() const override { return stats_; }
@@ -967,8 +1007,16 @@ private:
         checked(cudaMalloc(reinterpret_cast<void **>(&pointer), bytes), "allocate CUDA ranker buffer");
         stats_.device_bytes += bytes;
     }
-    void check() const { if (failed_) throw std::runtime_error("CUDA block ranker failed"); }
-    void fail() noexcept { failed_ = true; if (stream_) (void) cudaStreamSynchronize(stream_); deferred_query_.reset(); }
+    void check(bool collecting_rank = false) const {
+        if (failed_) throw std::runtime_error("CUDA block ranker failed");
+        if (pending_rank_ && !collecting_rank) throw std::logic_error("previous rank receipt must be collected");
+    }
+    void fail() noexcept {
+        failed_ = true;
+        if (stream_) (void) cudaStreamSynchronize(stream_);
+        deferred_query_.reset();
+        pending_rank_.reset();
+    }
     void release() noexcept {
         int previous = 0;
         const bool restore = cudaGetDevice(&previous) == cudaSuccess;
@@ -1003,6 +1051,7 @@ private:
         if (probability_captured_) (void) cudaEventDestroy(probability_captured_);
         if (probability_done_) (void) cudaEventDestroy(probability_done_);
         if (probability_host_) (void) cudaFreeHost(probability_host_);
+        if (rank_host_) (void) cudaFreeHost(rank_host_);
         if (stream_) (void) cudaStreamDestroy(stream_);
         if (restore && previous != device_) (void) cudaSetDevice(previous);
     }
@@ -1012,7 +1061,15 @@ private:
     std::size_t block_elements_ = 0, layer_bytes_ = 0;
     cudaStream_t stream_ = nullptr;
     std::vector<void *> banks_;
-    std::vector<std::uint64_t> published_, output_;
+    std::vector<std::uint64_t> published_;
+    struct PendingRank { std::size_t count; std::uint32_t lists, stride; bool shared; };
+    std::optional<PendingRank> pending_rank_;
+    std::uint64_t rank_ticket_ = 0;
+    std::size_t output_capacity_ = 0;
+    void * rank_host_ = nullptr;
+    std::uint64_t * output_host_ = nullptr, * ids_host_ = nullptr;
+    std::uint32_t * costs_host_ = nullptr;
+    int * rank_error_ = nullptr;
     std::vector<BuilderState> builders_;
     std::vector<ProbabilityState> probability_states_;
     std::vector<std::uint64_t> probability_lengths_, probability_matured_;

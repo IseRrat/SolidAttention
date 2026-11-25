@@ -70,6 +70,7 @@ public:
                                                        const BlockCandidates & candidates) const;
     std::vector<std::vector<std::uint64_t>> rank_blocks(std::uint32_t layer, DeviceQueryWithEvent query,
                                                        const BlockCandidates & candidates) const;
+    RankCompletion submit_rank_blocks(std::uint32_t layer, DeviceQuery query, const BlockCandidates & candidates) const;
 private:
     struct Representative { std::uint64_t position; double score; std::vector<Half> key; };
     struct Block { std::uint32_t finalized = 0; std::vector<Representative> tokens; };
@@ -97,13 +98,16 @@ private:
     double infllm_shared_score(std::uint32_t layer, std::uint64_t block, const std::vector<float> & query) const;
     std::vector<std::vector<std::uint64_t>> rank_impl(std::uint32_t layer, const std::vector<float> * query,
                                                      const DeviceQuery * device, const BlockCandidates & candidates,
-                                                     void * cuda_ready_event = nullptr) const;
+                                                     void * cuda_ready_event = nullptr, RankCompletion * completion = nullptr) const;
 };
 
 struct HeadSelection {
     std::vector<std::uint64_t> positions;
     std::vector<std::uint64_t> blocks;
 };
+using SelectionCompletion = std::function<std::vector<HeadSelection>()>;
+SelectionCompletion submit_select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
+    const RepresentativeIndex & representatives, std::uint32_t layer, std::uint64_t position, DeviceQuery query);
 
 std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
                                         const RepresentativeIndex & representatives, std::uint32_t layer,

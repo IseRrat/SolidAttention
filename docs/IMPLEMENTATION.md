@@ -62,6 +62,10 @@
 
    CUDA Prefill 的均值与排名之间采用设备事件衔接。`mean_sparse_query_async` 在 attention 队列生成 FP32 均值，记录完成事件，返回均值指针和事件；选块器在评分队列插入该事件依赖，随后执行块点积和 Top-K，在所选编号回传处收取结果。模型推理调用这条异步均值入口，省去均值阶段单独的 CPU 等待。输入 Q、均值缓冲和事件由生产者持有，覆盖排名使用期；候选直接全部采用时，后续同队列 attention 完成输入读取。`DeviceQueryWithEvent` 单独表达这项依赖，普通 `DeviceQuery` 继续要求输入已完成生产。同步均值接口按均值事件收取结果。
 
+   CUDA 评分新增提交与收取两个入口。提交时把候选编号和 token 成本复制到一次分配的页锁定缓冲，向独立评分队列提交打分、CUB Top-K 和编号回传，随后返回；收取时才等待评分队列并验证结果。编号、成本、输出和错误状态共用固定页锁定区，持续选块复用。每次仅允许一份在途回执，收取后释放工作区占用；重复收取及未收取时再次提交会报错。同步入口复用同一套评分与结果校验，选块规则保持一致。
+
+   `cuda_prefill_test.cpp` 用生产队列门闩阻止 Q 就绪事件完成，检查提交入口能在门闩打开前返回；提交后修改候选容器，仍得到原来的块编号，并检查工作区与回执的复用边界。服务器 CUDA Prefill、15 组原版检索对照、完整 CUDA 评分选块检查及 54 项 CPU 检查通过。
+
    结果中的 `prefill_mean_events`、`prefill_mean_host_waits` 分别记录均值事件和同步均值收取次数，`query_ready_event_waits` 记录插入评分队列的 GPU 事件依赖次数。CUDA 对照用例分别调用同步、异步均值排名，核对选块一致，并检查普通候选、空候选两条路径的事件依赖及 CPU 均值等待计数。代码和 CUDA 对照用例已编译，原版 CPU 对照及 54 项 CPU 回归通过。
 
    [device_input.hpp](../include/solid/device_input.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[baseline.cpp](../src/baseline.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
@@ -164,7 +168,7 @@
 
 2. **Q 前沿与提前补读**
 
-   已将设备 Q 就绪标量和 CPU 前沿接入模型图。overlap 与 overlap+sync_reuse 的前沿通过异步设备入口把选择交给持久协调线程后返回，GPU 可继续 KV 投影与交错转换。协调线程完成代表更新、选择和历史补读，KV 就绪处收割其结果。异步入口借用的 Q 由图依赖保留至 KV 汇合或排空结束，原同步设备入口在返回前消费 Q。选择异常在 KV 前沿传递。任务图把选择和 KV 生成作为 Q 就绪后的两个分支。naive 保留串行路径。
+   已将设备 Q 就绪标量和 CPU 前沿接入模型图。CUDA 的 overlap 与 overlap+sync_reuse 在 Q 就绪前沿直接提交评分与 Top-K，随后返回模型图继续 KV 投影和交错转换；持久协调线程收取块编号、完成历史补读及上传。CPU 和 SYCL 的异步入口由协调线程完成选择。KV 就绪处汇合工作结果。异步入口借用的 Q 由图依赖保留至 KV 汇合或排空结束，原同步设备入口在返回前消费 Q。选择异常在 KV 前沿传递。任务图把选择和 KV 生成作为 Q 就绪后的两个分支。naive 保留串行路径。
 
    SolidAttention 的 InfLLM 路径直接用设备上的 Q 做评分和 Top-K，代表向量继续由实际的近期 attention 概率生成。当前 token 的 K 从归档的 FP16 K/V 中提取，归档完成后接收本层近期概率。Offload＋Sparse 和 SolidAttention 沿用同一套候选块、评分规则和 25%／1K 总预算。
 

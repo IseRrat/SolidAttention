@@ -6,6 +6,7 @@
 #include <numeric>
 #include <set>
 #include <stdexcept>
+#include <type_traits>
 
 namespace solid {
 namespace {
@@ -535,7 +536,7 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
 }
 std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
     std::uint32_t layer, const std::vector<float> * query, const DeviceQuery * device, const BlockCandidates & candidates,
-    void * cuda_ready_event) const {
+    void * cuda_ready_event, RankCompletion * completion) const {
     if (layer >= geometry_.layers || candidates.blocks.size() != candidates.tokens.size() || candidates.remaining > budget_.total) {
         throw std::invalid_argument("block ranking shape or budget");
     }
@@ -549,9 +550,36 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
     }
     const auto needed = std::min<std::uint64_t>(available, candidates.remaining);
     std::vector<std::vector<std::uint64_t>> result(geometry_.heads);
-    if (!needed) return std::vector<std::vector<std::uint64_t>>(kv_heads_);
+    const auto ready = [completion](RankedBlocks value) {
+        if (!completion) return value;
+        *completion = [value = std::move(value)]() mutable { return std::move(value); };
+        return RankedBlocks{};
+    };
+    if (!needed) return ready(RankedBlocks(kv_heads_));
     if (candidates.shared_heads && available <= candidates.remaining) {
-        return std::vector<std::vector<std::uint64_t>>(kv_heads_, candidates.blocks);
+        return ready(RankedBlocks(kv_heads_, candidates.blocks));
+    }
+    const auto validate = [candidates, needed, heads = geometry_.heads, kv_heads = kv_heads_](RankedBlocks result) {
+        if (result.size() != heads) throw std::runtime_error("ranker returned wrong head count");
+        for (const auto & head : result) {
+            std::set<std::uint64_t> unique;
+            std::uint64_t covered = 0;
+            for (const auto block : head) {
+                const auto found = std::lower_bound(candidates.blocks.begin(), candidates.blocks.end(), block);
+                if (found == candidates.blocks.end() || *found != block || !unique.insert(block).second || covered >= needed) {
+                    throw std::runtime_error("ranker returned invalid, duplicate or excess block");
+                }
+                covered += candidates.tokens[found - candidates.blocks.begin()];
+            }
+            if (covered < needed) throw std::runtime_error("ranker returned insufficient token coverage");
+        }
+        result.resize(kv_heads);
+        return result;
+    };
+    if (device && completion) {
+        auto pending = ranker_->submit_rank_device(layer, {*device, cuda_ready_event}, candidates);
+        *completion = [pending = std::move(pending), validate]() mutable { return validate(pending()); };
+        return {};
     }
     if (device) result = ranker_->rank_device_after_event(layer, {*device, cuda_ready_event}, candidates);
     else if (ranker_) result = ranker_->rank(layer, *query, candidates);
@@ -578,21 +606,16 @@ std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_impl(
         }
         if (candidates.shared_heads) std::fill(result.begin() + 1, result.end(), result.front());
     }
-    if (result.size() != geometry_.heads) throw std::runtime_error("ranker returned wrong head count");
-    for (const auto & head : result) {
-        std::set<std::uint64_t> unique;
-        std::uint64_t covered = 0;
-        for (const auto block : head) {
-            const auto found = std::lower_bound(candidates.blocks.begin(), candidates.blocks.end(), block);
-            if (found == candidates.blocks.end() || *found != block || !unique.insert(block).second || covered >= needed) {
-                throw std::runtime_error("ranker returned invalid, duplicate or excess block");
-            }
-            covered += candidates.tokens[found - candidates.blocks.begin()];
-        }
-        if (covered < needed) throw std::runtime_error("ranker returned insufficient token coverage");
-    }
-    result.resize(kv_heads_);
-    return result;
+    return validate(std::move(result));
+}
+RankCompletion RepresentativeIndex::submit_rank_blocks(
+    std::uint32_t layer, DeviceQuery query, const BlockCandidates & candidates) const {
+    const auto memory = rank_memory();
+    if (!memory) throw std::logic_error("direct device ranking is disabled");
+    validate_device_query(query, *memory, query_heads_, geometry_.dimension);
+    RankCompletion completion;
+    (void) rank_impl(layer, nullptr, &query, candidates, nullptr, &completion);
+    return completion;
 }
 std::vector<std::vector<std::uint64_t>> RepresentativeIndex::rank_blocks(
     std::uint32_t layer, DeviceQueryWithEvent query, const BlockCandidates & candidates) const {
@@ -641,11 +664,10 @@ std::uint64_t RepresentativeIndex::resident_bytes() const {
 }
 template<class Query> static std::vector<HeadSelection> select_blocks_impl(const KvGeometry & geometry, const SparseBudget & budget,
                                         const RepresentativeIndex & representatives, std::uint32_t layer,
-                                        std::uint64_t position, const Query & query) {
+                                        std::uint64_t position, const Query & query, SelectionCompletion * completion = nullptr) {
     budget.validate(geometry);
     if (position >= geometry.capacity_tokens) throw std::out_of_range("selection position");
     const auto count = position + 1;
-    std::vector<HeadSelection> result(geometry.heads);
     const auto initial_end = count <= budget.total ? count : budget.initial;
     const auto local_first = count <= budget.total ? count : budget.recent_start(geometry, position);
     const auto origin = representatives.history_start();
@@ -669,24 +691,35 @@ template<class Query> static std::vector<HeadSelection> select_blocks_impl(const
             candidates.tokens.push_back(static_cast<std::uint32_t>(end - begin));
         }
     }
-    const auto ranked = representatives.rank_blocks(layer, query, candidates);
-    for (std::uint32_t head = 0; head < geometry.heads; ++head) {
-        auto & chosen = result[head].positions;
-        chosen = deterministic;
-        for (const auto block : ranked[head]) {
-            const auto begin = std::max(initial_end, origin + block * geometry.block_tokens);
-            const auto end = std::min(local_first, origin + (block + 1) * geometry.block_tokens);
-            for (auto p = begin; p < end && chosen.size() < budget.total; ++p) chosen.push_back(p);
-            if (chosen.size() >= budget.total) break;
+    const auto assemble = [geometry, budget, initial_end, local_first, origin,
+                           deterministic = std::move(deterministic)](const RankedBlocks & ranked) {
+        std::vector<HeadSelection> result(geometry.heads);
+        for (std::uint32_t head = 0; head < geometry.heads; ++head) {
+            auto & chosen = result[head].positions;
+            chosen = deterministic;
+            for (const auto block : ranked[head]) {
+                const auto begin = std::max(initial_end, origin + block * geometry.block_tokens);
+                const auto end = std::min(local_first, origin + (block + 1) * geometry.block_tokens);
+                for (auto p = begin; p < end && chosen.size() < budget.total; ++p) chosen.push_back(p);
+                if (chosen.size() >= budget.total) break;
+            }
+            std::sort(chosen.begin() + deterministic.size(), chosen.end());
+            std::rotate(chosen.begin() + initial_end, chosen.begin() + deterministic.size(), chosen.end());
+            for (const auto p : chosen) {
+                const auto block = p / geometry.block_tokens;
+                if (result[head].blocks.empty() || result[head].blocks.back() != block) result[head].blocks.push_back(block);
+            }
         }
-        std::sort(chosen.begin() + deterministic.size(), chosen.end());
-        std::rotate(chosen.begin() + initial_end, chosen.begin() + deterministic.size(), chosen.end());
-        for (const auto p : chosen) {
-            const auto block = p / geometry.block_tokens;
-            if (result[head].blocks.empty() || result[head].blocks.back() != block) result[head].blocks.push_back(block);
+        return result;
+    };
+    if constexpr (std::is_same_v<Query, DeviceQuery>) {
+        if (completion) {
+            auto pending = representatives.submit_rank_blocks(layer, query, candidates);
+            *completion = [pending = std::move(pending), assemble]() mutable { return assemble(pending()); };
+            return {};
         }
     }
-    return result;
+    return assemble(representatives.rank_blocks(layer, query, candidates));
 }
 std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
                                         const RepresentativeIndex & representatives, std::uint32_t layer,
@@ -694,6 +727,15 @@ std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const Spar
     if (query.size() != static_cast<std::size_t>(representatives.query_heads())*geometry.dimension) throw std::invalid_argument("selection query shape");
     finite_query(query);
     return select_blocks_impl(geometry, budget, representatives, layer, position, query);
+}
+SelectionCompletion submit_select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
+    const RepresentativeIndex & representatives, std::uint32_t layer, std::uint64_t position, DeviceQuery query) {
+    const auto memory = representatives.rank_memory();
+    if (!memory) throw std::logic_error("direct device selection is disabled");
+    validate_device_query(query, *memory, representatives.query_heads(), geometry.dimension);
+    SelectionCompletion completion;
+    (void) select_blocks_impl(geometry, budget, representatives, layer, position, query, &completion);
+    return completion;
 }
 std::vector<HeadSelection> select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
                                         const RepresentativeIndex & representatives, std::uint32_t layer,

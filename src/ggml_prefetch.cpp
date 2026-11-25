@@ -926,6 +926,13 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
     const auto work = impl_->new_work(layer, position,device!=nullptr,projection_ns,deferred_archive);
     work->query = query;
     work->direct = device != nullptr;
+    // Queue score/top-k while the graph is at its Q frontier. Waking an I/O
+    // worker before submission can miss the entire KV-projection window.
+    const bool submitted = asynchronous && device && device->memory == DeviceMemory::cuda;
+    if (submitted) {
+        work->dag.start(select_task, impl_->trace.now());
+        impl_->session.submit_before_kv_device(layer, position, *device);
+    }
     if (!asynchronous) {
         work->dag.start(select_task,impl_->trace.now());
         work->selection=device?impl_->session.select_before_kv_device(layer,position,*device):
@@ -935,13 +942,14 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
     work->dag.start(kv_projection, impl_->trace.now());
     const auto device_query=device && asynchronous?std::optional<DeviceQuery>{*device}:std::nullopt;
     ++impl_->totals.worker_jobs;
-    impl_->worker.submit([this, work, device_query, asynchronous] {
+    impl_->worker.submit([this, work, device_query, asynchronous, submitted] {
         std::lock_guard<std::mutex> lock(impl_->mutex);
         // Q is producer-complete. The graph retains its device allocation
         // through the KV and mask nodes while selection uses its own queue.
         if (asynchronous) {
-            work->dag.start(select_task, impl_->trace.now());
-            work->selection=device_query?impl_->session.select_before_kv_device(work->layer,work->position,*device_query):
+            if (!submitted) work->dag.start(select_task, impl_->trace.now());
+            work->selection = submitted ? impl_->session.finish_before_kv_device() : device_query ?
+                impl_->session.select_before_kv_device(work->layer,work->position,*device_query) :
                 impl_->session.select_before_kv(work->layer,work->position,work->query);
             work->dag.complete(select_task, impl_->trace.now());
         }

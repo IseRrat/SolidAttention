@@ -3,6 +3,8 @@
 #include <cuda_runtime_api.h>
 #include <iostream>
 #include <limits>
+#include <future>
+#include <chrono>
 #include <string>
 #include <type_traits>
 
@@ -108,6 +110,42 @@ void sparse_prefill(int device) {
         test_tiled::require(empty_ranking == std::vector<std::vector<std::uint64_t>>(heads) &&
             event_ranker->stats().query_ready_event_waits == 2 && backend->stats().retrieval_mean_host_waits == prior_waits,
             "empty event-dependent ranking ignored query readiness");
+        // Hold the producer queue until submission returns. A hidden pageable
+        // copy or premature host wait would keep submit blocked at this gate.
+        cudaStream_t producer = nullptr;
+        cudaEvent_t ready = nullptr;
+        cuda_check(cudaStreamCreateWithFlags(&producer, cudaStreamNonBlocking));
+        cuda_check(cudaEventCreateWithFlags(&ready, cudaEventDisableTiming));
+        std::promise<void> release;
+        auto gate = release.get_future().share();
+        cuda_check(cudaLaunchHostFunc(producer, [](void * value) {
+            static_cast<std::shared_future<void> *>(value)->wait();
+        }, &gate));
+        cuda_check(cudaEventRecord(ready, producer));
+        auto candidates = request;
+        const auto submitted_calls = event_ranker->stats().calls;
+        auto submission = std::async(std::launch::async, [&] {
+            return event_ranker->submit_rank_device(0, {mean, ready}, candidates);
+        });
+        const bool returned = submission.wait_for(std::chrono::seconds(2)) == std::future_status::ready;
+        release.set_value();
+        auto receipt = submission.get();
+        // Submission must own this metadata until its asynchronous H2D ends.
+        candidates.blocks.assign(2, UINT64_MAX);
+        candidates.tokens.assign(2, 0);
+        bool rejects_reuse = false;
+        try { (void) event_ranker->submit_rank_device(0, {mean, nullptr}, request); }
+        catch (const std::logic_error &) { rejects_reuse = true; }
+        const bool uncollected = event_ranker->stats().calls == submitted_calls;
+        const auto deferred_ranking = receipt();
+        bool rejects_receipt = false;
+        try { (void) receipt(); }
+        catch (const std::logic_error &) { rejects_receipt = true; }
+        cuda_check(cudaStreamSynchronize(producer));
+        cuda_check(cudaEventDestroy(ready));
+        cuda_check(cudaStreamDestroy(producer));
+        test_tiled::require(returned && uncollected && rejects_reuse && rejects_receipt && deferred_ranking == expected_ranking,
+            "deferred rank waited before the consumer, reused live metadata, or changed selected IDs");
         const auto before = backend->stats();
         const auto direct = backend->sparse({first, queries, 0.125f, local, rope, positions, {}, packed, fixed, query,
             {device_result.get(), q.size(), solid::DeviceMemory::cuda},

@@ -3,11 +3,14 @@
 #include "solid/kv_store.hpp"
 #include "solid/device_input.hpp"
 #include <memory>
+#include <functional>
 #include <optional>
 #include <stdexcept>
 #include <vector>
 
 namespace solid {
+using RankedBlocks = std::vector<std::vector<std::uint64_t>>;
+using RankCompletion = std::function<RankedBlocks()>;
 // Candidates have the same eligibility and token cost for every KV head.
 struct BlockCandidates {
     std::vector<std::uint64_t> blocks;
@@ -102,6 +105,14 @@ public:
                                                                           const BlockCandidates & candidates) {
         if (query.cuda_ready_event) throw std::logic_error("event-dependent device ranking is disabled");
         return rank_device(layer, query.query, candidates);
+    }
+    // Submit before returning to model computation; collect on the I/O worker.
+    // One outstanding receipt owns the ranker's workspace. Keep the query and
+    // ranker alive until collection; candidate metadata is copied on submission.
+    virtual RankCompletion submit_rank_device(std::uint32_t layer, DeviceQueryWithEvent query,
+                                              const BlockCandidates & candidates) {
+        auto result = rank_device_after_event(layer, query, candidates);
+        return [result = std::move(result)]() mutable { return std::move(result); };
     }
     virtual std::optional<BuiltRepresentatives> build_query_device(std::uint32_t, std::uint64_t, DeviceQuery) {
         throw std::logic_error("direct device representative query is disabled");

@@ -604,7 +604,7 @@ std::vector<HeadSelection> AttentionSession::select_decode_device(std::uint32_t 
     } catch (...) { failed_ = true; throw; }
 }
 std::vector<HeadSelection> AttentionSession::select_before_kv(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query) {
-    if (failed_ || early_ || !prefetch_ || position < prefill_tokens_ || store_->length(layer) != position) {
+    if (failed_ || early_ || pending_device_selection_ || !prefetch_ || position < prefill_tokens_ || store_->length(layer) != position) {
         throw std::logic_error("early selection requires an uncommitted decode position");
     }
     try {
@@ -636,22 +636,40 @@ std::optional<DeviceMemory> AttentionSession::direct_memory() const {
     return rope_ ? representatives_->rank_memory() : representatives_->direct_memory();
 }
 std::vector<HeadSelection> AttentionSession::select_before_kv_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query) {
-    if (failed_ || early_ || !prefetch_ || !direct_memory() || position < prefill_tokens_ || store_->length(layer) != position) {
+    submit_before_kv_device(layer, position, query);
+    return finish_before_kv_device();
+}
+void AttentionSession::submit_before_kv_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query) {
+    if (failed_ || early_ || pending_device_selection_ || !prefetch_ || !direct_memory() || position < prefill_tokens_ || store_->length(layer) != position) {
         throw std::logic_error("device early selection requires an uncommitted decode position");
     }
     try {
         const auto start = Clock::now();
         if (rope_) representatives_->begin_probability_query(layer, position);
         else representatives_->observe_query_device(layer, position, query,true);
-        auto selected = select_blocks(geometry(), budget_, *representatives_, layer, position, query);
-        if (!rope_) representatives_->finish_query_for_rank_device();
-        stats_.selection_ns += elapsed(start);
-        early_ = std::make_pair(layer, position);
-        direct_early_ = true;
-        record(layer, position, selected);
-        for (const auto & head : selected) stats_.selected_tokens += head.positions.size();
-        return selected;
+        auto pending = submit_select_blocks(geometry(), budget_, *representatives_, layer, position, query);
+        pending_device_selection_ = [this, layer, position, start, pending = std::move(pending)]() mutable {
+            auto selected = pending();
+            if (!rope_) representatives_->finish_query_for_rank_device();
+            stats_.selection_ns += elapsed(start);
+            early_ = std::make_pair(layer, position);
+            direct_early_ = true;
+            record(layer, position, selected);
+            for (const auto & head : selected) stats_.selected_tokens += head.positions.size();
+            return selected;
+        };
     } catch (...) {
+        failed_ = true;
+        if (!rope_) try { representatives_->finish_query_for_rank_device(); } catch (...) {}
+        throw;
+    }
+}
+std::vector<HeadSelection> AttentionSession::finish_before_kv_device() {
+    if (failed_ || !pending_device_selection_) throw std::logic_error("no pending device selection");
+    auto pending = std::move(pending_device_selection_);
+    pending_device_selection_ = {};
+    try { return pending(); }
+    catch (...) {
         failed_ = true;
         if (!rope_) try { representatives_->finish_query_for_rank_device(); } catch (...) {}
         throw;
@@ -762,6 +780,7 @@ void AttentionSession::enable_direct_reads() {
 }
 void AttentionSession::flush() {
     if (failed_) throw std::runtime_error("attention session failed");
+    if (pending_device_selection_) throw std::logic_error("collect device selection before flushing the session");
     try {
         finish_device_probabilities();
         if (prefetch_) prefetch_->finish_stores();
@@ -802,13 +821,13 @@ SessionStats AttentionSession::stats() const {
     return result;
 }
 void AttentionSession::set_ranker(std::unique_ptr<BlockRanker> ranker) {
-    if (failed_ || !representatives_ || replay_.is_open() || early_) throw std::logic_error("ranker requires a dynamic sparse session at a query boundary");
+    if (failed_ || !representatives_ || replay_.is_open() || early_ || pending_device_selection_) throw std::logic_error("ranker requires a dynamic sparse session at a query boundary");
     try { representatives_->set_ranker(std::move(ranker)); }
     catch (...) { failed_ = true; throw; }
 }
 void AttentionSession::set_prefill(std::unique_ptr<TiledPrefill> prefill) {
     const auto * original = rope_ ? "cpu_infllm_sparse" : "cpu_streaming";
-    if (failed_ || early_ || prefill_ || stats_.prefill_backend != original || !prefill ||
+    if (failed_ || early_ || pending_device_selection_ || prefill_ || stats_.prefill_backend != original || !prefill ||
         prefill->supports_sparse() != rope_.has_value() || !prefill->query_capacity() ||
         !prefill->tile_capacity() || prefill->tile_capacity()%geometry().block_tokens) throw std::invalid_argument("invalid tiled prefill attachment");
     const auto width=static_cast<std::uint64_t>(2)*geometry().dimension;
