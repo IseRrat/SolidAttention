@@ -8,15 +8,15 @@
 namespace solid {
 enum class DeviceMemory { cuda, host_emulator, sycl };
 
-// Borrowed, producer-complete inputs. The owner retains the allocation until
-// the consuming call returns, including its private-stream synchronization.
+// Borrowed, producer-complete inputs. Retain the allocation through the
+// consuming call, or through receipt collection for an asynchronous API.
 struct DeviceQuery {
     const float * data = nullptr;
     std::size_t elements = 0;
     DeviceMemory memory = DeviceMemory::cuda;
 };
 // CUDA producer event accompanying a query that is still being computed.
-// The producer owns the query and event through the consuming rank call.
+// The producer owns the query and event through rank completion/receipt collection.
 // Plain DeviceQuery retains its producer-complete contract.
 struct DeviceQueryWithEvent {
     DeviceQuery query;

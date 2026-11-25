@@ -64,7 +64,7 @@
 
    [attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[block_ranker.hpp](../include/solid/block_ranker.hpp)。
 
-   CUDA Prefill 的均值与排名之间采用设备事件衔接。`mean_sparse_query_async` 在 attention 队列生成 FP32 均值，记录完成事件，返回均值指针和事件；选块器在评分队列插入该事件依赖，随后执行块点积和 Top-K，在所选编号回传处收取结果。模型推理调用这条异步均值入口，省去均值阶段单独的 CPU 等待。输入 Q、均值缓冲和事件由生产者持有，覆盖排名使用期；候选直接全部采用时，后续同队列 attention 完成输入读取。`DeviceQueryWithEvent` 单独表达这项依赖，普通 `DeviceQuery` 继续要求输入已完成生产。同步均值接口按均值事件收取结果。
+   CUDA Prefill 的均值与排名之间采用设备事件衔接。`mean_sparse_query_async` 在 attention 队列生成 FP32 均值，记录完成事件，返回均值指针和事件；选块器在评分队列插入该事件依赖，随后执行块点积和 Top-K，在所选编号回传处收取结果。模型推理调用这条异步均值入口，省去均值阶段单独的 CPU 等待。输入 Q、均值缓冲和事件由生产者持有，覆盖排名使用期；候选直接全部采用时，后续同队列 attention 完成输入读取。`DeviceQueryWithEvent` 单独表达这项依赖，普通 `DeviceQuery` 继续要求输入已完成生产。异步入口借用输入的保留期延续至回执收取，`device_input.hpp` 和排名接口均记录这项约定。同步均值接口按均值事件收取结果。
 
    CUDA 评分新增提交与收取两个入口。提交时把候选编号和 token 成本复制到一次分配的页锁定缓冲，向独立评分队列提交打分、CUB Top-K 和编号回传，随后返回；收取时才等待评分队列并验证结果。编号、成本、输出和错误状态共用固定页锁定区，持续选块复用。每次仅允许一份在途回执，收取后释放工作区占用；重复收取及未收取时再次提交会报错。同步入口复用同一套评分与结果校验，选块规则保持一致。主机校验在同步入口借用候选表，异步入口才保存自己的候选副本；最终 token 组装通过移动接管固定位置表。
 
