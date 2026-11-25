@@ -100,6 +100,8 @@
 
    CUDA 对照的输入上传由 `upload_ready` 收取默认上传队列完成后，再交给独立计算队列，保证借用输入已就绪。`infllm_reference_cases.hpp` 的 F32 均值检查采用由输入绝对值和浮点精度计算的归约误差界，失败时报告样例、组长、元素及双方数值；选块继续严格核对原版最优得分集合。
 
+   `7820c8d` 的服务器核验完成 Qwen2.5-7B Q4_0、8K 输入、8 步 Decode 的三方法短推理。三组均启用 Nsight、8 GiB 显存限制、16 GiB 主机内存限制及 Decode O_DIRECT。Prefill 分别为 Offload 1.575 秒、Offload＋Sparse 1.405 秒、SolidAttention 1.299 秒；两条稀疏路径均记录 784 个均值事件、0 次均值主机等待。结果、选块、逐阶段时间线及数值比较保存在 `results/server5090/nsys-infllm-8k-7820c8d/`，报告编号与方法由其中的 `capture/nsys/INDEX.tsv` 对应。
+
    [原版源码及许可](../third_party/infllm/)、[来源记录](../third_party/infllm/ORIGIN)、[infllm_reference_fixture.py](../scripts/infllm_reference_fixture.py)、[infllm_reference_cases.hpp](../tests/infllm_reference_cases.hpp)、[infllm_reference_test.cpp](../tests/infllm_reference_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)、[CMakeLists.txt](../CMakeLists.txt)。
 
 ## 三、Speculative Prefetcher
@@ -247,6 +249,8 @@
    [tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[tiled_prefill.cpp](../src/sycl/tiled_prefill.cpp)、[session.cpp](../src/session.cpp)、[session.hpp](../include/solid/session.hpp)、[attention.cpp](../src/attention.cpp)、[attention.hpp](../include/solid/attention.hpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[config.cpp](../src/config.cpp)、[baseline.cpp](../src/baseline.cpp)、[experiments.py](../scripts/experiments.py)、[experiment_common.py](../scripts/experiment_common.py)、[test_experiments.py](../tests/test_experiments.py)、[ranker_test.cpp](../tests/ranker_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。
 
    CUDA 稀疏预填充的分数工作区支持最多 64 Mi 个分数元素，容纳 512-token 检索组的历史块与滑动窗口并集。密集预填充沿用原工作区上限。
+
+   `baseline.cpp` 的可选 attention 张量诊断增加 InfLLM Decode 捕获，`SOLID_DIAGNOSTIC_PHASE` 区分 Prefill 和 Decode。Decode 在 PV 节点完成时记录每层 Q、旋转后 K、V、mask、联合概率及输出，连同类型、形状和 stride 保存；捕获使用同步调度保护被读取的 KV bank。8K 单步诊断用拆开的 K/V 投影对照两条稀疏路径：前 26 层 Q 逐值相同，实际有效 KV 集合相同，attention 输出最大差异约为 5.96×10⁻⁷。后两层的 Q 和当前 KV 随后产生差异。原始 8 步短核验中，两条稀疏路径生成 token 相同，896 条选块记录有 348 条不同，logits 最大绝对差为 2.216；这些数据与逐层诊断分别保存。
 
 5. **Offload 全量 Decode**
 

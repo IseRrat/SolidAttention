@@ -145,10 +145,15 @@ struct EvaluationBridge {
     std::filesystem::path diagnostic;
     std::size_t diagnostic_layers = 0, captured = 0;
     bool diagnostic_prefill = false;
+    bool diagnostic_infllm_decode = false;
     std::exception_ptr diagnostic_error;
     void check() const { if (diagnostic_error) std::rethrow_exception(diagnostic_error); }
     bool wants_diagnostic(const ggml_tensor * tensor) const {
         if (diagnostic.empty() || captured >= diagnostic_layers) return false;
+        if (diagnostic_infllm_decode) {
+            return tensor->op == GGML_OP_MUL_MAT && tensor->ne[1] == 1 &&
+                std::string_view(ggml_get_name(tensor)).find("infllm.PV.L") == 0;
+        }
         if (diagnostic_prefill) {
             return tensor->type == GGML_TYPE_F32 && tensor->ne[1] > 1 &&
                 std::string_view(ggml_get_name(tensor)) == "solid_sync_attention";
@@ -157,13 +162,19 @@ struct EvaluationBridge {
     }
     void capture(ggml_tensor * tensor) {
         Json tensors = Json::array();
-        const ggml_tensor * values[] = {tensor->src[0], tensor->src[1], tensor->src[2],
-                                       diagnostic_prefill ? nullptr : tensor->src[3], tensor};
-        const char * labels[] = {"q", diagnostic_prefill && !tensor->src[2] ? "kv" : "k", "v", "mask", "output"};
-        for (std::size_t i = 0; i < std::size(values); ++i) {
-            const auto * value = values[i];
+        std::vector<std::pair<const ggml_tensor *, const char *>> values;
+        if (diagnostic_infllm_decode) {
+            const auto * probabilities = tensor->src[1];
+            const auto * logits = probabilities->src[0];
+            values = {{logits->src[1], "q"}, {logits->src[0], "k"}, {tensor->src[0], "v"},
+                      {probabilities->src[1], "mask"}, {probabilities, "probabilities"}, {tensor, "output"}};
+        } else {
+            values = {{tensor->src[0], "q"}, {tensor->src[1], diagnostic_prefill && !tensor->src[2] ? "kv" : "k"},
+                      {tensor->src[2], "v"}, {diagnostic_prefill ? nullptr : tensor->src[3], "mask"}, {tensor, "output"}};
+        }
+        for (const auto & [value, label] : values) {
             if (!value) continue;
-            const auto filename = std::to_string(captured) + "-" + labels[i] + ".bin";
+            const auto filename = std::to_string(captured) + "-" + label + ".bin";
             std::vector<unsigned char> bytes(ggml_nbytes(value));
             ggml_backend_tensor_get(value, bytes.data(), 0, bytes.size());
             std::ofstream stream(diagnostic / filename, std::ios::binary);
@@ -171,7 +182,7 @@ struct EvaluationBridge {
             stream.close();
             if (!stream) throw std::runtime_error("attention diagnostic write failed");
             const auto * storage = value->buffer ? value : value->view_src;
-            tensors.push_back({{"label", labels[i]}, {"file", filename}, {"type", ggml_type_name(value->type)},
+            tensors.push_back({{"label", label}, {"file", filename}, {"type", ggml_type_name(value->type)},
                 {"buffer", storage && storage->buffer ? ggml_backend_buffer_name(storage->buffer) : "none"},
                 {"ne", {value->ne[0], value->ne[1], value->ne[2], value->ne[3]}},
                 {"nb", {value->nb[0], value->nb[1], value->nb[2], value->nb[3]}}});
@@ -326,6 +337,13 @@ int main(int argc, char ** argv) {
         EvaluationBridge evaluation{adapter.get(), config.attention.profile ? &profile : nullptr};
         if (const auto * directory = std::getenv("SOLID_DIAGNOSTIC_ATTENTION")) {
             evaluation.diagnostic_prefill = config.attention.infllm_attention;
+            if (const auto * phase = std::getenv("SOLID_DIAGNOSTIC_PHASE")) {
+                if (std::string_view(phase) != "prefill" && std::string_view(phase) != "decode") {
+                    throw std::invalid_argument("SOLID_DIAGNOSTIC_PHASE must be prefill or decode");
+                }
+                evaluation.diagnostic_infllm_decode = config.attention.infllm_attention && std::string_view(phase) == "decode";
+                if (evaluation.diagnostic_infllm_decode) evaluation.diagnostic_prefill = false;
+            }
             if (!evaluation.diagnostic_prefill && config.attention.prefetch && config.attention.schedule != "naive") {
                 throw std::invalid_argument("attention diagnostics require naive prefetch scheduling to retain the captured cache bank");
             }
