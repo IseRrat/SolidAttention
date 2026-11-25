@@ -218,6 +218,8 @@
 
    `cuda_prefill_test.cpp` 同时运行显式诊断索引和正常 GPU 索引，核对 96-token Prefill、逐 token Decode、代表值、发布边界及最终检索，检查正常索引的主机占用保持固定。门闩用例阻止 GPU 计算队列前进，要求同队列提交在门闩释放前返回；随后立即覆盖输入，核对代表与检索结果。原版 5 组、172 帧、101 个完整块、15 次检索对照和 54 项 CPU 检查通过。
 
+   `fba7b76` 完成两条稀疏路径的 8K、8 步 Decode 短核验，额外调试输出关闭，保留 Nsight、8 GiB 显存与 16 GiB 主机内存限制及 Decode O_DIRECT。对照 `920f5a2`，两条路径的主机代表索引缓冲均由 36,553,672 字节降为 680 字节；Prefill 评分队列 D2H 由 4,144 次、12,143,040 字节降为 2,464 次、100,800 字节。稀疏基线的 224 次概率更新与 FFN 位于同一 GPU 队列，全部更新先于对应 FFN 归一化完成，流同步次数由 6,562 降为 6,338。SolidAttention 继续使用独立代表队列。两条路径生成的 9 个 token 相同；Prefill 分别为稀疏基线 1.381 秒、SolidAttention 1.279 秒，8 步 Decode 分别为 500.2 ms、342.5 ms。原始结果、时间线及逐层队列顺序保存在 `results/server5090/nsys-infllm-8k-fba7b76.wz1e_5xy/`，比较记录为 `representative-storage-check.json`。
+
 5. **统一内存和复制队列**
 
    SYCL 已为支持共享 USM 的集成 GPU 分配共享 KV bank，SSD READ 与 dirty 数据转发直接填入该 bank 的历史槽位，attention 使用同一地址。主机释放独立块载荷，历史块安装只登记槽位和完成票据。共享内存的所有权随块视图保留，覆盖原 I/O 完成及排空过程。
