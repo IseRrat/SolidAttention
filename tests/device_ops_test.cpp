@@ -55,8 +55,39 @@ void run() {
             require(actual[((p*heads+h)*2+plane)*width+d]==solid::to_half(values[(p*heads+h)*(2*width+5)+plane*width+d]),"strided FP16 consolidator layout or bits");
     }
 }
+void local_window() {
+    std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
+    std::unique_ptr<ggml_context,decltype(&ggml_free)> context(ggml_init({1024*1024,nullptr,true}),ggml_free);
+    constexpr std::uint32_t width=17, heads=2, capacity=7, queries=3, tokens=8;
+    std::vector<solid::Half> ring(capacity*heads*width), current(queries*heads*2*width), actual(tokens*heads*width);
+    auto * kv=ggml_new_tensor_3d(context.get(),GGML_TYPE_F16,2*width,heads,queries);
+    auto * positions=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,queries);
+    auto * keys=solid::device_local_keys(context.get(),kv,positions,{ring.data(),capacity,solid::DeviceMemory::cuda},tokens);
+    auto * graph=ggml_new_graph_custom(context.get(),32,false); ggml_build_forward_expand(graph,keys);
+    std::unique_ptr<ggml_backend_buffer,decltype(&ggml_backend_buffer_free)> buffer(
+        ggml_backend_alloc_ctx_tensors(context.get(),backend.get()),ggml_backend_buffer_free);
+    require(buffer!=nullptr,"local Key CPU allocation");
+    const auto bits=[](int p,int h,int d) { return static_cast<solid::Half>(1+p*131+h*19+d); };
+    for (int first:{0,2,12,19}) {
+        for (int p=std::max(0,first-static_cast<int>(capacity));p<first;++p)
+            for (int h=0;h<heads;++h) for (int d=0;d<width;++d) ring[(p%capacity*heads+h)*width+d]=bits(p,h,d);
+        for (int p=0;p<queries;++p) for (int h=0;h<heads;++h) for (int d=0;d<width;++d) {
+            current[((p*heads+h)*2)*width+d]=bits(first+p,h,d);
+            current[((p*heads+h)*2+1)*width+d]=0xffff;
+        }
+        const std::int32_t pos[]{first,first+1,first+2};
+        ggml_backend_tensor_set(kv,current.data(),0,current.size()*sizeof(solid::Half));
+        ggml_backend_tensor_set(positions,pos,0,sizeof(pos));
+        require(ggml_backend_graph_compute(backend.get(),graph)==GGML_STATUS_SUCCESS,"local Key CPU graph");
+        ggml_backend_tensor_get(keys,actual.data(),0,actual.size()*sizeof(solid::Half));
+        for (int h=0;h<heads;++h) for (int t=0;t<tokens;++t) for (int d=0;d<width;++d) {
+            const int p=first+queries-tokens+t;
+            require(actual[(h*tokens+t)*width+d]==(p<0?0:bits(p,h,d)),"local Key prefix, ring wrap or current input");
+        }
+    }
+}
 }
 int main() {
-    try { run(); std::cout<<"pure device graph operations, FP16 bits and strided layout passed on CPU\n"; return 0; }
+    try { run(); local_window(); std::cout<<"pure device graph operations, local Key window, FP16 bits and strided layout passed on CPU\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

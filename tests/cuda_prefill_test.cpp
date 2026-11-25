@@ -165,6 +165,24 @@ void sparse_prefill(int device) {
             after.output_download_bytes == before.output_download_bytes &&
             after.upload_bytes - before.upload_bytes == (packed.size() - current.size()) * sizeof(solid::Half),
             "direct sparse prefill transferred GPU input or output through host");
+        constexpr std::uint32_t ring_capacity = 7;
+        std::vector<solid::Half> ring(ring_capacity * heads * width);
+        for (auto p = first - ring_capacity; p < first; ++p) for (std::uint32_t h = 0; h < heads; ++h)
+            std::copy_n(raw[p].data() + 2 * h * width, width, ring.data() + (p % ring_capacity * heads + h) * width);
+        auto device_ring = device_buffer<solid::Half>(ring.size());
+        upload_ready(device_ring.get(), ring.data(), ring.size());
+        backend->begin_sparse_local({first, queries, .125f, local, rope, query,
+            {device_kv.get(), current.size(), solid::DeviceMemory::cuda},
+            {device_ring.get(), ring_capacity, solid::DeviceMemory::cuda}});
+        const auto after_local = backend->mean_sparse_query_async(query, queries);
+        test_tiled::require(event_ranker->rank_device_after_event(0, after_local, request) == expected_ranking,
+            "local-first prefill changed retrieval");
+        const auto staged = backend->sparse({first, queries, .125f, local, rope, positions, {}, packed, fixed, query,
+            {device_result.get(), q.size(), solid::DeviceMemory::cuda},
+            {device_kv.get(), current.size(), solid::DeviceMemory::cuda}});
+        cuda_check(cudaMemcpy(output.data(), device_result.get(), output.size() * sizeof(float), cudaMemcpyDeviceToHost));
+        test_tiled::close(output, expected, 2e-3f);
+        test_tiled::close(staged.key_scores, feedback, 2e-3f);
     }
 
     packed[width] = solid::to_half(std::numeric_limits<float>::quiet_NaN());

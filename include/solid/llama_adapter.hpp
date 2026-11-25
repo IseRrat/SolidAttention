@@ -64,13 +64,15 @@ public:
     ~AttentionNode();
     ggml_tensor * build(ggml_context * context, ggml_tensor * query, ggml_tensor * key, ggml_tensor * value,
                        ggml_tensor * packed_kv = nullptr, ggml_backend_sched * scheduler = nullptr,
-                       ggml_backend * decode_backend = nullptr, ggml_cgraph * graph = nullptr);
+                       ggml_backend * decode_backend = nullptr, ggml_cgraph * graph = nullptr,
+                       ggml_tensor * absolute_positions = nullptr);
     void check() const;
     bool can_reuse(std::uint64_t next_position) const;
     ggml_tensor * host_node() const;
     ggml_tensor * metadata_node() const;
     ggml_tensor * selection_node() const;
     ggml_tensor * attention_node() const;
+    ggml_tensor * local_attention_node() const;
     void set_query_proof(bool covers_previous_attention);
     void defer_completion();
     void complete_attention();

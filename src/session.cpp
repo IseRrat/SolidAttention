@@ -157,6 +157,12 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
             const float * query = archived ? nullptr : queries.data() + start * qwidth;
             const DeviceQuery chunk_query = archived ?
                 DeviceQuery{device_query.data + start * qwidth, count * qwidth, device_query.memory} : DeviceQuery{};
+            const DeviceKvBatch chunk_kv = archived ?
+                DeviceKvBatch{device_kv.data + start * 2 * kwidth, count * 2 * kwidth, device_kv.memory} : DeviceKvBatch{};
+            if (archived && device_probabilities() && device_query.memory == DeviceMemory::cuda) {
+                prefill_->begin_sparse_local({position, count, scale, budget_.local, *rope_, chunk_query,
+                    chunk_kv, representatives_->probability_key_window(layer)});
+            }
             const auto selection_start = Clock::now();
             const auto context = [&] {
                 if (archived) {
@@ -204,8 +210,6 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
                 if (!archived) batch.assign(query, query + count * qwidth);
                 const DeviceOutput chunk_output = archived ?
                     DeviceOutput{device_output.data + start * qwidth, count * qwidth, device_output.memory} : DeviceOutput{};
-                const DeviceKvBatch chunk_kv = archived ?
-                    DeviceKvBatch{device_kv.data + start * 2 * kwidth, count * 2 * kwidth, device_kv.memory} : DeviceKvBatch{};
                 device = prefill_->sparse({position, count, scale, budget_.local, *rope_, positions, batch,
                                            prefill_tile_, context.local_only_from, chunk_query, chunk_output, chunk_kv,
                                            device_probabilities()});

@@ -1,6 +1,7 @@
 #pragma once
 
 #include "solid/device_ops.hpp"
+#include "solid/local_keys.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 
@@ -31,6 +32,14 @@ inline cudaError_t cuda_device_op(ggml_tensor * output, cudaStream_t stream) {
     const auto count = static_cast<std::uint64_t>(ggml_nelements(output));
     const auto grid = static_cast<unsigned>((count+255)/256 > 65535 ? 65535 : (count+255)/256);
     switch (device_op(output)) {
+        case DeviceOp::local_keys: {
+            const auto binding = local_keys_binding(output);
+            device_ops_detail::gather_local_keys<<<grid,256,0,stream>>>(reinterpret_cast<const std::uint16_t *>(binding.ring),
+                static_cast<const std::uint16_t *>(output->src[0]->data), static_cast<std::uint16_t *>(output->data),
+                static_cast<const std::int32_t *>(output->src[1]->data), 0, output->src[0]->ne[2], output->ne[1],
+                binding.capacity, output->ne[2], output->ne[0]);
+            break;
+        }
         case DeviceOp::query_token:
         case DeviceOp::kv_token:
             if (auto * interval=device_timing(output)) interval->record(stream,true);

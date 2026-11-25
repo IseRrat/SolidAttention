@@ -80,6 +80,7 @@ public:
     const std::optional<RelativeRope> & relative_rope() const { return rope_; }
     void observe_probabilities(std::uint32_t layer, std::uint64_t position, const std::vector<float> & probabilities);
     bool device_probabilities() const { return representatives_ && representatives_->device_probabilities(); }
+    DeviceKeyWindow probability_key_window(std::uint32_t layer) const { return representatives_->probability_key_window(layer); }
     void observe_device_probabilities(std::uint32_t layer, std::uint64_t position, DeviceKvBatch kv, DeviceQuery scores,
         void * compute_stream = nullptr, bool on_compute = false);
     void finish_device_probabilities();

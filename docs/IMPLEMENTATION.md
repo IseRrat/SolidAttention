@@ -88,6 +88,10 @@
 
    两条稀疏路径的 K/V 在矩阵乘法中使用 FP16，累加精度设为 FP32。近期槽位索引按 query head 和时间顺序生成，设备上的 GET_ROWS 从概率表中只取近期分数。CPU 回执接收近期分数和一个 attention 完成标量，确认本层归档后更新代表索引。attention 输出通过带回执依赖的原地设备节点直接交给后续层。CPU、CUDA、SYCL 均实现该节点，数值回归覆盖解码图复用、近期索引和原生完成通知。
 
+   CUDA 设备概率路径按原版 `_append` 拆分近期、历史两个 attention 分支。`DeviceKeyWindow` 暴露既有代表构造 raw-K 环的只读视图；`local_keys.cuh` 按绝对位置聚集近期 Key 和本组新 Key，支持环绕、起始填零及 GQA 的 KV-head 存储。`device_ops.cpp`、`device_ops.cuh`、`sycl_device_ops.hpp` 提供图内聚集操作，绑定保留 GGML 自定义回调参数。`llama_adapter.cpp` 在历史选块、补读的主机前沿之前展开局部 RoPE 和 QK；SolidAttention 先展开论文要求的 Q 前沿选块，再展开局部 QK。历史就绪后，按局部、历史顺序拼接 logits，执行一次联合 softmax，分别计算两部分 PV 后相加。局部概率直接交给代表更新；完成通知在两部分 PV 及输出整理完成后发布。分离缓存直接按物理行索引聚集所需的两部分，省去先构造全量逻辑 K/V 的中间副本。`attention.hpp`、`block_ranker.hpp`、`session.hpp`、`llama_adapter.hpp` 转发只读窗口及图入口。
+
+   `tiled_prefill.hpp`、`session.cpp`、`tiled_prefill.cu` 将 CUDA Prefill 分为局部 QK 提交和历史检索后的联合计算。每组先从 raw-K 环和当前设备 K 构造局部 Key、提交局部 QK，再生成检索 Q 均值并提交历史块评分。局部 Key 工作区按 attention tile 容量分配，所有层复用；联合 softmax 后，已完成的 F32 logits 工作区复用为两部分 F16 概率矩阵，局部 Key 工作区复用为局部 V 矩阵。cuBLAS 先计算局部 PV，再累加历史 PV。近期概率仍按唯一 token 掩码汇总。`device_ops_test.cpp`、`cuda_device_input_test.cu` 核对起始填零、环绕及图重放；`cuda_prefill_test.cpp` 对照普通路径与先局部计算路径的输出、近期分数和检索结果。`trace.cpp` 将两部分计算保留在同一个 Attention 阶段中。
+
    初始、历史和近期位置合并为唯一的 KV 位置列表。Prefill 按每个 query 的距离选择近期或历史 logits，同一位置在联合 softmax 和 V 累积中只计入一次；分组内已过期的临时近期行按掩码处理。
 
    CUDA 选块器启用设备概率累计时，近期分数和当前 FP16 Key 直接交给 GPU 的环形缓冲。每个 query head 独立累加分数，整块退出近期窗口时在 GPU 生成均值代表。CPU 接收完成块数量和状态。Prefill 的按 key 汇总分数与 Decode 的单 token 分数接入同一条更新路径。回归用例覆盖 96-token 输入组、逐 token 解码和环形缓冲周转；CPU 参考按同样的 Prefill 分组、Decode 单步边界累计 FP16 分数。[attention.cpp](../src/attention.cpp)、[attention.hpp](../include/solid/attention.hpp)、[block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[session.cpp](../src/session.cpp)、[session.hpp](../include/solid/session.hpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[tiled_prefill.hpp](../include/solid/tiled_prefill.hpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)。

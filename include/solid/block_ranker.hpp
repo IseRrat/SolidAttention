@@ -103,6 +103,7 @@ public:
     virtual bool configure_probability_builder(std::uint32_t, std::uint32_t, std::uint32_t) { return false; }
     virtual bool device_probabilities() const { return false; }
     virtual bool host_representative_metadata() const { return true; }
+    virtual DeviceKeyWindow probability_key_window(std::uint32_t) const { return {}; }
     virtual std::vector<BuiltRepresentatives> probability_update(const ProbabilityFrame &) {
         throw std::logic_error("device probability builder is disabled");
     }

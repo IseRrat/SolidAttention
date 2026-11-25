@@ -7,6 +7,12 @@
 
 namespace solid {
 enum class DeviceMemory { cuda, host_emulator, sycl };
+// InfLLM's existing pending raw-K ring; borrowed and read-only during attention.
+struct DeviceKeyWindow {
+    const Half * data = nullptr;
+    std::uint32_t capacity = 0;
+    DeviceMemory memory = DeviceMemory::cuda;
+};
 
 // Borrowed, producer-complete inputs. Retain the allocation through the
 // consuming call, or through receipt collection for an asynchronous API.

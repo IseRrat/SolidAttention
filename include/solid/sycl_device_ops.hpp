@@ -7,6 +7,23 @@ namespace solid {
 inline bool sycl_device_op(sycl::queue & queue, ggml_tensor * output) {
     if (!device_op_supported(output)) return false;
     switch (device_op(output)) {
+        case DeviceOp::local_keys: {
+            const auto binding = local_keys_binding(output);
+            const auto * ring = reinterpret_cast<const std::uint16_t *>(binding.ring);
+            const auto * current = static_cast<const std::uint16_t *>(output->src[0]->data);
+            const auto * position = static_cast<const std::int32_t *>(output->src[1]->data);
+            auto * target = static_cast<std::uint16_t *>(output->data);
+            const auto width = output->ne[0], tokens = output->ne[1], heads = output->ne[2], queries = output->src[0]->ne[2];
+            queue.parallel_for(sycl::range<1>(static_cast<std::size_t>(ggml_nelements(output))), [=](sycl::id<1> index) {
+                const auto i = static_cast<std::int64_t>(index[0]);
+                const auto first = static_cast<std::int64_t>(position[0]);
+                const auto p = first + queries - tokens + i / width % tokens;
+                const auto head = i / width / tokens, d = i % width;
+                target[i] = p < 0 ? std::uint16_t{0} : p >= first ? current[((p - first) * heads + head) * 2 * width + d] :
+                    ring[(p % binding.capacity * heads + head) * width + d];
+            });
+            return true;
+        }
         case DeviceOp::query_token:
         case DeviceOp::kv_token:
             if (auto * interval=device_timing(output)) interval->record(&queue,true);

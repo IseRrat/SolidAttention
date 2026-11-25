@@ -8,6 +8,16 @@
 
 namespace solid {
 struct RelativeRope;
+struct SparsePrefillLocalFrame {
+    std::uint64_t first_query;
+    std::uint32_t queries;
+    float scale;
+    std::uint32_t local;
+    const RelativeRope & rope;
+    DeviceQuery query;
+    DeviceKvBatch kv;
+    DeviceKeyWindow window;
+};
 struct SparsePrefillFrame {
     std::uint64_t first_query;
     std::uint32_t queries;
@@ -61,6 +71,9 @@ public:
     virtual PrefillStats stats() const = 0;
     virtual const char * name() const = 0;
     virtual bool supports_sparse() const { return false; }
+    // Enqueue native local QK before historical retrieval. Borrowed Q/KV and
+    // the representative K ring remain live through sparse()/abort().
+    virtual void begin_sparse_local(const SparsePrefillLocalFrame &) { throw std::logic_error("device local prefill is disabled"); }
     virtual DeviceQuery mean_sparse_query(DeviceQuery, std::uint32_t) { throw std::logic_error("device sparse query is disabled"); }
     // Retain the input Q until the ranker has consumed the returned event, or
     // this backend has completed its following sparse()/abort() call.

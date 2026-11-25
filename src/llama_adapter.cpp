@@ -365,6 +365,8 @@ struct AttentionNode::Impl {
     std::unique_ptr<PrefillOutput> prefill_output = {};
     ggml_tensor * host = nullptr;
     ggml_tensor * metadata = nullptr;
+    ggml_tensor * local_logits = nullptr;
+    std::int64_t local_source_rows = 0;
     ggml_tensor * early = nullptr;
     ggml_tensor * flash = nullptr;
     bool query_proof = false;
@@ -455,6 +457,58 @@ struct AttentionNode::Impl {
         } catch (...) {
             self.failure->capture(std::current_exception(), self.layer, self.frame->positions.empty() ? 0 : self.frame->positions.front());
             std::fill_n(static_cast<float *>(destination->data), ggml_nelements(destination), 0.f);
+        }
+    }
+    static void staged_metadata(ggml_tensor * destination, int ith, int, void * userdata) {
+        if (ith) return;
+        auto & self = *static_cast<Impl *>(userdata);
+        auto * physical = static_cast<std::int32_t *>(destination->data);
+        std::fill_n(physical, ggml_nelements(destination), 0);
+        try {
+            self.failure->check();
+            const auto budget = self.session.budget();
+            const auto total = budget.total, local = budget.local;
+            const auto heads = self.session.geometry().heads;
+            const auto group = self.session.query_heads() / heads;
+            const auto recent = std::min<std::uint64_t>(self.frame->positions.at(0) + 1, local);
+            const auto slots = ggml_nelements(destination->src[0]) / heads;
+            const auto * markers = static_cast<const Half *>(destination->src[0]->data);
+            const auto * host = static_cast<const Half *>(destination->src[1]->data);
+            const auto * source_indices = self.selected_cache ? reinterpret_cast<const std::int32_t *>(host) : nullptr;
+            const auto * mask = host + (self.selected_cache ? 2 * slots : 0);
+            auto * logical = physical + total * heads;
+            for (std::uint32_t h = 0; h < heads; ++h) {
+                auto * p = physical + h * total;
+                auto * l = logical + h * total;
+                std::fill_n(p, total, -1);
+                std::int32_t padding = -1;
+                std::uint32_t globals = 0;
+                for (std::int64_t i = 0; i < slots; ++i) {
+                    if (from_half(mask[h * group * slots + i]) != 0.f) { if (padding < 0) padding = i; continue; }
+                    const auto marker = static_cast<std::uint32_t>(from_half(markers[h * slots + i]));
+                    std::uint32_t target;
+                    if (marker) {
+                        if (marker <= local - recent || marker > local || p[marker - 1] != -1) throw std::logic_error("invalid or duplicate local slot");
+                        target = marker - 1;
+                    } else {
+                        if (globals == total - local) throw std::logic_error("historical selection exceeds its budget");
+                        target = local + globals++;
+                    }
+                    const auto row = source_indices ? source_indices[i] : static_cast<std::int32_t>(i);
+                    if (row < 0 || row >= self.local_source_rows) throw std::logic_error("invalid staged KV row");
+                    p[target] = row;
+                    l[target] = i;
+                }
+                for (std::uint32_t i = local - recent; i < local; ++i) if (p[i] < 0) throw std::logic_error("missing local KV row");
+                for (std::uint32_t i = 0; i < total; ++i) if (p[i] < 0) {
+                    if (padding < 0) throw std::logic_error("missing invalid slot for staged padding");
+                    p[i] = source_indices ? source_indices[padding] : padding;
+                    l[i] = padding;
+                }
+            }
+        } catch (...) {
+            self.failure->capture(std::current_exception(), self.layer);
+            std::fill_n(physical, ggml_nelements(destination), 0);
         }
     }
     static void decode_metadata(ggml_tensor * destination, int ith, int, void * userdata) {
@@ -656,7 +710,7 @@ AttentionNode::AttentionNode(AttentionSession & session, std::shared_ptr<Attenti
 AttentionNode::~AttentionNode() = default;
 ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, ggml_tensor * key, ggml_tensor * value,
                                   ggml_tensor * packed_kv, ggml_backend_sched * scheduler, ggml_backend * decode_backend,
-                                  ggml_cgraph * graph) {
+                                  ggml_cgraph * graph, ggml_tensor * absolute_positions) {
     const auto & g = impl_->session.geometry();
 #ifdef SOLID_HAVE_CUDA_SELECTION
     if (impl_->session.device_probabilities() && decode_backend && ggml_backend_is_cuda(decode_backend)) {
@@ -786,6 +840,23 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         inputs[input_count++] = on_device(ggml_dup(context, history));
         for (int i = 0; i < input_count; ++i) ggml_build_forward_expand(graph, inputs[i]);
     }
+    if (impl_->gathered && absolute_positions && impl_->session.device_probabilities()) {
+        const auto window = impl_->session.probability_key_window(impl_->layer);
+        if (window.data && window.memory == DeviceMemory::cuda) {
+            const auto local = impl_->session.budget().local;
+            const auto & rope = *impl_->session.relative_rope();
+            auto * local_keys = on_device(device_local_keys(context, impl_->device_kv, absolute_positions, window, local));
+            local_keys = on_device(ggml_cont(context, ggml_permute(context, local_keys, 0, 2, 1, 3)));
+            auto * relative = on_device(ggml_cast(context, on_device(ggml_arange(context, 0, local, 1)), GGML_TYPE_I32));
+            local_keys = on_device(ggml_rope_ext(context, local_keys, relative, nullptr, rope.dimensions,
+                rope.split_halves ? GGML_ROPE_TYPE_NEOX : GGML_ROPE_TYPE_NORMAL, 0, rope.base, 1, 0, 1, 0, 0));
+            local_keys = ggml_permute(context, local_keys, 0, 2, 1, 3);
+            impl_->local_logits = on_device(ggml_mul_mat(context, local_keys, ggml_permute(context, impl_->device_query, 0, 2, 1, 3)));
+            ggml_prec_set_acc(impl_->local_logits, GGML_PREC_F32);
+            ggml_format_name(impl_->local_logits, "infllm.local.QK.L%u", impl_->layer);
+            if (graph && !impl_->prefetch) ggml_build_forward_expand(graph, impl_->local_logits);
+        }
+    }
     if (impl_->gathered && query->ne[2] != 1) throw std::invalid_argument("gathered attention requires one decode token");
     const auto elements = impl_->selected_cache ? static_cast<std::uint64_t>(impl_->session.gather_slots()) *
         (2 + impl_->session.query_heads() + g.heads) : impl_->prefetch ? static_cast<std::uint64_t>(impl_->prefetch->tokens_per_head()) *
@@ -797,11 +868,103 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
                                    inputs, input_count, Impl::compute, 1, impl_.get());
     ggml_set_name(result, "solid_sync_attention");
     impl_->host = result;
+    const auto finish_infllm = [&](ggml_tensor * logits, ggml_tensor * output, ggml_tensor * compact, bool staged) {
+        if (impl_->prefetch) {
+            if (auto * token = impl_->prefetch->completion_token(impl_->layer)) {
+                if (impl_->prefetch->completion_host_marker()) {
+                    auto * source = output;
+                    output = ggml_custom_4d(context, GGML_TYPE_F32, source->ne[0], source->ne[1], source->ne[2], source->ne[3],
+                        &source, 1, Impl::publish_completion, 1, token);
+                    ggml_set_name(output, "solid_infllm_completion_emulator");
+                }
+#ifdef SOLID_HAVE_CUDA_SELECTION
+                else if (decode_backend && ggml_backend_is_cuda(decode_backend)) {
+                    static_assert(stream_completion_offset + sizeof(StreamCompletionBinding) <= GGML_MAX_OP_PARAMS);
+                    bind_stream_completion(logits->op_params, sizeof(logits->op_params), token, CompletionPhase::begin);
+                    if (!staged) bind_stream_completion(output->op_params, sizeof(output->op_params), token, CompletionPhase::end);
+                }
+#endif
+            }
+        }
+        if (impl_->session.device_probabilities()) {
+            impl_->device_scores = compact;
+            compact = on_device(device_query_token(context, compact));
+        }
+        output = on_device(ggml_cont(context, ggml_reshape_2d(context, output, g.dimension * impl_->session.query_heads(), 1)));
+#ifdef SOLID_HAVE_CUDA_SELECTION
+        if (staged && impl_->prefetch && decode_backend && ggml_backend_is_cuda(decode_backend)) {
+            if (auto * token = impl_->prefetch->completion_token(impl_->layer))
+                bind_stream_completion(output->op_params, sizeof(output->op_params), token, CompletionPhase::end);
+        }
+#endif
+        auto * ready = on_device(device_query_token(context, output,
+            impl_->session.device_probabilities() ? impl_->device_kv : nullptr));
+        ggml_tensor * receipt_inputs[]{compact, ready};
+        auto * received = ggml_custom_4d(context, GGML_TYPE_F32, 1, 1, 1, 1,
+            receipt_inputs, 2, Impl::receive_attention, 1, impl_.get());
+        ggml_set_name(received, "solid_infllm_attention_receipt");
+        return on_device(device_attention_result(context, output, received,
+            impl_->session.device_probabilities() ? impl_->device_kv : nullptr, impl_->device_scores));
+    };
     const auto infllm_attention = [&](ggml_tensor * q, ggml_tensor * keys, ggml_tensor * values,
                                       ggml_tensor * mask, std::size_t marker_offset) {
-        const auto slots = keys->ne[1];
+        const auto slots = mask->ne[0];
         const auto & rope = *impl_->session.relative_rope();
         auto * markers = ggml_view_1d(context, impl_->host, slots * g.heads, marker_offset);
+        if (impl_->local_logits) {
+            const auto local = impl_->session.budget().local;
+            const auto total = impl_->session.budget().total;
+            const auto global = total - local;
+            const auto query_heads = impl_->session.query_heads();
+            impl_->local_source_rows = keys->ne[1];
+            ggml_tensor * sources[]{markers, impl_->host};
+            impl_->metadata = ggml_custom_4d(context, GGML_TYPE_I32, total, g.heads, 2, 1,
+                                            sources, 2, Impl::staged_metadata, 1, impl_.get());
+            ggml_set_name(impl_->metadata, "infllm_staged_indices");
+            auto * logical = ggml_view_3d(context, impl_->metadata, total, 1, g.heads,
+                total * sizeof(std::int32_t), total * sizeof(std::int32_t), total * g.heads * sizeof(std::int32_t));
+            logical = ggml_reshape_2d(context, logical, total, g.heads);
+            auto * head_mask = ggml_view_3d(context, mask, 1, slots, g.heads,
+                sizeof(Half), slots * (query_heads / g.heads) * sizeof(Half), 0);
+            auto * joint_mask = on_device(ggml_get_rows(context, head_mask, logical));
+            joint_mask = ggml_reshape_3d(context, joint_mask, total, 1, g.heads);
+            joint_mask = on_device(ggml_repeat_4d(context, joint_mask, total, query_heads / g.heads, g.heads, 1));
+            joint_mask = ggml_reshape_3d(context, joint_mask, total, 1, query_heads);
+            const auto indices = [&](std::uint32_t count, std::uint32_t first) {
+                return on_device(ggml_cont(context, ggml_view_2d(context, impl_->metadata, count, g.heads,
+                    total * sizeof(std::int32_t), first * sizeof(std::int32_t))));
+            };
+            auto * local_indices = indices(local, 0);
+            auto * global_indices = global ? indices(global, local) : nullptr;
+            const auto gather = [&](ggml_tensor * rows, ggml_tensor * ids) {
+                return on_device(ggml_cast(context, on_device(ggml_get_rows(context, rows, ids)), GGML_TYPE_F16));
+            };
+            auto * local_values = gather(values, local_indices);
+            ggml_tensor * global_logits = nullptr, * global_values = nullptr;
+            if (global) {
+                global_logits = on_device(ggml_mul_mat(context, gather(keys, global_indices), q));
+                ggml_prec_set_acc(global_logits, GGML_PREC_F32);
+                ggml_format_name(global_logits, "infllm.QK.L%u", impl_->layer);
+                global_values = gather(values, global_indices);
+            }
+            auto * logits = global ? on_device(ggml_concat(context, impl_->local_logits, global_logits, 0)) : impl_->local_logits;
+            auto * probabilities = on_device(ggml_soft_max_ext(context, logits, joint_mask, impl_->scale, 0));
+            ggml_format_name(probabilities, "infllm.softmax.L%u", impl_->layer);
+            const auto probability_view = [&](std::uint32_t count, std::uint32_t first) {
+                return on_device(ggml_cont(context, ggml_view_3d(context, probabilities, count, 1, query_heads,
+                    probabilities->nb[1], probabilities->nb[2], first * sizeof(float))));
+            };
+            auto * local_probabilities = probability_view(local, 0);
+            const auto multiply = [&](ggml_tensor * v, ggml_tensor * p) {
+                auto * output = on_device(ggml_mul_mat(context, on_device(ggml_cont(context, ggml_transpose(context, v))), p));
+                ggml_prec_set_acc(output, GGML_PREC_F32);
+                return output;
+            };
+            auto * output = multiply(local_values, local_probabilities);
+            if (global) output = on_device(ggml_add(context, output, multiply(global_values, probability_view(global, local))));
+            ggml_format_name(output, "infllm.PV.L%u", impl_->layer);
+            return finish_infllm(global_logits ? global_logits : probabilities, output, local_probabilities, true);
+        }
         const auto position_count = slots * g.heads;
         const auto index_count = static_cast<std::int64_t>(impl_->session.budget().local) * impl_->session.query_heads();
         impl_->metadata = ggml_custom_4d(context, GGML_TYPE_I32, position_count + index_count, 1, 1, 1,
@@ -825,38 +988,9 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         auto * output = on_device(ggml_mul_mat(context, transposed_values, probabilities));
         ggml_format_name(output, "infllm.PV.L%u", impl_->layer);
         ggml_prec_set_acc(output, GGML_PREC_F32);
-        if (impl_->prefetch) {
-            if (auto * token = impl_->prefetch->completion_token(impl_->layer)) {
-                if (impl_->prefetch->completion_host_marker()) {
-                    auto * source = output;
-                    output = ggml_custom_4d(context, GGML_TYPE_F32, source->ne[0], source->ne[1], source->ne[2], source->ne[3],
-                        &source, 1, Impl::publish_completion, 1, token);
-                    ggml_set_name(output, "solid_infllm_completion_emulator");
-                }
-#ifdef SOLID_HAVE_CUDA_SELECTION
-                else if (decode_backend && ggml_backend_is_cuda(decode_backend)) {
-                    static_assert(stream_completion_offset + sizeof(StreamCompletionBinding) <= GGML_MAX_OP_PARAMS);
-                    bind_stream_completion(logits->op_params, sizeof(logits->op_params), token, CompletionPhase::begin);
-                    bind_stream_completion(output->op_params, sizeof(output->op_params), token, CompletionPhase::end);
-                }
-#endif
-            }
-        }
         auto * compact = on_device(ggml_get_rows(context, ggml_reshape_2d(context, probabilities, 1, slots * impl_->session.query_heads()), indices));
         ggml_set_name(compact, "solid_infllm_recent_scores");
-        if (impl_->session.device_probabilities()) {
-            impl_->device_scores = compact;
-            compact = on_device(device_query_token(context, compact));
-        }
-        output = on_device(ggml_cont(context, ggml_reshape_2d(context, output, g.dimension * impl_->session.query_heads(), 1)));
-        auto * ready = on_device(device_query_token(context, output,
-            impl_->session.device_probabilities() ? impl_->device_kv : nullptr));
-        ggml_tensor * receipt_inputs[]{compact, ready};
-        auto * received = ggml_custom_4d(context, GGML_TYPE_F32, 1, 1, 1, 1,
-            receipt_inputs, 2, Impl::receive_attention, 1, impl_.get());
-        ggml_set_name(received, "solid_infllm_attention_receipt");
-        return on_device(device_attention_result(context, output, received,
-            impl_->session.device_probabilities() ? impl_->device_kv : nullptr, impl_->device_scores));
+        return finish_infllm(logits, output, compact, false);
     };
     if (impl_->prefill_output) {
         result=on_device(device_prefill_result(context,impl_->prefill_output->tensor,result,impl_->device_query,impl_->device_kv));
@@ -893,6 +1027,14 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         result = ggml_reshape_2d(context, result, g.dimension * impl_->session.query_heads(), 1);
     } else if (impl_->selected_cache) {
         const auto slots = impl_->session.gather_slots();
+        if (impl_->local_logits) {
+            const auto offset = static_cast<std::size_t>(slots) * sizeof(std::int32_t);
+            auto * mask = ggml_view_3d(context, result, slots, 1, impl_->session.query_heads(),
+                slots * sizeof(Half), slots * sizeof(Half), offset);
+            return infllm_attention(ggml_permute(context, impl_->device_query, 0, 2, 1, 3),
+                impl_->selected_cache->plane(context, false), impl_->selected_cache->plane(context, true), mask,
+                offset + static_cast<std::size_t>(slots) * impl_->session.query_heads() * sizeof(Half));
+        }
         auto * indices = ggml_custom_4d(context, GGML_TYPE_I32, slots, g.heads, 1, 1, &result, 1, Impl::cache_indices, 1, nullptr);
         ggml_set_name(indices, "infllm_selected_kv_indices");
         const auto gather = [&](bool values) {
@@ -950,6 +1092,7 @@ bool AttentionNode::can_reuse(std::uint64_t next_position) const {
 }
 ggml_tensor * AttentionNode::host_node() const { return impl_->host; }
 ggml_tensor * AttentionNode::metadata_node() const { return impl_->metadata; }
+ggml_tensor * AttentionNode::local_attention_node() const { return impl_->local_logits; }
 ggml_tensor * AttentionNode::selection_node() const { return impl_->early; }
 ggml_tensor * AttentionNode::attention_node() const { return impl_->flash; }
 void AttentionNode::set_query_proof(bool covers) { impl_->query_proof = covers; }
@@ -1403,11 +1546,13 @@ ggml_tensor * adapter_attention(const llm_graph_context & graph, llm_graph_input
     const bool gathered = query->ne[2] == 1 && graph.ubatch.pos && graph.ubatch.pos[0] >= 0 &&
         custom->adapter.gathered_decode(static_cast<std::uint64_t>(graph.ubatch.pos[0]));
     ggml_tensor * packed = nullptr;
+    ggml_tensor * absolute_positions = nullptr;
     const auto & rope = custom->adapter.relative_rope();
     if (rope) {
         if (query->op != GGML_OP_ROPE || key->op != GGML_OP_ROPE) {
             throw std::logic_error("InfLLM requires raw Q/K before the model RoPE operation");
         }
+        absolute_positions = query->src[1];
         if (!custom->retrieval_positions) {
             custom->retrieval_positions = ggml_new_tensor_1d(graph.ctx0, GGML_TYPE_I32, query->ne[2]);
             ggml_set_input(custom->retrieval_positions);
@@ -1421,7 +1566,7 @@ ggml_tensor * adapter_attention(const llm_graph_context & graph, llm_graph_input
     }
     auto * device=layer_backend(graph,layer);
     auto node = custom->adapter.node(custom->frame, static_cast<std::uint32_t>(layer), scale, gathered, device);
-    auto * result = node->build(graph.ctx0, query, key, value, packed, graph.sched, device, graph.gf);
+    auto * result = node->build(graph.ctx0, query, key, value, packed, graph.sched, device, graph.gf, absolute_positions);
     if (node->selection_node()) {
         if (!custom->nodes.empty() && custom->nodes.back()->attention_node()) {
             const auto * previous = custom->nodes.back()->attention_node();
@@ -1435,6 +1580,7 @@ ggml_tensor * adapter_attention(const llm_graph_context & graph, llm_graph_input
         if (layer + 1 == static_cast<int>(graph.hparams.n_layer())) node->defer_completion();
     }
     ggml_backend_sched_set_tensor_backend(graph.sched, node->host_node(), graph.backend_cpu);
+    if (node->local_attention_node()) ggml_build_forward_expand(graph.gf, node->local_attention_node());
     if (auto * metadata = node->metadata_node()) {
         // Both tables depend only on the completed host frontier. Schedule
         // them together before K copies/rotation/QK/PV; no CPU index node

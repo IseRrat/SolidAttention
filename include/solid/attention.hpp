@@ -40,6 +40,9 @@ public:
     void observe_prefill_scores(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
                                 const std::vector<Half> & kv, const std::vector<float> & key_scores);
     bool device_probabilities() const { return device_probabilities_; }
+    DeviceKeyWindow probability_key_window(std::uint32_t layer) const {
+        return ranker_ && device_probabilities_ ? ranker_->probability_key_window(layer) : DeviceKeyWindow{};
+    }
     void observe_device_probabilities(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
                                      DeviceKvBatch kv, DeviceQuery scores, bool key_major, void * compute_stream = nullptr,
                                      bool on_compute = false);

@@ -59,6 +59,13 @@ void operations() {
     auto * kv=solid::device_consolidate_kv(context.get(),k,v,q,early);
     auto * mask=ggml_new_tensor_1d(context.get(),GGML_TYPE_F16,79);
     auto * release=solid::device_release_mask(context.get(),mask,kv);
+    constexpr int ring_capacity=7, local_tokens=8;
+    DeviceBuffer ring(ring_capacity*heads*width*sizeof(solid::Half));
+    auto * positions=ggml_new_tensor_1d(context.get(),GGML_TYPE_I32,tokens);
+    auto * local=solid::device_local_keys(context.get(),kv,positions,
+        {static_cast<solid::Half *>(ring.data),ring_capacity,solid::DeviceMemory::cuda},local_tokens);
+    DeviceBuffer position_data(ggml_nbytes(positions)),local_data(ggml_nbytes(local));
+    positions->data=position_data.data; local->data=local_data.data;
     DeviceBuffer input(ggml_nbytes(packed)),query(ggml_nbytes(q)),frontier(4),marker(4),output(ggml_nbytes(kv)),
         masks(ggml_nbytes(mask)),released(ggml_nbytes(release));
     packed->data=input.data; k->data=input.data; v->data=static_cast<float *>(input.data)+width;
@@ -74,10 +81,19 @@ void operations() {
     checked(solid::cuda_device_op(token,capture.stream),"capture query frontier");
     checked(solid::cuda_device_op(kv,capture.stream),"capture FP16 KV");
     checked(solid::cuda_device_op(release,capture.stream),"capture KV release");
+    checked(solid::cuda_device_op(local,capture.stream),"capture local Key window");
     checked(cudaStreamEndCapture(capture.stream,&capture.graph),"finish input capture");
     checked(cudaGraphInstantiate(&capture.executable,capture.graph,nullptr,nullptr,0),"instantiate input graph");
     const float edge[]{0.0f,-0.0f,0x1p-25f,0x1.8p-24f,0x1.ffcp-15f,1.00048828125f,1.00146484375f,65504.0f,65520.0f,-65520.0f};
     for (int epoch=0;epoch<3;++epoch) {
+        const int first=epoch==0?0:epoch==1?2:12;
+        const std::int32_t pos[]{first,first+1,first+2};
+        std::vector<solid::Half> ring_keys(ring_capacity*heads*width);
+        for (int p=std::max(0,first-ring_capacity);p<first;++p)
+            for (int h=0;h<heads;++h) for (int d=0;d<width;++d)
+                ring_keys[(p%ring_capacity*heads+h)*width+d]=static_cast<solid::Half>(1+p*131+h*19+d);
+        checked(cudaMemcpy(ring.data,ring_keys.data(),ring_keys.size()*sizeof(solid::Half),cudaMemcpyHostToDevice),"initialize Key ring");
+        checked(cudaMemcpy(position_data.data,pos,sizeof(pos),cudaMemcpyHostToDevice),"replace local positions");
         for (int p=0;p<tokens;++p) for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)
             values[(p*heads+h)*(2*width+3)+plane*width+d]=edge[(p+d+h+plane+epoch)%10];
         checked(cudaMemcpy(input.data,values.data(),ggml_nbytes(packed),cudaMemcpyHostToDevice),"replace captured input");
@@ -85,6 +101,14 @@ void operations() {
         checked(cudaStreamSynchronize(capture.stream),"complete input operations");
         checked(cudaMemcpy(actual.data(),output.data,ggml_nbytes(kv),cudaMemcpyDeviceToHost),"read FP16 bits");
         checked(cudaMemcpy(actual_mask.data(),released.data,ggml_nbytes(release),cudaMemcpyDeviceToHost),"read released mask bits");
+        std::vector<solid::Half> local_result(ggml_nelements(local));
+        checked(cudaMemcpy(local_result.data(),local_data.data,ggml_nbytes(local),cudaMemcpyDeviceToHost),"read local Key window");
+        for (int h=0;h<heads;++h) for (int t=0;t<local_tokens;++t) for (int d=0;d<width;++d) {
+            const int p=first+tokens-local_tokens+t;
+            const auto expected=p<0?solid::Half{0}:p<first?ring_keys[(p%ring_capacity*heads+h)*width+d]:
+                actual[((p-first)*heads+h)*2*width+d];
+            require(local_result[(h*local_tokens+t)*width+d]==expected,"captured local Key prefix, ring wrap or current input");
+        }
         float zero=1; checked(cudaMemcpy(&zero,marker.data,4,cudaMemcpyDeviceToHost),"read scalar token");
         require(zero==0 && actual_mask==expected_mask,"captured token or mask changed");
         for (int p=0;p<tokens;++p) for (int h=0;h<heads;++h) for (int plane=0;plane<2;++plane) for (int d=0;d<width;++d)

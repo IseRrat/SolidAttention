@@ -2,12 +2,21 @@
 
 #include "ggml.h"
 #include "solid/device_timing.hpp"
+#include "solid/device_input.hpp"
 #include "solid/stream_completion.hpp"
 #include <cstdint>
 #include <cstring>
 
 namespace solid {
-enum class DeviceOp : std::uint32_t { none = 0, query_token = 1, consolidate_kv = 2, release_mask = 3, prefill_result = 4, kv_token = 5, attention_result = 6 };
+enum class DeviceOp : std::uint32_t { none = 0, query_token = 1, consolidate_kv = 2, release_mask = 3, prefill_result = 4, kv_token = 5, attention_result = 6, local_keys = 7 };
+struct LocalKeysBinding { std::uint64_t ring = 0; std::uint32_t capacity = 0, reserved = 0; };
+inline constexpr std::size_t local_keys_offset = 48;
+inline LocalKeysBinding local_keys_binding(const ggml_tensor * tensor) {
+    LocalKeysBinding binding{};
+    static_assert(local_keys_offset + sizeof(binding) <= GGML_MAX_OP_PARAMS);
+    std::memcpy(&binding, reinterpret_cast<const unsigned char *>(tensor->op_params) + local_keys_offset, sizeof(binding));
+    return binding;
+}
 struct DeviceOpBinding {
     std::uint64_t magic = 0x534f4c49444f5031ull;
     std::uint32_t version = 1;
@@ -31,6 +40,15 @@ inline bool device_op_supported(const ggml_tensor * tensor) {
             source->nb[2] >= static_cast<std::size_t>(source->ne[1])*source->nb[1];
     };
     switch (device_op(tensor)) {
+        case DeviceOp::local_keys: {
+            const auto binding = local_keys_binding(tensor);
+            return binding.ring && binding.capacity && a && a->type == GGML_TYPE_F16 && ggml_is_contiguous(a) &&
+                a->ne[0] == 2 * tensor->ne[0] && a->ne[1] == tensor->ne[2] && a->ne[2] > 0 && a->ne[3] == 1 &&
+                tensor->type == GGML_TYPE_F16 && tensor->ne[1] >= a->ne[2] && tensor->ne[3] == 1 &&
+                binding.capacity >= tensor->ne[1] - a->ne[2] &&
+                tensor->src[1] && tensor->src[1]->type == GGML_TYPE_I32 && ggml_is_contiguous(tensor->src[1]) &&
+                ggml_nelements(tensor->src[1]) >= a->ne[2];
+        }
         case DeviceOp::attention_result:
             return a && a->type == GGML_TYPE_F32 && ggml_is_contiguous(a) &&
                 tensor->type == GGML_TYPE_F32 && ggml_are_same_shape(a, tensor) &&
@@ -68,6 +86,8 @@ ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query, gg
 ggml_tensor * device_attention_result(ggml_context * context, ggml_tensor * output, ggml_tensor * receipt,
     ggml_tensor * kv = nullptr, ggml_tensor * scores = nullptr);
 ggml_tensor * device_kv_token(ggml_context * context, ggml_tensor * kv);
+ggml_tensor * device_local_keys(ggml_context * context, ggml_tensor * current_kv, ggml_tensor * positions,
+                               const DeviceKeyWindow & window, std::uint32_t tokens);
 ggml_tensor * device_consolidate_kv(ggml_context * context, ggml_tensor * key, ggml_tensor * value,
                                    ggml_tensor * query, ggml_tensor * early_selection);
 ggml_tensor * device_release_mask(ggml_context * context, ggml_tensor * mask, ggml_tensor * kv, ggml_tensor * query = nullptr);

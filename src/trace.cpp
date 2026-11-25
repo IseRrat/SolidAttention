@@ -115,9 +115,11 @@ thread_local ComputePhase computation;
 ComputeScope::ComputeScope(const char * op, const char * input, const char * output, void * stream) noexcept {
     if (!enabled()) return;
     unsigned layer = UINT32_MAX;
-    if (std::sscanf(output, "infllm.QK.L%u", &layer) == 1) {
-        computation.attention = Range("GPU Attention", layer);
-        computation.stream = stream;
+    if (std::sscanf(output, "infllm.local.QK.L%u", &layer) == 1 || std::sscanf(output, "infllm.QK.L%u", &layer) == 1) {
+        if (!computation.stream) {
+            computation.attention = Range("GPU Attention", layer);
+            computation.stream = stream;
+        }
     } else if (std::sscanf(output, "infllm.PV.L%u", &layer) == 1) {
         attention_end_ = computation.stream == stream;
     } else if (!std::strcmp(op, "FLASH_ATTN_EXT")) {

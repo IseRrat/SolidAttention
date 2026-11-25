@@ -2,6 +2,7 @@
 #include "solid/trace.hpp"
 #include "solid/attention.hpp"
 #include "solid/online_attention.hpp"
+#include "solid/local_keys.cuh"
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
 #include <cublas_v2.h>
@@ -267,7 +268,7 @@ __global__ void rotate_local_keys(__half * keys, const std::uint64_t * positions
     for (auto i = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < size;
          i += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
         const auto pair = i % (rotary / 2), row = i / (rotary / 2);
-        const auto position = positions[row % tokens];
+        const auto position = positions ? positions[row % tokens] : origin + row % tokens;
         if (position < origin) continue;
         const auto x = row * width + (split_halves ? pair : 2 * pair);
         const auto y = x + (split_halves ? rotary / 2 : 1);
@@ -282,18 +283,18 @@ __global__ void rotate_local_keys(__half * keys, const std::uint64_t * positions
 __global__ void sparse_softmax(const float * global_scores, const float * local_scores, __half * probabilities,
     const std::uint64_t * positions, int * error, std::uint64_t first,
     std::uint32_t count, std::uint32_t local, std::uint32_t tokens,
-    std::uint32_t local_only_from) {
+    std::uint32_t local_only_from, std::uint64_t origin, std::uint32_t local_tokens) {
     __shared__ float reduction[256];
     const auto row = static_cast<std::uint64_t>(blockIdx.x);
     const auto p = first + row % count;
     const auto * global = global_scores + row * tokens;
-    const auto * nearby = local_scores + row * tokens;
+    const auto * nearby = local_scores + row * local_tokens;
     auto * weights = probabilities + row * tokens;
     float maximum = -CUDART_INF_F;
     for (auto i = threadIdx.x; i < tokens; i += blockDim.x) {
         if (positions[i] > p) break;
         if (i >= local_only_from && p - positions[i] >= local) continue;
-        const auto score = p - positions[i] < local ? nearby[i] : global[i];
+        const auto score = p - positions[i] < local ? nearby[positions[i] - origin] : global[i];
         if (isfinite(score)) maximum = fmaxf(maximum, score);
         else atomicExch(error, 1);
     }
@@ -309,7 +310,7 @@ __global__ void sparse_softmax(const float * global_scores, const float * local_
     for (auto i = threadIdx.x; i < tokens; i += blockDim.x) {
         if (positions[i] > p) break;
         if (i >= local_only_from && p - positions[i] >= local) continue;
-        const auto score = p - positions[i] < local ? nearby[i] : global[i];
+        const auto score = p - positions[i] < local ? nearby[positions[i] - origin] : global[i];
         sum += expf(score - maximum);
     }
     reduction[threadIdx.x] = sum;
@@ -328,7 +329,40 @@ __global__ void sparse_softmax(const float * global_scores, const float * local_
         const bool causal = positions[i] <= p;
         const bool is_local = causal && p - positions[i] < local;
         const bool valid = causal && (i < local_only_from || is_local);
-        weights[i] = __float2half(valid ? expf((is_local ? nearby[i] : global[i]) - maximum) / sum : 0);
+        weights[i] = __float2half(valid ? expf((is_local ? nearby[positions[i] - origin] : global[i]) - maximum) / sum : 0);
+    }
+}
+
+// Reuse completed FP32 logit workspaces for the two compact FP16 P operands.
+// The local and historical branches partition the unique-token union mask.
+__global__ void split_sparse_probabilities(const __half * joint, __half * nearby, __half * historical,
+    const std::uint64_t * positions, std::uint64_t first, std::uint32_t queries, std::uint32_t heads,
+    std::uint32_t local, std::uint32_t tokens, std::uint32_t local_begin, std::uint32_t global_tokens) {
+    const auto local_tokens = tokens - local_begin;
+    const auto rows = static_cast<std::uint64_t>(queries) * heads;
+    for (auto i = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+         i < rows * (local_tokens + global_tokens); i += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        const auto row = i / (local_tokens + global_tokens), column = i % (local_tokens + global_tokens);
+        const auto p = first + row % queries;
+        if (column < local_tokens) {
+            const auto source = local_begin + column;
+            nearby[row * local_tokens + column] = positions[source] <= p && p - positions[source] < local ?
+                joint[row * tokens + source] : __float2half(0.f);
+        } else {
+            const auto source = column - local_tokens;
+            historical[row * global_tokens + source] = positions[source] <= p && p - positions[source] >= local ?
+                joint[row * tokens + source] : __float2half(0.f);
+        }
+    }
+}
+
+__global__ void copy_sparse_local_rows(const __half * packed, __half * local_keys, std::uint32_t tokens,
+    std::uint32_t first, std::uint32_t count, std::uint32_t heads, std::uint32_t width) {
+    const auto size = static_cast<std::uint64_t>(heads) * count * width;
+    for (auto i = static_cast<std::uint64_t>(blockIdx.x) * blockDim.x + threadIdx.x; i < size;
+         i += static_cast<std::uint64_t>(gridDim.x) * blockDim.x) {
+        const auto head = i / width / count, token = i / width % count;
+        local_keys[i] = packed[(head * tokens + first + token) * width + i % width];
     }
 }
 
@@ -410,6 +444,7 @@ public:
                 allocate(local_feedback_, product(product(qh_, tile_), sizeof(float)), stats_.workspace_device_bytes);
                 allocate(key_positions_, product(tile_, sizeof(std::uint64_t)), stats_.workspace_device_bytes);
                 allocate(frequencies_, product(g_.dimension / 2, sizeof(float)), stats_.workspace_device_bytes);
+                allocate(local_keys_, product(product(product(tile_, g_.heads), g_.dimension), sizeof(Half)), stats_.kv_device_bytes);
             }
             stats_.kv_device_peak_bytes=stats_.kv_device_bytes;
             stats_.workspace_device_peak_bytes=stats_.workspace_device_bytes;
@@ -433,7 +468,7 @@ public:
     }
     void begin_impl(std::uint64_t first,std::uint32_t queries,float scale,const float * query,bool device) {
         check();
-        if (open_ || !queries || queries>queries_ || first>g_.capacity_tokens-queries ||
+        if (open_ || local_prepared_ || !queries || queries>queries_ || first>g_.capacity_tokens-queries ||
             !std::isfinite(scale) || scale<=0) throw std::invalid_argument("prefill frame shape, position or scale");
         DeviceScope scope(device_);
         try {
@@ -501,7 +536,7 @@ public:
         } catch (...) { fail(); throw; }
     }
     void multiply_scores(std::uint32_t valid, std::uint32_t queries, float scale, float * output,
-                         std::uint32_t first_key, std::uint32_t key_count) {
+                         std::uint32_t first_key, std::uint32_t key_count, const __half * keys = nullptr) {
         if (!key_count) return;
         const auto width = static_cast<int>(g_.dimension);
         const auto tokens = static_cast<int>(valid);
@@ -511,23 +546,27 @@ public:
         const auto score_stride = static_cast<long long>(tokens) * queries_per_head;
         const float zero = 0;
         checked(cublasGemmStridedBatchedEx(blas_, CUBLAS_OP_T, CUBLAS_OP_N, key_count, queries_per_head, width,
-            &scale, packed_kv_ + static_cast<std::size_t>(first_key) * width, CUDA_R_16F, width, kv_stride,
+            &scale, (keys ? keys : packed_kv_) + static_cast<std::size_t>(first_key) * width, CUDA_R_16F, width, kv_stride,
             packed_query_, CUDA_R_16F, width, q_stride,
             &zero, output + first_key, CUDA_R_32F, tokens, score_stride, g_.heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
             "multiply prefill keys and queries");
     }
     void multiply_values(std::uint32_t valid, std::uint32_t queries) {
+        multiply_value_branch(packed_kv_ + static_cast<std::size_t>(g_.dimension) * valid * g_.heads,
+            probabilities_, valid, valid, queries, 0.f);
+    }
+    void multiply_value_branch(const __half * values, const __half * probabilities, std::uint32_t value_stride,
+                               std::uint32_t tokens, std::uint32_t queries, float beta) {
+        if (!tokens) return;
         const auto width = static_cast<int>(g_.dimension);
-        const auto tokens = static_cast<int>(valid);
         const auto queries_per_head = static_cast<int>(queries * (qh_ / g_.heads));
-        const auto kv_stride = static_cast<long long>(width) * tokens;
+        const auto kv_stride = static_cast<long long>(width) * value_stride;
         const auto q_stride = static_cast<long long>(width) * queries_per_head;
         const auto score_stride = static_cast<long long>(tokens) * queries_per_head;
-        const auto * values = packed_kv_ + kv_stride * g_.heads;
-        const float zero = 0, one = 1;
+        const float one = 1;
         checked(cublasGemmStridedBatchedEx(blas_, CUBLAS_OP_N, CUBLAS_OP_N, width, queries_per_head, tokens,
-            &one, values, CUDA_R_16F, width, kv_stride, probabilities_, CUDA_R_16F, tokens, score_stride,
-            &zero, tile_output_, CUDA_R_32F, width, q_stride, g_.heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
+            &one, values, CUDA_R_16F, width, kv_stride, probabilities, CUDA_R_16F, tokens, score_stride,
+            &beta, tile_output_, CUDA_R_32F, width, q_stride, g_.heads, CUBLAS_COMPUTE_32F, CUBLAS_GEMM_DEFAULT),
             "multiply prefill values and probabilities");
     }
     void pack_gemm_kv(const Half * kv, std::uint32_t valid, std::size_t token_stride, std::size_t head_stride,
@@ -558,6 +597,50 @@ public:
             ++stats_.retrieval_mean_host_waits;
         } catch (...) { fail(); throw; }
         return result.query;
+    }
+    void local_scores(std::uint64_t first, std::uint32_t count, float scale, std::uint32_t local,
+                      const RelativeRope & rope, const float * query) {
+        const auto origin = first + 1 - std::min<std::uint64_t>(first + 1, local);
+        const auto local_tokens = static_cast<std::uint32_t>(first + count - origin);
+        const auto elements = static_cast<std::uint64_t>(count) * qh_ * g_.dimension;
+        rotary_frequencies<<<grid(rope.dimensions / 2), 256, 0, stream_>>>(frequencies_, rope.dimensions, rope.base);
+        checked(cudaGetLastError(), "prepare sparse rotary frequencies");
+        pack_local_queries<<<grid(elements), 256, 0, stream_>>>(query, packed_query_, frequencies_, first, origin,
+            local, qh_, count, g_.dimension, rope.dimensions, rope.split_halves);
+        checked(cudaGetLastError(), "rotate local sparse prefill queries");
+        rotate_local_keys<<<grid(static_cast<std::uint64_t>(local_tokens) * g_.heads * (rope.dimensions / 2)), 256, 0, stream_>>>(
+            local_keys_, nullptr, frequencies_, origin, local_tokens, g_.heads, g_.dimension, rope.dimensions, rope.split_halves);
+        checked(cudaGetLastError(), "rotate local sparse prefill keys");
+        multiply_scores(local_tokens, count, scale, local_scores_, 0, local_tokens, local_keys_);
+    }
+    void begin_sparse_local(const SparsePrefillLocalFrame & frame) override {
+        check();
+        if (!supports_sparse() || open_ || local_prepared_ || frame.local != sparse_local_ || !frame.queries ||
+            frame.queries > queries_ || frame.queries > std::min(512u, frame.local) ||
+            frame.queries > g_.capacity_tokens || frame.first_query > g_.capacity_tokens - frame.queries ||
+            !std::isfinite(frame.scale) || frame.scale <= 0 || !frame.rope.dimensions ||
+            frame.rope.dimensions > g_.dimension || frame.rope.dimensions % 2 ||
+            !std::isfinite(frame.rope.base) || frame.rope.base <= 0) throw std::invalid_argument("sparse local prefill frame");
+        validate_device_query(frame.query, DeviceMemory::cuda, qh_, g_.dimension, frame.queries);
+        validate_device_kv(frame.kv, DeviceMemory::cuda, g_.heads, g_.dimension, frame.queries);
+        validate_pointer(frame.query.data); validate_pointer(frame.kv.data);
+        const auto origin = frame.first_query + 1 - std::min<std::uint64_t>(frame.first_query + 1, frame.local);
+        const auto local_tokens = static_cast<std::uint32_t>(frame.first_query + frame.queries - origin);
+        if (local_tokens > tile_ || (frame.first_query > origin && (!frame.window.data ||
+            frame.window.memory != DeviceMemory::cuda || frame.window.capacity < frame.first_query - origin)))
+            throw std::invalid_argument("sparse local Key window");
+        if (frame.window.data) validate_pointer(frame.window.data);
+        DeviceScope scope(device_);
+        try {
+            device_ops_detail::gather_local_keys<<<grid(static_cast<std::uint64_t>(local_tokens) * g_.heads * g_.dimension),
+                256, 0, stream_>>>(frame.window.data, frame.kv.data, reinterpret_cast<Half *>(local_keys_), nullptr,
+                frame.first_query, frame.queries, local_tokens, frame.window.capacity, g_.heads, g_.dimension);
+            checked(cudaGetLastError(), "gather native local prefill Key window");
+            local_scores(frame.first_query, frame.queries, frame.scale, frame.local, frame.rope, frame.query.data);
+            local_first_ = frame.first_query; local_count_ = frame.queries; local_scale_ = frame.scale;
+            local_query_ = frame.query.data; local_kv_ = frame.kv.data;
+            local_rope_ = frame.rope; local_prepared_ = true;
+        } catch (...) { fail(); throw; }
     }
     DeviceQueryWithEvent mean_sparse_query_async(DeviceQuery query, std::uint32_t count) override {
         if (!supports_sparse() || open_ || count > queries_ || count > std::min(512u, sparse_local_)) throw std::invalid_argument("sparse prefill mean frame");
@@ -619,6 +702,10 @@ public:
         const auto history = direct ? valid - frame.queries : valid;
         const auto kv_bytes = static_cast<std::size_t>(history) * g_.heads * row_bytes;
         const auto * queries = direct ? frame.device_query.data : query_;
+        if (local_prepared_ && (!direct || local_first_ != frame.first_query || local_count_ != frame.queries ||
+            local_scale_ != frame.scale || local_query_ != queries || local_kv_ != frame.device_kv.data ||
+            local_rope_.dimensions != frame.rope.dimensions || local_rope_.base != frame.rope.base ||
+            local_rope_.split_halves != frame.rope.split_halves)) throw std::logic_error("sparse prefill local frame changed before consumption");
         auto * output = direct ? frame.device_output.data : weights_;
         DeviceScope scope(device_);
         try {
@@ -629,27 +716,36 @@ public:
                 cudaMemcpyHostToDevice, stream_), "upload sparse prefill positions");
             checked(cudaMemsetAsync(error_device_, 0, sizeof(int), stream_), "clear sparse prefill status");
             pack_gemm_kv(kv_, valid, 2 * g_.dimension, 2 * tokens * g_.dimension, frame.device_kv.data, history);
+            if (!local_prepared_) {
+                copy_sparse_local_rows<<<grid(static_cast<std::uint64_t>(valid - local_begin) * g_.heads * g_.dimension), 256, 0, stream_>>>(
+                    packed_kv_, local_keys_, valid, local_begin, valid - local_begin, g_.heads, g_.dimension);
+                checked(cudaGetLastError(), "copy local sparse prefill Key window");
+                local_scores(frame.first_query, frame.queries, frame.scale, frame.local, frame.rope, queries);
+            }
             if (global_keys) {
                 pack_query<<<grid(elements), 256, 0, stream_>>>(queries, packed_query_, qh_, frame.queries, g_.dimension);
                 checked(cudaGetLastError(), "pack global sparse prefill queries");
                 multiply_scores(valid, frame.queries, frame.scale, scores_, 0, global_keys);
             }
-            rotary_frequencies<<<grid(frame.rope.dimensions / 2), 256, 0, stream_>>>(frequencies_, frame.rope.dimensions, frame.rope.base);
-            checked(cudaGetLastError(), "prepare sparse rotary frequencies");
-            pack_local_queries<<<grid(elements), 256, 0, stream_>>>(queries, packed_query_, frequencies_,
-                frame.first_query, origin, frame.local, qh_, frame.queries, g_.dimension, frame.rope.dimensions, frame.rope.split_halves);
-            checked(cudaGetLastError(), "rotate local sparse prefill queries");
-            rotate_local_keys<<<grid(tokens * g_.heads * (frame.rope.dimensions / 2)), 256, 0, stream_>>>(packed_kv_, key_positions_,
-                frequencies_, origin, valid, g_.heads, g_.dimension, frame.rope.dimensions, frame.rope.split_halves);
-            checked(cudaGetLastError(), "rotate local sparse prefill keys");
-            multiply_scores(valid, frame.queries, frame.scale, local_scores_, local_begin, valid - local_begin);
             sparse_softmax<<<static_cast<unsigned>(rows), 256, 0, stream_>>>(scores_, local_scores_, probabilities_,
-                key_positions_, error_device_, frame.first_query, frame.queries, frame.local, valid, local_only_from);
+                key_positions_, error_device_, frame.first_query, frame.queries, frame.local, valid, local_only_from,
+                origin, valid - local_begin);
             checked(cudaGetLastError(), "apply joint sparse prefill softmax");
             sum_sparse_local_scores<<<grid(score_elements), 256, 0, stream_>>>(probabilities_, local_feedback_,
                 frame.first_query, origin, frame.queries, qh_, frame.local, valid, local_begin);
             checked(cudaGetLastError(), "sum recent attention scores by key");
-            multiply_values(valid, frame.queries);
+            auto * local_probabilities = reinterpret_cast<__half *>(local_scores_);
+            auto * global_probabilities = reinterpret_cast<__half *>(scores_);
+            split_sparse_probabilities<<<grid(rows * (valid - local_begin + global_keys)), 256, 0, stream_>>>(
+                probabilities_, local_probabilities, global_probabilities, key_positions_, frame.first_query,
+                frame.queries, qh_, frame.local, valid, local_begin, global_keys);
+            checked(cudaGetLastError(), "partition joint probabilities for native attention branches");
+            const auto * values = packed_kv_ + static_cast<std::size_t>(valid) * g_.heads * g_.dimension;
+            copy_sparse_local_rows<<<grid(static_cast<std::uint64_t>(valid - local_begin) * g_.heads * g_.dimension), 256, 0, stream_>>>(
+                values, local_keys_, valid, local_begin, valid - local_begin, g_.heads, g_.dimension);
+            checked(cudaGetLastError(), "gather local values for native attention branch");
+            multiply_value_branch(local_keys_, local_probabilities, valid - local_begin, valid - local_begin, frame.queries, 0.f);
+            multiply_value_branch(values, global_probabilities, valid, global_keys, frame.queries, 1.f);
             scatter_sparse_output<<<grid(elements), 256, 0, stream_>>>(tile_output_, output, error_device_,
                 g_.dimension, qh_, frame.queries);
             checked(cudaGetLastError(), "reorder sparse prefill output");
@@ -660,6 +756,7 @@ public:
             checked(cudaMemcpyAsync(&error_, error_device_, sizeof(int), cudaMemcpyDeviceToHost, stream_), "download sparse prefill status");
             checked(cudaStreamSynchronize(stream_), "complete sparse CUDA prefill");
             if (error_) throw std::runtime_error("non-finite or empty sparse CUDA prefill");
+            local_prepared_ = false; local_query_ = nullptr; local_kv_ = nullptr;
         } catch (...) { fail(); throw; }
         ++stats_.batches;
         ++stats_.tiles;
@@ -703,7 +800,7 @@ public:
     void abort() override {
         DeviceScope scope(device_);
         const auto status=cudaStreamSynchronize(stream_);
-        open_=false; failed_=true;
+        open_=false; local_prepared_=false; failed_=true;
         current_query_=nullptr;
         checked(status,"abort tiled prefill");
     }
@@ -720,7 +817,7 @@ private:
         checked(cudaMalloc(reinterpret_cast<void **>(&target),bytes),"allocate tiled prefill"); category+=bytes;
     }
     void check() const { if (failed_) throw std::runtime_error("tiled prefill backend failed"); }
-    void fail() noexcept { failed_=true; open_=false; if (stream_) (void) cudaStreamSynchronize(stream_); current_query_=nullptr; }
+    void fail() noexcept { failed_=true; open_=false; local_prepared_=false; if (stream_) (void) cudaStreamSynchronize(stream_); current_query_=nullptr; }
     void release() noexcept {
         int previous=0; const bool restore=cudaGetDevice(&previous)==cudaSuccess;
         if (cudaSetDevice(device_)!=cudaSuccess) return;
@@ -739,6 +836,7 @@ private:
         if (tile_output_) (void) cudaFree(tile_output_);
         if (previous_scale_) (void) cudaFree(previous_scale_);
         if (local_scores_) (void) cudaFree(local_scores_);
+        if (local_keys_) (void) cudaFree(local_keys_);
         if (local_feedback_) (void) cudaFree(local_feedback_);
         if (key_positions_) (void) cudaFree(key_positions_);
         if (frequencies_) (void) cudaFree(frequencies_);
@@ -754,10 +852,18 @@ private:
     std::size_t tile_elements_=0;
     float scale_=1;
     bool open_=false,failed_=false;
+    bool local_prepared_=false;
+    std::uint64_t local_first_=0;
+    std::uint32_t local_count_=0;
+    float local_scale_=0;
+    const float * local_query_=nullptr;
+    const Half * local_kv_=nullptr;
+    RelativeRope local_rope_{};
     cudaStream_t stream_=nullptr;
     cudaEvent_t copied_=nullptr, mean_ready_=nullptr;
     cublasHandle_t blas_ = nullptr;
     __half * packed_query_ = nullptr, * packed_kv_ = nullptr, * probabilities_ = nullptr;
+    __half * local_keys_ = nullptr;
     float * scores_ = nullptr, * tile_output_ = nullptr, * previous_scale_ = nullptr;
     float * local_scores_ = nullptr, * local_feedback_ = nullptr, * frequencies_ = nullptr;
     std::uint64_t * key_positions_ = nullptr;

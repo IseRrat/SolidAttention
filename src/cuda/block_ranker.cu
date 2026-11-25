@@ -463,6 +463,9 @@ public:
         return true;
     }
     bool device_probabilities() const override { return probability_local_ != 0; }
+    DeviceKeyWindow probability_key_window(std::uint32_t layer) const override {
+        return {probability_states_.at(layer).keys, probability_capacity_, DeviceMemory::cuda};
+    }
     bool host_representative_metadata() const override { return !probability_local_ || representative_diagnostics_; }
     std::vector<BuiltRepresentatives> probability_update(const ProbabilityFrame & frame) override {
         return probability_update_impl(frame, nullptr);
