@@ -109,32 +109,30 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
     cuda = replace_once(cuda, anchor, '''        case GGML_OP_CUSTOM:
             return solid::device_op_supported(op);
 ''' + anchor)
-    anchor = '''        case GGML_OP_FLASH_ATTN_EXT:
-            ggml_cuda_flash_attn_ext(ctx, dst);
-            break;'''
-    cuda = replace_once(cuda, anchor, '''        case GGML_OP_FLASH_ATTN_EXT: {
-            auto * solid_completion = solid::stream_completion(dst->op_params, sizeof(dst->op_params));
-            if (solid_completion) CUDA_CHECK(solid::cuda_attention_begin(solid_completion, ctx.stream()));
-            ggml_cuda_flash_attn_ext(ctx, dst);
-            if (solid_completion) CUDA_CHECK(solid::cuda_attention_end(solid_completion, ctx.stream()));
-            break;
-        }''')
-    anchor = '''        case GGML_OP_MUL_MAT:
-            ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
-            break;'''
-    cuda = replace_once(cuda, anchor, '''        case GGML_OP_MUL_MAT: {
+    # The two-branch InfLLM graph ends after PV addition/output layout and
+    # can begin at softmax when no historical branch is present. Honor the
+    # same phase binding at each actual boundary, including graph replay.
+    for operation, launch in (
+        ("FLASH_ATTN_EXT", "ggml_cuda_flash_attn_ext(ctx, dst);"),
+        ("MUL_MAT", "ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);"),
+        ("CONT", "ggml_cuda_dup(ctx, dst);"),
+        ("SOFT_MAX", "ggml_cuda_op_soft_max(ctx, dst);"),
+    ):
+        anchor = f"        case GGML_OP_{operation}:\n            {launch}\n            break;"
+        boundary = f"        case GGML_OP_{operation}: {{\n" + '''
             solid::CompletionPhase phase;
             auto * completion = solid::stream_completion(dst->op_params, sizeof(dst->op_params), &phase);
-            if (completion && phase == solid::CompletionPhase::begin) CUDA_CHECK(solid::cuda_attention_begin(completion, ctx.stream()));
-            ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
-            if (completion && phase == solid::CompletionPhase::end) CUDA_CHECK(solid::cuda_attention_end(completion, ctx.stream()));
+            if (completion && phase != solid::CompletionPhase::end) CUDA_CHECK(solid::cuda_attention_begin(completion, ctx.stream()));
+''' + f"            {launch}\n" + '''
+            if (completion && phase != solid::CompletionPhase::begin) CUDA_CHECK(solid::cuda_attention_end(completion, ctx.stream()));
             break;
-        }''')
+        }'''
+        cuda = replace_once(cuda, anchor, boundary)
     anchor = '                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);'
     cuda = replace_once(cuda, anchor, '''                if (node->op == GGML_OP_MUL_MAT) {
                     if (auto * interval = solid::device_timing(node)) interval->record(cuda_ctx->stream(), false);
                 }
-                const bool solid_attention_boundary = node->op == GGML_OP_MUL_MAT &&
+                const bool solid_attention_boundary =
                     solid::stream_completion(node->op_params, sizeof(node->op_params));
                 int nodes_to_skip = solid_attention_boundary ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);''')
     anchor = 'int ggml_backend_cuda_get_device_count() {\n'

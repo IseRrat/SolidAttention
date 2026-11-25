@@ -253,8 +253,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
     if (!infllm) require(after.ranking.builder_rank_shared_waits>0,"CUDA decode did not reuse the block ranking wait");
     const auto schedule=cache->schedule_stats();
     if (mode==solid::ScheduleMode::sync_reuse) {
-        require(schedule.device_event_completions+schedule.device_boundary_fallbacks==16,
-            "CUDA graph replay lost attention completion receipts");
+        require(schedule.device_event_completions==16 && schedule.device_boundary_fallbacks==0,
+            "CUDA graph replay replaced device completion events with CPU boundary receipts");
         require(schedule.archive_attention_reuses==16 && schedule.archive_separate_completions==0,
             "CUDA KV archive did not share the attention completion");
         require(schedule.stream_waits==16 && schedule.batch_waits==0,
