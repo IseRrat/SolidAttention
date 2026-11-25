@@ -3,6 +3,8 @@
 #include <algorithm>
 #include <fstream>
 #include <iostream>
+#include <cmath>
+#include <limits>
 #include <set>
 #include <string>
 
@@ -28,7 +30,7 @@ void run(const std::string & path, Configure configure, Submit submit, Mean mean
     std::ifstream input(path, std::ios::binary);
     require(static_cast<bool>(input), "cannot open InfLLM reference fixture");
     const auto magic = read<char>(input, 8);
-    require(std::string(magic.begin(), magic.end()) == "IFLMREF2", "InfLLM fixture format");
+    require(std::string(magic.begin(), magic.end()) == "IFLMREF3", "InfLLM fixture format");
     const auto cases = read<std::uint32_t>(input);
     std::uint64_t checked_blocks = 0, frames = 0, tied_sets = 0, checked_rankings = 0;
     for (std::uint32_t c = 0; c < cases; ++c) {
@@ -114,18 +116,21 @@ void run(const std::string & path, Configure configure, Submit submit, Mean mean
             const auto count = read<std::uint32_t>(input), candidates = read<std::uint32_t>(input), topk = read<std::uint32_t>(input);
             auto ids = read<std::uint64_t>(input, candidates);
             auto queries = read<float>(input, static_cast<std::size_t>(count) * heads * width);
-            auto upstream_mean = read<solid::Half>(input, heads * width);
-            auto upstream_scores = read<solid::Half>(input, candidates);
+            auto upstream_mean = read<float>(input, heads * width);
+            auto upstream_scores = read<float>(input, candidates);
             auto upstream_topk = read<std::uint64_t>(input, topk);
             const auto mean = mean_query(queries, count, heads * width);
             require(mean.size() == upstream_mean.size(), "retrieval mean shape differs from upstream");
             for (std::size_t i = 0; i < mean.size(); ++i) {
-                if (mean[i] != solid::from_half(upstream_mean[i])) {
+                // Bound differences between sequential and upstream parallel
+                // F32 reductions by their sum-of-magnitudes rounding error.
+                double magnitude = 0;
+                for (std::uint32_t q = 0; q < count; ++q) magnitude += std::abs(queries[q * mean.size() + i]);
+                const auto tolerance = 2 * std::numeric_limits<float>::epsilon() * magnitude;
+                if (!std::isfinite(mean[i]) || std::abs(mean[i] - upstream_mean[i]) > tolerance) {
                     throw std::runtime_error("retrieval mean differs from upstream: case=" + std::to_string(c) +
                         " tokens=" + std::to_string(count) + " element=" + std::to_string(i) +
-                        " expected_half=" + std::to_string(upstream_mean[i]) +
-                        " actual_half=" + std::to_string(solid::to_half(mean[i])) +
-                        " expected=" + std::to_string(solid::from_half(upstream_mean[i])) +
+                        " expected=" + std::to_string(upstream_mean[i]) +
                         " actual=" + std::to_string(mean[i]));
                 }
             }
@@ -133,7 +138,7 @@ void run(const std::string & path, Configure configure, Submit submit, Mean mean
             const auto ranked = index.rank_blocks(0, mean, request);
             require(ranked.size() == kv_heads, "retrieval KV-head mapping differs from upstream");
             std::vector<float> optimal;
-            for (const auto value : upstream_scores) optimal.push_back(solid::from_half(value));
+            for (const auto value : upstream_scores) optimal.push_back(value);
             std::sort(optimal.begin(), optimal.end(), std::greater<float>());
             for (const auto & selected : ranked) {
                 require(selected.size() == upstream_topk.size(), "retrieval Top-K count differs from upstream");
@@ -142,7 +147,7 @@ void run(const std::string & path, Configure configure, Submit submit, Mean mean
                 for (const auto id : selected) {
                     const auto found = std::lower_bound(ids.begin(), ids.end(), id);
                     require(found != ids.end() && *found == id && unique.insert(id).second, "retrieval candidate invalid/repeated");
-                    selected_scores.push_back(solid::from_half(upstream_scores[found - ids.begin()]));
+                    selected_scores.push_back(upstream_scores[found - ids.begin()]);
                 }
                 std::sort(selected_scores.begin(), selected_scores.end(), std::greater<float>());
                 require(std::equal(selected_scores.begin(), selected_scores.end(), optimal.begin()),

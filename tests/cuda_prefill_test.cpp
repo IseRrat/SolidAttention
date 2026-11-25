@@ -84,9 +84,9 @@ void sparse_prefill(int device) {
         std::vector<float> host_mean(mean.elements), expected_mean(mean.elements);
         cuda_check(cudaMemcpy(host_mean.data(), mean.data, mean.elements * sizeof(float), cudaMemcpyDeviceToHost));
         for (std::uint32_t i = 0; i < queries; ++i) for (std::size_t d = 0; d < mean.elements; ++d) {
-            expected_mean[d] += solid::from_half(solid::to_half(q[i * mean.elements + d]));
+            expected_mean[d] += q[i * mean.elements + d];
         }
-        for (auto & value : expected_mean) value = solid::from_half(solid::to_half(value / queries));
+        for (auto & value : expected_mean) value /= queries;
         test_tiled::close(host_mean, expected_mean, 1e-6f);
 
         auto event_ranker = solid::make_cuda_block_ranker(geometry, query_heads, 1, 16, device);

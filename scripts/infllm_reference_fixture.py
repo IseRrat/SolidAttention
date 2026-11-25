@@ -60,7 +60,7 @@ def write_fixture(output, module):
     summary = []
     output.parent.mkdir(parents=True, exist_ok=True)
     with output.open("wb") as file:
-        file.write(b"IFLMREF2")
+        file.write(b"IFLMREF3")
         file.write(struct.pack("<I", len(cases)))
         for kv_heads, heads, width, block, initial, local, total, capacity, chunks in cases:
             representatives = 4
@@ -129,7 +129,10 @@ def write_rankings(file, module, context, blocks, heads, width, capacity):
     if not blocks:
         file.write(struct.pack("<I", 0))
         return 0
-    bank = context.block_k[0].get_data()[blocks].contiguous()
+    # The llama.cpp adapter produces F32 queries and stores KV/representatives
+    # in F16. Promote stored values for the original matmul, preserving every
+    # stored value. Upstream inherits model dtype, not a fixed F16 score type.
+    bank = context.block_k[0].get_data()[blocks].float().contiguous()
     retrieval = module.ContextManager.__new__(module.ContextManager)
     retrieval.num_units, retrieval.unit_size, retrieval.dim_head = 1, heads, width
     retrieval.num_global_block = len(blocks)
@@ -139,14 +142,20 @@ def write_rankings(file, module, context, blocks, heads, width, capacity):
     vectors.data, vectors.length, vectors.hidden_size = bank, len(blocks), heads * width
     retrieval.block_k = [vectors]
     limit = min(512, context.n_local, capacity)
-    counts = tuple(dict.fromkeys((1, min(37, limit), limit)))
-    file.write(struct.pack("<I", len(counts)))
-    for query_case, count in enumerate(counts):
+    queries = [(count, 1) for count in dict.fromkeys((1, min(37, limit), limit))]
+    queries.append((1, 1048576))
+    file.write(struct.pack("<I", len(queries)))
+    for query_case, (count, scale) in enumerate(queries):
         raw = ((torch.arange(count * heads * width).reshape(count, heads, width) * 19 + query_case * 7) % 211 - 105).float() / 73
         raw += 0.000013
-        global_q = raw.half().permute(1, 0, 2).unsqueeze(0).contiguous()
+        raw *= scale
+        global_q = raw.permute(1, 0, 2).unsqueeze(0).contiguous()
         mean = global_q.mean(dim=2).reshape(-1)
         logits = torch.matmul(bank, mean[:, None]).reshape(-1)
+        assert torch.isfinite(logits).all()
+        if scale > 1:
+            assert raw.abs().max() > torch.finfo(torch.float16).max
+            assert logits.abs().max() > torch.finfo(torch.float16).max
         retrieval.topk = min(2, len(blocks))
         picks = retrieval.calc_block_topk(global_q)[0]
         file.write(struct.pack("<III", count, len(blocks), retrieval.topk))
@@ -155,7 +164,7 @@ def write_rankings(file, module, context, blocks, heads, width, capacity):
         file.write(mean.contiguous().numpy().tobytes())
         file.write(logits.contiguous().numpy().tobytes())
         file.write(torch.tensor([blocks[i] for i in picks], dtype=torch.int64).numpy().tobytes())
-    return len(counts)
+    return len(queries)
 
 
 def main():

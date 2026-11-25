@@ -26,8 +26,8 @@ struct RelativeRope {
     bool split_halves;
     void rotate(float * row, std::uint32_t position) const;
 };
-// InfLLM retrieval averages FP16 global Q, accumulates in FP32, and stores
-// the mean in Q's FP16 dtype. The caller owns width output elements.
+// InfLLM retrieval averages global Q in its compute dtype (llama.cpp F32).
+// The caller owns width output elements; KV storage precision is independent.
 void mean_infllm_query(const float * queries, float * mean, std::size_t width, std::uint32_t count);
 
 class RepresentativeIndex {

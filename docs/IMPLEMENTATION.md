@@ -1,6 +1,6 @@
 # 实现记录
 
-更新日期为 2026-11-24。
+更新日期为 2026-11-25。
 
 ## 一、KV Consolidator
 
@@ -50,13 +50,13 @@
 
    设备维护代表 bank、pending K 环和 FP16 窗口分数。完整块退出近期窗口后，每个“历史块、query head”对应一个 CUDA 线程块，独立执行块内 Top-K。32-token 实验块及不超过 128-token 的兼容块调用 CUB 稳定基数排序；更大的兼容块调用 CUB 并行归约选出代表。后续 gather/mean 内核并行读取代表 Key、计算各维均值，生成 FP16 块代表。待定环保留尚未完整退出窗口的块，代表构造按完整块提交，省去逐 token 插入及搬移代表 Key。位置、分数和状态通过一次分配的页锁定回执缓冲返回主机，同步、异步入口复用该缓冲。
 
-   两条稀疏实验路径使用相同的 CUDA 评分与 Top-K。检索 Q 按原版 `calc_block_topk` 的类型处理：组内各 Q 先转为 FP16，使用 FP32 累加后取均值，再存成 FP16。每个线程块并行归约一个历史块跨头的 FP32 点积，完整点积转成 FP16 块分数后参与共享 Top-K，只回传一份块编号。Decode 的单个 Q 也在该评分入口转为 FP16。已就绪的全部候选放得进预算时直接使用。原有低层共享 FP32、逐头 FP64 评分及其增量代表构造接口继续提供给既有调用。各选块接口同分时按逻辑块 ID 排序。
+   两条稀疏实验路径使用相同的 CUDA 评分与 Top-K。检索 Q 保留 llama.cpp 的 F32 计算类型，组内均值、跨头块点积和排序分数使用 FP32；FP16 代表 bank 在计算时提升为 FP32。每个线程块并行归约一个历史块的跨头点积，共享 Top-K 只回传一份块编号。已就绪的全部候选放得进预算时直接使用。原有逐头 FP64 评分及增量代表构造接口继续提供给既有调用。各选块接口同分时按逻辑块 ID 排序。
 
-   CPU 的 `mean_infllm_query` 和共享块评分使用相同的 FP16 输入、FP32 累加、FP16 输出规则；`session.cpp` 的主机输入 Prefill 与 `tiled_prefill.cu` 的设备输入 Prefill 分别接入这两个均值入口。InfLLM CUDA 结果中的 ranker 名称为 `cuda_infllm_fp16_topk`。
+   CPU 的 `mean_infllm_query` 和共享块评分使用相同的 F32 输入与累加规则；`session.cpp` 的主机输入 Prefill 与 `tiled_prefill.cu` 的设备输入 Prefill 分别接入对应均值入口。InfLLM CUDA 结果中的 ranker 名称为 `cuda_infllm_fp32_topk`。原版 `calc_block_topk` 跟随模型张量类型，上游 `benchmark/pred.py` 加载 BF16 模型。真实模型核验在第 0 层、位置 1024 确认过：有限的 FP32 块分数压成 FP16 后溢出。评分入口已去掉这项额外转换，KV、代表 bank 和近期概率累计仍为 FP16。
 
    [attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.cpp](../src/session.cpp)、[tiled_prefill.cu](../src/cuda/tiled_prefill.cu)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[block_ranker.hpp](../include/solid/block_ranker.hpp)。
 
-   CUDA Prefill 的均值与排名之间采用设备事件衔接。`mean_sparse_query_async` 在 attention 队列生成 FP16 均值，记录完成事件，返回均值指针和事件；选块器在评分队列插入该事件依赖，随后执行块点积和 Top-K，在所选编号回传处收取结果。模型推理调用这条异步均值入口，省去均值阶段单独的 CPU 等待。输入 Q、均值缓冲和事件由生产者持有，覆盖排名使用期；候选直接全部采用时，后续同队列 attention 完成输入读取。`DeviceQueryWithEvent` 单独表达这项依赖，普通 `DeviceQuery` 继续要求输入已完成生产。同步均值接口按均值事件收取结果。
+   CUDA Prefill 的均值与排名之间采用设备事件衔接。`mean_sparse_query_async` 在 attention 队列生成 FP32 均值，记录完成事件，返回均值指针和事件；选块器在评分队列插入该事件依赖，随后执行块点积和 Top-K，在所选编号回传处收取结果。模型推理调用这条异步均值入口，省去均值阶段单独的 CPU 等待。输入 Q、均值缓冲和事件由生产者持有，覆盖排名使用期；候选直接全部采用时，后续同队列 attention 完成输入读取。`DeviceQueryWithEvent` 单独表达这项依赖，普通 `DeviceQuery` 继续要求输入已完成生产。同步均值接口按均值事件收取结果。
 
    结果中的 `prefill_mean_events`、`prefill_mean_host_waits` 分别记录均值事件和同步均值收取次数，`query_ready_event_waits` 记录插入评分队列的 GPU 事件依赖次数。CUDA 对照用例分别调用同步、异步均值排名，核对选块一致，并检查普通候选、空候选两条路径的事件依赖及 CPU 均值等待计数。代码和 CUDA 对照用例已编译，原版 CPU 对照及 54 项 CPU 回归通过。
 
@@ -94,11 +94,11 @@
 
    `third_party/infllm` 保存 thunlp/InfLLM 提交 `12b70798f56e56ebb23c53c7018091a3f540a028` 的原始 Python 包及 MIT 许可证，`ORIGIN` 记录提交、来源和源码归档 SHA256。`infllm_reference_fixture.py` 直接调用这份源码的 `append_global`、`get_block_k`、GQA 展开及 `VectorTensor` 写入，生成 CPU 张量参考数据；初始化时只将存储放到 CPU，保留原函数。参考包含 32-token 检索块、28 个 query heads 对 4 个 KV heads、96/480/512-token Prefill、逐 token Decode、环形缓冲周转、未对齐 init 及 7/256-token 兼容块。每批输入均检查原版“组长不超过近期窗口”的前提。
 
-   `infllm_reference_cases.hpp` 读取原版输出，逐批核对完整块发布边界、代表 Top-K 得分集合、选中的原始 Key 和 FP16 均值。分数唯一时核对原版代表集合；Top-K 边界同分时核对最优得分集合及实际所选 Key 的均值。随后直接调用原版 `calc_block_topk` 和 `VectorTensor.get_topk`，分别用 1、37 和最多 512 个 Q 生成检索参考。检索候选使用代表边界无歧义的完整块，确保移植版与原版拥有相同的代表 bank，再核对 Q 均值的 FP16 数值、GQA 返回列表和 Top-K 最优得分集合。
+   `infllm_reference_cases.hpp` 读取原版输出，逐批核对完整块发布边界、代表 Top-K 得分集合、选中的原始 Key 和 FP16 均值。分数唯一时核对原版代表集合；Top-K 边界同分时核对最优得分集合及实际所选 Key 的均值。随后直接调用原版 `calc_block_topk` 和 `VectorTensor.get_topk`，分别用 1、37 和最多 512 个 Q 生成检索参考；另加 Q 与块分数超过 FP16 有限范围的检索用例。检索候选使用代表边界无歧义的完整块，确保双方拥有相同的代表 bank。测试将 FP16 bank 的值无损提升为 FP32，与 llama.cpp 的 F32 Query 配对交给原版 matmul。参考格式 `IFLMREF3` 保存 F32 Query 均值和块分数，核对 GQA 返回列表及 Top-K 最优得分集合。
 
-   `infllm_reference_test.cpp` 接入 CPU 索引及均值函数，`cuda_prefill_test.cpp` 接入真实 CUDA 代表 bank、检索内核和 Prefill Q 均值内核。`CMakeLists.txt` 添加独立的 CPU 对照程序。CPU 和 CUDA 均已通过 5 组、172 批、101 个完整块及 11 组检索的原版对照；服务器 54 项 CPU 回归通过，CUDA 基础评分选块与 tiled Prefill 检查通过。同分代表的构造样例单独核对合法集合；检索比较使用拥有相同代表 bank 的样例。
+   `infllm_reference_test.cpp` 接入 CPU 索引及均值函数，`cuda_prefill_test.cpp` 接入真实 CUDA 代表 bank、检索内核和 Prefill Q 均值内核。`CMakeLists.txt` 添加独立的 CPU 对照程序。CPU 和 CUDA 均已通过 5 组、172 批、101 个完整块及 15 组检索的原版对照；服务器 54 项 CPU 回归通过，CUDA tiled Prefill 检查通过。同分代表的构造样例单独核对合法集合；检索比较使用拥有相同代表 bank 的样例。
 
-   CUDA 对照的输入上传由 `upload_ready` 收取默认上传队列完成后，再交给独立计算队列，保证借用输入已就绪。`infllm_reference_cases.hpp` 的均值检查在失败时报告样例、组长、元素及双方 FP16 编码，保持原版数值判据。
+   CUDA 对照的输入上传由 `upload_ready` 收取默认上传队列完成后，再交给独立计算队列，保证借用输入已就绪。`infllm_reference_cases.hpp` 的 F32 均值检查采用由输入绝对值和浮点精度计算的归约误差界，失败时报告样例、组长、元素及双方数值；选块继续严格核对原版最优得分集合。
 
    [原版源码及许可](../third_party/infllm/)、[来源记录](../third_party/infllm/ORIGIN)、[infllm_reference_fixture.py](../scripts/infllm_reference_fixture.py)、[infllm_reference_cases.hpp](../tests/infllm_reference_cases.hpp)、[infllm_reference_test.cpp](../tests/infllm_reference_test.cpp)、[cuda_prefill_test.cpp](../tests/cuda_prefill_test.cpp)、[CMakeLists.txt](../CMakeLists.txt)。
 
