@@ -1,5 +1,6 @@
 #include "solid/llama_adapter.hpp"
 #include "solid/dense_offload.hpp"
+#include "solid/device_ops.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
@@ -10,6 +11,7 @@
 #include <iostream>
 #include <memory>
 #include <stdexcept>
+#include <string_view>
 
 void run(solid::KvLayout layout, bool on_disk, bool packed_inputs, bool sparse, bool infllm = false, bool cached = false,
          bool dense_offload = false) {
@@ -65,7 +67,17 @@ void run(solid::KvLayout layout, bool on_disk, bool packed_inputs, bool sparse, 
         auto * graph = ggml_new_graph_custom(context.get(), 128, false);
         auto * result = operation.build(context.get(), qt, kt, vt, packed, nullptr, backend.get(), graph);
         if (operation.host_node()->type != GGML_TYPE_F16) throw std::runtime_error("gather must retain FP16 precision");
+        if (operation.metadata_node()) ggml_build_forward_expand(graph, operation.metadata_node());
         ggml_build_forward_expand(graph, result);
+        bool in_attention = false;
+        for (int n = 0; n < ggml_graph_n_nodes(graph); ++n) {
+            const auto * node = ggml_graph_node(graph, n);
+            if (std::string_view(ggml_get_name(node)).find("infllm.QK.") == 0) in_attention = true;
+            if (std::string_view(ggml_get_name(node)) == "solid_infllm_recent_scores") in_attention = false;
+            if (in_attention && node->op == GGML_OP_CUSTOM && solid::device_op(node) == solid::DeviceOp::none) {
+                throw std::runtime_error("CPU metadata interrupted attention before recent probability gather");
+            }
+        }
         std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(
             ggml_backend_alloc_ctx_tensors(context.get(), backend.get()), ggml_backend_buffer_free);
         if (!buffer) throw std::runtime_error("graph allocation");

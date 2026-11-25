@@ -251,6 +251,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
             if (layer == 1) operations[layer]->defer_completion();
         }
         if (infllm) ggml_build_forward_expand(graph, operations[layer]->host_node());
+        if (operations[layer]->metadata_node()) ggml_build_forward_expand(graph, operations[layer]->metadata_node());
         require(solid::to_half(-INFINITY) == 0xfc00, "half mask representation");
     }
     ggml_build_forward_expand(graph, outputs[1]);

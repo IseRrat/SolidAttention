@@ -68,6 +68,7 @@ public:
     void check() const;
     bool can_reuse(std::uint64_t next_position) const;
     ggml_tensor * host_node() const;
+    ggml_tensor * metadata_node() const;
     ggml_tensor * selection_node() const;
     ggml_tensor * attention_node() const;
     void set_query_proof(bool covers_previous_attention);

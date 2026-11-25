@@ -86,6 +86,8 @@
 
    设备概率回执的就绪节点同时依赖 attention 输出和当前设备 KV，保证 CPU 使用设备指针前两者已完成。输出依赖节点持有设备 KV 和近期分数，覆盖代表更新的输入捕获过程。近期分数直接作为就绪节点输入，省去额外的连续副本。 [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
 
+   Decode 的 RoPE 位置表和近期概率索引合并为一个 I32 元数据张量，两段视图分别供旋转与概率 GET_ROWS 使用。`decode_metadata` 在选块及 KV 准备完成的主机边界统一生成两表，保留近期位置的范围、唯一性和完整性检查。模型图通过 `AttentionNode::metadata_node` 将该节点排在 K 复制、旋转、QK、softmax、PV 之前；概率提取复用已经生成的索引。`gather_test.cpp` 检查从 QK 到近期概率提取之间无 CPU 自定义节点插入，并对照流式 attention 输出；`prefetch_graph_test.cpp` 用相同顺序核对图复用与代表更新。服务器 54 项 CPU 回归通过。[llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[gather_test.cpp](../tests/gather_test.cpp)、[prefetch_graph_test.cpp](../tests/prefetch_graph_test.cpp)。
+
    [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cuh](../include/solid/device_ops.cuh)、[sycl_device_ops.hpp](../include/solid/sycl_device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)。
 
    [llama_adapter.cpp](../src/llama_adapter.cpp)、[llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[device_cache.cpp](../src/device_cache.cpp)、[device_cache.hpp](../include/solid/device_cache.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[sycl_flash_decode.hpp](../include/solid/sycl_flash_decode.hpp)、[gather_test.cpp](../tests/gather_test.cpp)、[prefetch_graph_test.cpp](../tests/prefetch_graph_test.cpp)。
