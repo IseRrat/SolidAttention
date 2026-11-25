@@ -353,7 +353,11 @@ int main(int argc, char ** argv) {
                 throw std::runtime_error("attention diagnostic requires a new output directory");
             }
         }
-        if (config.attention.profile || config.attention.prefetch || (adapter && adapter->dense_offload_enabled()) || !evaluation.diagnostic.empty()) {
+        // InfLLM completes through its graph receipt. An unused eval observer
+        // still makes GGML synchronize every GPU split, so retain it only for
+        // the legacy FlashAttention completion or explicit diagnostics.
+        const bool legacy_prefetch_completion = config.attention.prefetch && !config.attention.infllm_attention;
+        if (config.attention.profile || legacy_prefetch_completion || (adapter && adapter->dense_offload_enabled()) || !evaluation.diagnostic.empty()) {
             cp.cb_eval = EvaluationBridge::evaluate;
             cp.cb_eval_user_data = &evaluation;
         }

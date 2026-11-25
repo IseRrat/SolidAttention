@@ -90,6 +90,8 @@
 
    设备概率回执的就绪节点同时依赖 attention 输出和当前设备 KV，保证 CPU 使用设备指针前两者已完成。输出依赖节点持有设备 KV 和近期分数，覆盖代表更新的输入捕获过程。近期分数直接作为就绪节点输入，省去额外的连续副本。 [device_ops.hpp](../include/solid/device_ops.hpp)、[device_ops.cpp](../src/device_ops.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)。
 
+   `baseline.cpp` 在 InfLLM 路径通过图内 attention 回执确认完成，关闭旧 FlashAttention 路径使用的额外 eval 观察回调。旧 FlashAttention 预取、纯卸载的完成通知及显式张量诊断保留所需回调。普通 InfLLM 推理避免触发 GGML 观察模式对每个 GPU 子图的强制同步。
+
    Decode 的 RoPE 位置表和近期概率索引合并为一个 I32 元数据张量，两段视图分别供旋转与概率 GET_ROWS 使用。`decode_metadata` 在选块及 KV 准备完成的主机边界统一生成两表，保留近期位置的范围、唯一性和完整性检查。模型图通过 `AttentionNode::metadata_node` 将该节点排在 K 复制、旋转、QK、softmax、PV 之前；概率提取复用已经生成的索引。`gather_test.cpp` 检查从 QK 到近期概率提取之间无 CPU 自定义节点插入，并对照流式 attention 输出；`prefetch_graph_test.cpp` 用相同顺序核对图复用与代表更新。服务器 54 项 CPU 回归通过。8K、8 步 Decode 的 Nsight 核验中，SolidAttention 的流同步调用由 7,018 次降为 6,122 次，稀疏基线由 7,010 次降为 6,562 次。[llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[gather_test.cpp](../tests/gather_test.cpp)、[prefetch_graph_test.cpp](../tests/prefetch_graph_test.cpp)。
 
    同一提交 `138a486` 的短对照保留 Nsight 与两条路径的选块记录，分别核对逐块调度 JSON 开启和关闭的情况。关闭额外逐块 JSON 后，稀疏基线 8 步 Decode 为 516.2 ms，SolidAttention 为 356.5 ms；逐块 JSON 开启的 SolidAttention 为 640.2 ms。两组原始结果及 `.nsys-rep` 分别保存于 `results/server5090/nsys-infllm-8k-138a486.iokc6m03/` 和 `results/server5090/nsys-infllm-8k-138a486-nvtx.c8svfapi/`，配置文件记录各自日志开关。仓库实验生成器沿用默认关闭 `schedule_trace` 的配置。
