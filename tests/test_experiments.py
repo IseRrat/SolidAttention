@@ -57,6 +57,16 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_interleaving_ablation_keeps_prefetch_scoring_and_projection(self):
+        template={"attention":{"infllm_attention":True,"selection_backend":"cuda","direct_decode_reads":True}}
+        full=experiments.variant_config(template,"solid",32,1024)
+        separate=experiments.variant_config(template,"solid-no-interleaved",32,1024)
+        self.assertEqual(separate["attention"].pop("layout"),"separate")
+        self.assertEqual(full["attention"].pop("layout"),"interleaved")
+        self.assertEqual(separate,full)
+        self.assertTrue(separate["attention"]["fuse_kv_projection"])
+        self.assertTrue(separate["attention"]["prefetch_ahead"])
+
     def test_prefetch_ablation_changes_only_advance_reads(self):
         template = {"attention": {"infllm_attention":True, "selection_backend":"cuda", "direct_decode_reads":True}}
         full = experiments.variant_config(template, "solid", 32, 1024)

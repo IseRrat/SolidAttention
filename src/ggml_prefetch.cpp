@@ -54,7 +54,7 @@ class GgmlTransport final : public DeviceTransport {
     struct RowCopy { ggml_tensor source{},target{}; };
     struct CopyRecord {
         ggml_backend_event_t event=nullptr;
-        std::unique_ptr<RowCopy> row;
+        std::unique_ptr<std::array<RowCopy,2>> row;
         DeviceInterval * interval=nullptr;
 #ifdef SOLID_HAVE_SYCL
         std::unique_ptr<SyclCopyEvent> sycl;
@@ -63,7 +63,7 @@ class GgmlTransport final : public DeviceTransport {
 public:
     GgmlTransport(ggml_backend_t backend, KvGeometry geometry, std::uint32_t per_head, ScheduleMode mode,AttentionEvents * native,bool share_host_cache) :
         backend_(backend), geometry_(geometry), per_head_(per_head),native_(native) {
-        if (!backend || geometry.layout != KvLayout::interleaved) throw std::invalid_argument("invalid GGML prefetch transport");
+        if (!backend) throw std::invalid_argument("invalid GGML prefetch transport");
         if (share_host_cache) {
             if (!ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend))) throw std::invalid_argument("explicit shared cache requires a host-addressable backend");
             shared_=true;
@@ -71,6 +71,7 @@ public:
 #ifdef SOLID_HAVE_SYCL
         if (ggml_backend_is_sycl(backend) && solid_sycl_shared_kv_supported(backend)) shared_=true;
 #endif
+        if (shared_ && geometry.layout != KvLayout::interleaved) throw std::invalid_argument("shared KV slots require interleaved storage");
         if (shared_) {
             if (per_head_==UINT32_MAX) throw std::overflow_error("shared cache slot count");
             ++per_head_; // One private current-token block per head.
@@ -81,7 +82,9 @@ public:
         }
         context_.reset(ggml_init({ggml_tensor_overhead() + 1024, nullptr, true}));
         if (!context_) throw std::runtime_error("device cache metadata allocation");
-        tensor_ = ggml_new_tensor_3d(context_.get(), GGML_TYPE_F16, geometry.dimension * 2, tokens, geometry.heads);
+        tensor_ = geometry.layout == KvLayout::interleaved ?
+            ggml_new_tensor_3d(context_.get(), GGML_TYPE_F16, geometry.dimension * 2, tokens, geometry.heads) :
+            ggml_new_tensor_4d(context_.get(), GGML_TYPE_F16, geometry.dimension, tokens, geometry.heads, 2);
         ggml_set_name(tensor_, "solid_prefetch_device_slots");
 #ifdef SOLID_HAVE_SYCL
         if (ggml_backend_is_sycl(backend)) {
@@ -152,15 +155,13 @@ public:
         }
     }
     std::uint64_t upload(std::uint32_t slot, const KvBlock & block) override {
-        if (slot >= geometry_.heads * static_cast<std::uint64_t>(per_head_) || block.layout != KvLayout::interleaved ||
+        if (slot >= geometry_.heads * static_cast<std::uint64_t>(per_head_) || block.layout != geometry_.layout ||
             block.dimension != geometry_.dimension || block.capacity != geometry_.block_tokens ||
             block.storage_size() != static_cast<std::size_t>(geometry_.block_tokens) * 2 * geometry_.dimension) {
             throw std::invalid_argument("device upload shape");
         }
         if (next_ == std::numeric_limits<std::uint64_t>::max()) throw std::overflow_error("copy ticket exhausted");
         const auto id = next_++;
-        const auto head = slot / per_head_, local = slot % per_head_;
-        const auto offset = head * tensor_->nb[2] + local * geometry_.block_tokens * tensor_->nb[1];
         const auto bytes = block.storage_size() * sizeof(Half);
         if (shared_) {
             if (block.storage()!=shared_slot(slot)) throw std::logic_error("shared upload changed the physical slot");
@@ -172,7 +173,9 @@ public:
             auto & record=events_.try_emplace(id).first->second;
             try {
                 const auto * source=stage_host(slot,0,block.storage(),bytes);
-                sycl_copy_->copy(static_cast<unsigned char *>(tensor_->data)+offset,source,bytes);
+                for (std::size_t plane=0;plane<planes();++plane)
+                    sycl_copy_->copy(static_cast<unsigned char *>(tensor_->data)+slot_offset(slot,plane),
+                        static_cast<const unsigned char *>(source)+plane*bytes/planes(),bytes/planes());
                 record.sycl=sycl_copy_->fence();
             } catch (...) {
                 try { drain(); } catch (...) {}
@@ -189,7 +192,9 @@ public:
             record.event=event;
             const auto * source=stage_host(slot,0,block.storage(),bytes);
             begin_copy_interval(record,slot);
-            ggml_backend_tensor_set_async(copy_backend_, tensor_, source, offset, bytes);
+            for (std::size_t plane=0;plane<planes();++plane)
+                ggml_backend_tensor_set_async(copy_backend_, tensor_, static_cast<const unsigned char *>(source)+plane*bytes/planes(),
+                    slot_offset(slot,plane), bytes/planes());
             record_copy_interval(record.interval,true);
             if (event) ggml_backend_event_record(event, copy_backend_);
             else ggml_backend_synchronize(copy_backend_);
@@ -214,15 +219,15 @@ public:
         struct Range { std::size_t offset; std::uintptr_t source; std::size_t bytes; };
         const auto bytes=static_cast<std::size_t>(geometry_.block_tokens)*2*geometry_.dimension*sizeof(Half);
         std::vector<Range> ranges;
-        ranges.reserve(blocks.size());
+        ranges.reserve(blocks.size()*planes());
         for (const auto & copy : blocks) {
             const auto & block=*copy.block;
-            if (copy.slot>=static_cast<std::uint64_t>(geometry_.heads)*per_head_ || block.layout!=KvLayout::interleaved ||
+            if (copy.slot>=static_cast<std::uint64_t>(geometry_.heads)*per_head_ || block.layout!=geometry_.layout ||
                 block.dimension!=geometry_.dimension || block.capacity!=geometry_.block_tokens ||
                 block.storage_size()!=bytes/sizeof(Half)) throw std::invalid_argument("batched device upload shape");
-            const auto offset=(copy.slot/per_head_)*tensor_->nb[2]+(copy.slot%per_head_)*geometry_.block_tokens*tensor_->nb[1];
             const auto * source=stage_host(copy.slot,0,block.storage(),bytes);
-            ranges.push_back({offset,reinterpret_cast<std::uintptr_t>(source),bytes});
+            for (std::size_t plane=0;plane<planes();++plane)
+                ranges.push_back({slot_offset(copy.slot,plane),reinterpret_cast<std::uintptr_t>(source)+plane*bytes/planes(),bytes/planes()});
         }
         std::sort(ranges.begin(),ranges.end(),[](const Range & a,const Range & b) { return a.offset<b.offset; });
         const auto id=next_++;
@@ -286,29 +291,36 @@ public:
     void clear_current() noexcept { current_source_=nullptr; }
     std::uint64_t upload_current(std::uint32_t slot,const KvBlock * block,const CurrentDeviceKv & current,std::uint32_t prefix) override {
         const auto row=static_cast<std::uint32_t>(current.position%geometry_.block_tokens);
-        const auto row_bytes=static_cast<std::size_t>(2)*geometry_.dimension*sizeof(Half);
+        const auto packed_row_bytes=static_cast<std::size_t>(2)*geometry_.dimension*sizeof(Half);
+        const auto row_bytes=packed_row_bytes/planes();
         const auto version=row+(current.unarchived?0:1);
         if (!current_source_ || current_source_->data!=current.kv.data || slot>=static_cast<std::uint64_t>(geometry_.heads)*per_head_ || prefix>row ||
-            (version!=0 && !block) || (block && (block->layout!=KvLayout::interleaved || block->dimension!=geometry_.dimension ||
+            (version!=0 && !block) || (block && (block->layout!=geometry_.layout || block->dimension!=geometry_.dimension ||
             block->capacity!=geometry_.block_tokens || block->storage_size()!=static_cast<std::size_t>(geometry_.block_tokens)*2*geometry_.dimension ||
             block->valid_tokens!=version || block->version!=version || block->first_position!=current.position-row))) {
             throw std::invalid_argument("current device transfer snapshot");
         }
         if (next_==UINT64_MAX) throw std::overflow_error("copy ticket exhausted");
         const auto id=next_++;
-        const auto head=slot/per_head_,local=slot%per_head_;
-        const auto offset=head*tensor_->nb[2]+local*geometry_.block_tokens*tensor_->nb[1];
+        const auto head=slot/per_head_;
         const auto prefix_offset=static_cast<std::size_t>(prefix)*row_bytes;
         const auto prefix_bytes=static_cast<std::size_t>(row-prefix)*row_bytes;
-        const auto * prefix_data=prefix_bytes?block->storage()+static_cast<std::size_t>(prefix)*2*geometry_.dimension:nullptr;
-        const auto * current_row=static_cast<const unsigned char *>(current_source_->data)+head*row_bytes;
+        const auto plane_bytes=static_cast<std::size_t>(geometry_.block_tokens)*row_bytes;
+        const auto * current_row=static_cast<const unsigned char *>(current_source_->data)+head*packed_row_bytes;
+        const auto prefix_source = [&](std::size_t plane) -> const void * {
+            if (!prefix_bytes) return nullptr;
+            const auto source_offset=plane*plane_bytes+prefix_offset;
+            return stage_host(slot,source_offset,reinterpret_cast<const unsigned char *>(block->storage())+source_offset,prefix_bytes);
+        };
 #ifdef SOLID_HAVE_SYCL
         if (sycl_copy_) {
             auto & record=events_.try_emplace(id).first->second;
-            auto * target=static_cast<unsigned char *>(tensor_->data)+offset;
             try {
-                if (prefix_bytes) sycl_copy_->copy(target+prefix_offset,stage_host(slot,prefix_offset,prefix_data,prefix_bytes),prefix_bytes);
-                sycl_copy_->copy(target+row*row_bytes,current_row,row_bytes);
+                for (std::size_t plane=0;plane<planes();++plane) {
+                    auto * target=static_cast<unsigned char *>(tensor_->data)+slot_offset(slot,plane);
+                    if (prefix_bytes) sycl_copy_->copy(target+prefix_offset,prefix_source(plane),prefix_bytes);
+                    sycl_copy_->copy(target+row*row_bytes,current_row+plane*row_bytes,row_bytes);
+                }
                 record.sycl=sycl_copy_->fence();
             } catch (...) {
                 try { drain(); } catch (...) {}
@@ -321,19 +333,21 @@ public:
         auto * device=ggml_backend_get_device(copy_backend_);
         auto * event=device?ggml_backend_event_new(device):nullptr;
         try {
-            auto rows=std::make_unique<RowCopy>();
-            rows->source=row_tensor(*current_source_,const_cast<unsigned char *>(current_row));
-            rows->target=row_tensor(*tensor_,static_cast<unsigned char *>(tensor_->data)+offset+row*row_bytes);
+            auto rows=std::make_unique<std::array<RowCopy,2>>();
+            for (std::size_t plane=0;plane<planes();++plane) {
+                (*rows)[plane].source=row_tensor(*current_source_,const_cast<unsigned char *>(current_row)+plane*row_bytes);
+                (*rows)[plane].target=row_tensor(*tensor_,static_cast<unsigned char *>(tensor_->data)+slot_offset(slot,plane)+row*row_bytes);
+            }
             auto & record=events_.try_emplace(id).first->second;
             record.event=event;
             record.row=std::move(rows);
-            const auto * source=prefix_bytes ? stage_host(slot,prefix_offset,prefix_data,prefix_bytes) : nullptr;
             begin_copy_interval(record,slot);
-            if (prefix_bytes) {
-                ggml_backend_tensor_set_async(copy_backend_,tensor_,source,offset+prefix_offset,prefix_bytes);
+            for (std::size_t plane=0;plane<planes();++plane) {
+                if (prefix_bytes)
+                    ggml_backend_tensor_set_async(copy_backend_,tensor_,prefix_source(plane),slot_offset(slot,plane)+prefix_offset,prefix_bytes);
+                // Separate K/V use two views covered by the same completion.
+                ggml_backend_tensor_copy_async(copy_backend_,copy_backend_,&(*record.row)[plane].source,&(*record.row)[plane].target);
             }
-            // The KV graph frontier has completed on the producing backend.
-            ggml_backend_tensor_copy_async(copy_backend_,copy_backend_,&record.row->source,&record.row->target);
             record_copy_interval(record.interval,true);
             if (event) ggml_backend_event_record(event,copy_backend_);
             else ggml_backend_synchronize(copy_backend_);
@@ -504,12 +518,15 @@ public:
             for (std::size_t h=0;h<slots.size();++h) {
                 if (slots[h]/per_head_!=h) throw std::logic_error("KV archive slot belongs to the wrong head");
                 const auto token=(slots[h]%per_head_)*geometry_.block_tokens+position%geometry_.block_tokens;
-                const auto offset=h*tensor_->nb[2]+token*tensor_->nb[1];
+                for (std::size_t plane=0;plane<planes();++plane) {
+                    const auto offset=h*tensor_->nb[2]+token*tensor_->nb[1]+plane*tensor_->nb[3];
+                    const auto bytes=row_bytes/planes();
 #ifdef SOLID_HAVE_SYCL
-                if (sycl_copy_) sycl_copy_->copy(output+h*row_bytes,static_cast<const unsigned char *>(tensor_->data)+offset,row_bytes);
-                else
+                    if (sycl_copy_) sycl_copy_->copy(output+h*row_bytes+plane*bytes,static_cast<const unsigned char *>(tensor_->data)+offset,bytes);
+                    else
 #endif
-                    ggml_backend_tensor_get_async(copy_backend_,tensor_,output+h*row_bytes,offset,row_bytes);
+                        ggml_backend_tensor_get_async(copy_backend_,tensor_,output+h*row_bytes+plane*bytes,offset,bytes);
+                }
             }
             record_copy_interval(archive_interval_.get(),true);
 #ifdef SOLID_HAVE_SYCL
@@ -574,6 +591,10 @@ public:
     }
     ggml_tensor * tensor() const { return tensor_; }
 private:
+    std::size_t planes() const { return geometry_.layout==KvLayout::interleaved?1:2; }
+    std::size_t slot_offset(std::uint32_t slot,std::size_t plane) const {
+        return (slot/per_head_)*tensor_->nb[2]+(slot%per_head_)*geometry_.block_tokens*tensor_->nb[1]+plane*tensor_->nb[3];
+    }
     void begin_copy_interval(CopyRecord & record,std::uint32_t slot) {
 #ifdef SOLID_HAVE_CUDA_SELECTION
         if (cuda_device_<0) return;
@@ -605,7 +626,7 @@ private:
         row.buffer=source.view_src?source.view_src->buffer:source.buffer;
         row.view_src=nullptr; row.view_offs=0; row.data=data; row.extra=nullptr;
         for (auto & input:row.src) input=nullptr;
-        row.ne[0]=2ll*geometry_.dimension;
+        row.ne[0]=2ll*geometry_.dimension/planes();
         for (int i=1;i<GGML_MAX_DIMS;++i) row.ne[i]=1;
         row.nb[0]=sizeof(Half);
         for (int i=1;i<GGML_MAX_DIMS;++i) row.nb[i]=static_cast<std::size_t>(row.ne[0])*sizeof(Half);
@@ -818,7 +839,10 @@ struct GgmlPrefetch::Impl {
             work->dag.start(attention,now);
         }
         if (device.attention_complete(device.attention_epoch())) {
-            work->dag.complete(attention, trace.now(), proof, device_ns);
+            const auto completed=trace.now();
+            work->dag.complete(attention, completed, proof, device_ns);
+            totals.attention_layer_span_ns+=completed-work->dag.task(q_ready).end_ns;
+            ++totals.attention_layer_span_layers;
             if (work->archive_at_attention) {
                 finish_archive(work);
                 if (work->dag.task(next_prefetch).state==TaskState::pending) next_layer(work);

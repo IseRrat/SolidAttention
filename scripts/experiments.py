@@ -19,7 +19,7 @@ from experiment_runtime import Background, condition, cuda_memory_limit, fio_com
 from process_lifetime import stop_process, termination_signals
 
 ROOT = Path(__file__).resolve().parents[1]
-VARIANTS = {"origin", "quant", "indram", "indram-sparse", "offload", "offload-sparse", "interleaved", "prefetch", "overlap", "solid", "solid-no-prefetch"}
+VARIANTS = {"origin", "quant", "indram", "indram-sparse", "offload", "offload-sparse", "interleaved", "prefetch", "overlap", "solid", "solid-no-prefetch", "solid-no-interleaved"}
 
 
 def name(value):
@@ -30,9 +30,10 @@ def name(value):
 
 def variant_config(template, variant, block, budget):
     if variant not in VARIANTS: raise ValueError("unknown experiment variant")
-    if variant == "solid-no-prefetch":
+    if variant in ("solid-no-prefetch", "solid-no-interleaved"):
         config = variant_config(template, "solid", block, budget)
-        config["attention"]["prefetch_ahead"] = False
+        if variant == "solid-no-prefetch": config["attention"]["prefetch_ahead"] = False
+        else: config["attention"]["layout"] = "separate"
         return config
     config = copy.deepcopy(template)
     for key in ("attention", "replay_token_ids", "prompt_token_ids"): config.pop(key,None)
@@ -131,7 +132,7 @@ def create(spec_path, destination):
             raise ValueError("offload_sparse_budgets must map input lengths in the suite to budgets")
         if sparse_budgets and ("offload-sparse" not in suite["variants"] or suite["budgets"]!=[0]):
             raise ValueError("offload_sparse_budgets replaces the automatic budget for offload-sparse")
-        if sparse_budgets and {"solid", "solid-no-prefetch"}.intersection(suite["variants"]):
+        if sparse_budgets and {"solid", "solid-no-prefetch", "solid-no-interleaved"}.intersection(suite["variants"]):
             raise ValueError("offload-sparse and solid must use the same budget in a comparison suite")
         for value in sparse_budgets.values():
             if value!="full": number(value,1,True)

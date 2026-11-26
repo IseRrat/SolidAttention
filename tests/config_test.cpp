@@ -99,7 +99,10 @@ int main() {
         reject(prefix + async_mode + ",\"gpu_decode\":false}}");
         reject(prefix + ",\"attention\":{\"storage\":\"memory\",\"sparse\":true,\"layout\":\"interleaved\",\"prefetch\":true}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":false,\"layout\":\"interleaved\",\"prefetch\":true}}");
-        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"prefetch\":true}}");
+        write(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"separate\",\"prefetch\":true,\"fuse_kv_projection\":true}}");
+        const auto separate_prefetch=solid::RunConfig::load(config).attention;
+        if (separate_prefetch.interleaved || !separate_prefetch.prefetch || !separate_prefetch.fuse_kv_projection)
+            throw std::runtime_error("KV interleaving ablation changed prefetch or projection settings");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"prefetch_queue_depth\":4}}");
         write(prefix + async_mode + ",\"schedule\":\"overlap+sync_reuse\",\"schedule_trace\":true}}");
         if (solid::RunConfig::load(config).attention.schedule != "overlap+sync_reuse") throw std::runtime_error("schedule configuration parsing");

@@ -999,9 +999,10 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         if (impl_->direct) result = on_device(device_release_mask(context,result,impl_->device_kv,impl_->device_query));
         const auto slots = impl_->prefetch->tokens_per_head();
         auto * bank = impl_->prefetch->tensor();
-        const auto stride = static_cast<std::size_t>(g.dimension) * 2 * sizeof(Half);
+        const auto stride = bank->nb[1];
         auto * keys = ggml_view_3d(context, bank, g.dimension, slots, g.heads, stride, bank->nb[2], 0);
-        auto * values = ggml_view_3d(context, bank, g.dimension, slots, g.heads, stride, bank->nb[2], g.dimension * sizeof(Half));
+        auto * values = ggml_view_3d(context, bank, g.dimension, slots, g.heads, stride, bank->nb[2],
+            g.layout==KvLayout::interleaved?g.dimension*sizeof(Half):bank->nb[3]);
         auto * mask = ggml_view_3d(context, result, slots, 1, impl_->session.query_heads(), slots * sizeof(Half), slots * sizeof(Half), 0);
         auto * q = query->type == GGML_TYPE_F32 ? query : ggml_cast(context, query, GGML_TYPE_F32);
         q = ggml_permute(context, q, 0, 2, 1, 3);

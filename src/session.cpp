@@ -49,7 +49,7 @@ AttentionSession::AttentionSession(std::unique_ptr<KvStore> store, std::uint32_t
     if (rope_) stats_.prefill_backend = "cpu_infllm_sparse";
     if (sparse_) representatives_ = std::make_unique<RepresentativeIndex>(store_->geometry(), query_heads, budget);
     if (reader) {
-        if (!sparse_ || geometry().layout != KvLayout::interleaved) throw std::invalid_argument("prefetch requires sparse interleaved KV");
+        if (!sparse_) throw std::invalid_argument("prefetch requires sparse KV");
         if (!prefetch_slots_per_head) prefetch_slots_per_head = budget.cache_slots(geometry());
         prefetch_ = std::make_unique<Prefetcher>(*store_, budget, prefetch_slots_per_head, std::move(reader), prefetch_trace, prefetch_ahead);
     }

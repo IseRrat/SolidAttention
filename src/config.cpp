@@ -210,8 +210,8 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
             if (target.prefetch_queue_depth < 2 || target.prefetch_queue_depth > 16384) throw std::invalid_argument("prefetch_queue_depth must be in [2,16384]");
         }
         if (a.contains("prefetch_slots_per_head")) target.prefetch_slots_per_head = positive(a, "prefetch_slots_per_head");
-        if (target.prefetch && (target.in_memory || !target.sparse || !target.interleaved || !target.gpu_decode)) {
-            throw std::invalid_argument("prefetch requires SSD sparse interleaved storage and GGML decode");
+        if (target.prefetch && (target.in_memory || !target.sparse || !target.gpu_decode)) {
+            throw std::invalid_argument("prefetch requires SSD sparse storage and GGML decode");
         }
         if (!target.prefetch && (a.contains("prefetch_ahead") || a.contains("prefetch_queue_depth") || a.contains("prefetch_slots_per_head") || a.contains("prefetch_trace"))) throw std::invalid_argument("prefetch options require prefetch=true");
         if (!target.prefetch && (a.contains("schedule") || a.contains("schedule_trace"))) throw std::invalid_argument("schedule requires prefetch=true");

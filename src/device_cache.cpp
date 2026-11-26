@@ -11,7 +11,7 @@ DeviceCache::DeviceCache(Prefetcher & host, KvGeometry geometry, std::uint32_t q
     host_(host), geometry_(geometry), query_heads_(query_heads), transport_(transport),
     slots_(geometry.heads, host.slots_per_head()+(transport.aliases_host_slots()?1:0)) {
     geometry.validate();
-    if (geometry.layout != KvLayout::interleaved || !query_heads || query_heads % geometry.heads != 0) throw std::invalid_argument("invalid device cache geometry");
+    if (!query_heads || query_heads % geometry.heads != 0) throw std::invalid_argument("invalid device cache geometry");
     (void) tokens_per_head();
     if (transport_.binds_host_slots()) {
         std::vector<Half *> addresses;

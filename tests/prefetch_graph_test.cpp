@@ -102,9 +102,10 @@ struct OverlapBarrier {
     }
 };
 void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & traces, bool builder,bool native,bool direct,bool packed,
-         bool shared=false,bool infllm=false) {
+         bool shared=false,bool infllm=false,bool separate=false) {
     constexpr int dimension = 128, kv_heads = 2, query_heads = 4;
-    const solid::KvGeometry geometry{2, kv_heads, dimension, 2, 12, 64, solid::KvLayout::interleaved};
+    const solid::KvGeometry geometry{2, kv_heads, dimension, 2, 12, 64,
+        separate?solid::KvLayout::separate:solid::KvLayout::interleaved,separate};
     const solid::SparseBudget budget = infllm ? solid::SparseBudget{6, 1, 2, 2, true, true} : solid::SparseBudget{6, 1, 1, 1};
     const auto rope = infllm ? std::optional<solid::RelativeRope>{{dimension, 10000.f, true}} : std::nullopt;
     std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(), ggml_backend_free);
@@ -310,6 +311,8 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     }
     const auto stats = device.schedule_stats();
     require(stats.frames == 12 && stats.tasks == 144, "microtask frames not fully completed");
+    require(stats.attention_layer_span_layers==12 && stats.attention_layer_span_ns>0,
+        "attention latency did not cover every replayed layer");
     require(mode==solid::ScheduleMode::naive ? stats.block_frames==0 : stats.block_frames==12 && stats.block_tasks>12,
             "historical block DAG not completed through actual copy receipts");
     if (infllm && !native) require(stats.attention_fences == 12 && observer.completions == 0, "InfLLM probability receipts did not complete attention");
@@ -363,6 +366,9 @@ int main(int argc, char ** argv) {
             for (auto mode : {solid::ScheduleMode::naive, solid::ScheduleMode::overlap, solid::ScheduleMode::sync_reuse}) {
                 run(false, mode, {}, false, false, false, true, false, true);
                 run(false, mode, {}, false, mode==solid::ScheduleMode::sync_reuse, true, true, false, true);
+                run(false, mode, {}, false, mode==solid::ScheduleMode::sync_reuse, true, true, false, true, true);
+                if (solid::uring_available())
+                    run(true, mode, {}, false, mode==solid::ScheduleMode::sync_reuse, true, true, false, true, true);
             }
             std::cout << "InfLLM attention through prefetched slots and device frontiers passed\n";
             return 0;

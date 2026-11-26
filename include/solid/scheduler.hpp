@@ -118,5 +118,7 @@ struct ScheduleStats {
     std::uint64_t history_consumer_wait_ns = 0, history_consumer_wait_calls = 0;
     std::uint64_t cache_load_host_block_ns = 0, cache_load_host_block_layers = 0;
     std::uint64_t cache_load_device_block_ns = 0, cache_load_device_block_layers = 0;
+    // Host-observed Q frontier to attention completion, including exposed I/O.
+    std::uint64_t attention_layer_span_ns = 0, attention_layer_span_layers = 0;
 };
 } // namespace solid

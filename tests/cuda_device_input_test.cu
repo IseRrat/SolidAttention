@@ -119,8 +119,8 @@ void operations() {
 // Model-free integration on the experiment machine: two actual CUDA/CPU split
 // layers, private ranker stream, native completion and one allocated graph reused
 // across decode positions. CPU scalar sparse attention is the numerical oracle.
-void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bool baseline=false,bool prefetch_ahead=true) {
-    const solid::KvGeometry g{2,2,128,2,32,64,baseline?solid::KvLayout::separate:solid::KvLayout::interleaved};
+void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bool baseline=false,bool prefetch_ahead=true,bool separate=false) {
+    const solid::KvGeometry g{2,2,128,2,32,64,baseline||separate?solid::KvLayout::separate:solid::KvLayout::interleaved};
     const solid::SparseBudget budget=infllm?solid::SparseBudget{6,1,2,2,true,true}:solid::SparseBudget{6,1,1,1};
     const auto rope=infllm?std::optional<solid::RelativeRope>{{128,10000.f,true}}:std::nullopt;
     std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> gpu(ggml_backend_cuda_init(device),ggml_backend_free),
@@ -255,6 +255,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
     if (!infllm) require(after.ranking.builder_rank_shared_waits>0,"CUDA decode did not reuse the block ranking wait");
     const auto schedule=cache->schedule_stats();
     require(schedule.history_consumer_wait_calls==16,"CUDA decode omitted consumer readiness wait accounting");
+    require(schedule.attention_layer_span_layers==16 && schedule.attention_layer_span_ns>0,
+        "CUDA replay omitted Q-frontier-to-attention latency samples");
     if (mode==solid::ScheduleMode::sync_reuse) {
         require(schedule.cache_load_host_block_layers==16 && schedule.cache_load_device_block_layers==16,
             "CUDA graph replay omitted CPU/GPU cache loading blocking measurements");
@@ -282,6 +284,8 @@ int main(int argc,char ** argv) {
         for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) decode(device,false,mode,true);
         decode(device,false,solid::ScheduleMode::naive,true,true);
         decode(device,false,solid::ScheduleMode::sync_reuse,true,false,false);
+        for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse})
+            decode(device,false,mode,true,false,true,true);
         std::cout<<"CUDA borrowed Q/K, FP16 kernels, split graphs and replay checks passed\n"; return 0;
     } catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

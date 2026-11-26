@@ -599,6 +599,8 @@ int main(int argc, char ** argv) {
                     {"block_observed_critical_path_sum_ms",schedule.block_critical_path_ns/1e6},
                     {"completion_backend",schedule.completion_backend},{"device_event_completions",schedule.device_event_completions},
                     {"device_attention_event_ms",schedule.device_attention_ns/1e6},{"device_boundary_fallbacks",schedule.device_boundary_fallbacks},
+                    {"attention_layer_span_ms",schedule.attention_layer_span_ns/1e6},
+                    {"attention_layer_span_layers",schedule.attention_layer_span_layers},
                     {"uploads_before_boundary",schedule.uploads_before_boundary},{"copy_event_queries",schedule.copy_event_queries},
                     {"coordinator_cpu",schedule.coordinator_cpu},
                     {"observed_critical_path_sum_ms", schedule.critical_path_ns / 1e6},
