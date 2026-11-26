@@ -865,8 +865,9 @@ struct GgmlPrefetch::Impl {
             if (per_completion_uploads) {
                 device.prefetch_ready(before_upload,true);
                 session.prefetcher().poll(false,[&](const SlotLease & lease) {
-                    device.stage_ready_batch({lease},{},before_upload);
+                    device.stage_ready_completion(lease,{},before_upload);
                 });
+                device.reap_transfers();
                 observe_stores();
             } else {
                 session.prefetcher().poll();
@@ -894,8 +895,10 @@ struct GgmlPrefetch::Impl {
             events->acknowledge();
             if (current->archive_at_attention && !released) device.reap_transfers();
             const Prefetcher::ReadyBlock upload_ready=per_completion_uploads && released ?
-                Prefetcher::ReadyBlock{[&](const SlotLease & lease) { device.stage_ready_batch({lease},{},before_upload); }} : Prefetcher::ReadyBlock{};
-            host.poll(false,upload_ready); observe_stores();
+                Prefetcher::ReadyBlock{[&](const SlotLease & lease) { device.stage_ready_completion(lease,{},before_upload); }} : Prefetcher::ReadyBlock{};
+            host.poll(false,upload_ready);
+            if (per_completion_uploads && released) device.reap_transfers();
+            observe_stores();
             if (!released) if (const auto receipt=events->poll(current->layer,epoch)) {
                 const char * proof;
                 if (receipt->proof==AttentionProof::device_signal) {
@@ -1039,7 +1042,7 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
                 work->direct?std::optional<CurrentBlock>{CurrentBlock{work->layer,work->position}}:std::optional<CurrentBlock>{}); },
             impl_->per_completion_uploads ? Prefetcher::ReadyBlock{[&](const SlotLease & lease) {
                 if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
-                impl_->device.stage_ready_batch({lease},work->blocks);
+                impl_->device.stage_ready_completion(lease,work->blocks);
             }} : Prefetcher::ReadyBlock{},[&](const std::vector<BlockWork> & plan) {
                 auto blocks=plan;
                 const auto ready=host.ready();

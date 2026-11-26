@@ -335,6 +335,11 @@ void DeviceCache::stage_ready(const SlotLease & lease,const std::shared_ptr<Bloc
     }
     (void) upload(lease,stage,before_upload);
 }
+void DeviceCache::stage_ready_completion(const SlotLease & lease,const std::shared_ptr<BlockStage> & stage,const std::function<void()> & before_upload) {
+    if (!transport_.batches_uploads()) { stage_ready(lease,stage,before_upload); return; }
+    if (!attention_.empty()) throw std::logic_error("completion upload while attention owns slots");
+    upload_batch({lease},stage,before_upload);
+}
 void DeviceCache::stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage,const std::function<void()> & before_upload) {
     if (!transport_.batches_uploads()) {
         for (const auto & lease : leases) stage_ready(lease,stage,before_upload);

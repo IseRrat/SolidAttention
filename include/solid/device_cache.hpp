@@ -75,6 +75,10 @@ public:
     void begin_stage(const std::vector<BlockIdentity> & identities,std::optional<CurrentBlock> current = {});
     void stage_ready(const SlotLease & host_lease,const std::shared_ptr<BlockStage> & stage = {},
                      const std::function<void()> & before_upload = {});
+    // The caller has prepared this layer bank. Keep source leases until the
+    // normal queue-boundary reap; do not scan all pending tickets per CQE.
+    void stage_ready_completion(const SlotLease & lease,const std::shared_ptr<BlockStage> & stage = {},
+                                const std::function<void()> & before_upload = {});
     void stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage,
                            const std::function<void()> & before_upload = {});
     std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,

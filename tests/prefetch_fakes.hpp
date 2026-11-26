@@ -94,6 +94,7 @@ public:
     bool immediate = false;
     bool fail_upload = false;
     bool batch_uploads = false;
+    std::uint64_t completion_polls=0;
     std::uint64_t upload(std::uint32_t slot, const solid::KvBlock & block) override {
         if (fail_upload) throw std::runtime_error("injected transfer failure");
         const auto id = next++;
@@ -110,6 +111,7 @@ public:
     }
     void write(Copy & copy) { if (!copy.done) { memory[copy.slot] = *copy.source; copy.done = true; } }
     bool complete(std::uint64_t id, bool wait) override {
+        ++completion_polls;
         auto found = copies.find(id);
         require(found != copies.end(), "unknown fake transfer");
         if (!found->second.front().done && !wait && !immediate) return false;

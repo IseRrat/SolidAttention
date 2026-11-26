@@ -312,11 +312,15 @@
 
    `attention.per_completion_uploads` 默认关闭。开启后，`io_worker.cpp` 在发布每条原始 I/O 完成结果后立即发送通知，再继续收取下一条结果。`prefetch.cpp` 在一个完整 KV 块的所有读取分段完成后、消费下一条完成结果之前调用上传入口；分离布局等待该块 K、V 两段均完成。正式补读通过块身份和槽位版本定位本次所需数据，上传期间持续持有主机源缓冲。异常路径释放临时引用，并由现有排空逻辑保护仍在进行的读写。
 
-   `ggml_prefetch.cpp` 将上述入口接入正式补读和下一层预测读取。当前 attention 释放显存读者后，`device_cache.cpp` 先整理可复用槽位，将此前已经读好的积压块逐块提交；随后新读好的块直接进入单块上传。每块沿用原页锁定主机槽位、设备槽位选择、独立复制队列和完成票据。`solid-per-completion` 从完整 SolidAttention 配置复制，只开启逐完成上传并关闭相邻块合并；预算、评分、交织、预测及同步复用沿用原配置。`scheduler.hpp` 和结果中的 `schedule.per_completion_uploads` 记录实际派发模式。
+   `ggml_prefetch.cpp` 将上述入口接入正式补读和下一层预测读取。当前 attention 释放显存读者后，`device_cache.cpp` 先整理可复用槽位，将此前已经读好的积压块逐块提交；随后新读好的块直接进入单块上传。每块沿用原页锁定主机槽位、设备槽位选择、独立复制队列和完成票据。逐完成入口在已准备好的显存 bank 中提交单块复制，完成查询集中在读回执处理边界和原有消费者边界，源缓冲继续由票据持有。`solid-per-completion` 从完整 SolidAttention 配置复制，只开启逐完成上传并关闭相邻块合并；预算、评分、交织、预测及同步复用沿用原配置。`scheduler.hpp` 和结果中的 `schedule.per_completion_uploads` 记录实际派发模式。
 
    `attention.measure_upload_ready_time` 默认关闭。诊断开启时，`async_reader.hpp` 的完成结果记录 I/O 线程观察到完成回执的单调时钟时间；`prefetch.hpp` 按槽位保存完整块最后一段回执的时间，槽位重新读取时重置。`device_cache.hpp`、`device_cache.cpp` 在实际进入上传器前累计样本数、总等待及最大等待，`baseline.cpp` 写出 `ready_time_measured`、`ready_upload_samples`、`ready_upload_delay_sum_ms`、`ready_upload_delay_max_ms`。该区间包含线程交接、程序处理及显存槽位依赖等待；计时只保存汇总数据。
 
    `config.hpp`、`config.cpp`、`llama_adapter.cpp`、`ggml_prefetch.hpp` 贯通配置与实际读取器、上传器，逐完成模式要求开启预取、关闭相邻合并并使用重叠调度。`experiments.py` 接入变体，`experiment_common.py` 核对实际派发模式和计时开关。`io_worker_test.cpp` 阻塞第二次完成检查，核对第一次通知已送达；`prefetch_test.cpp` 核对每块在下一条可用回执被消费前开始上传、分离 K/V 完整性及失败清理；`cuda_device_input_test.cu` 对照原生 CUDA 输出，并要求逐块上传的批次数与历史块数一致。配置与变体检查位于 `config_test.cpp`、`test_experiments.py`。服务器编译、54 项 CPU 检查、22 项实验脚本检查及原生 CUDA 数值核验通过，记录保存于 `results/server5090/completion-dispatch-check/`；CUDA 采集为 `results/server5090/infllm-port-check-completion.2H2PnXkQ/nsys/completion-dispatch-native.nsys-rep`。
+
+   `0bbdd74` 完成 3B、16K、相同 127 步输入的两组逐完成上传诊断。合并／逐完成的完整 Decode 为 78.77／170.00 ms/步，实际 GPU H2D 为 4.879／13.060 ms/步，GPU kernel 为 5.294／5.316 ms/步，H2D 请求为约 2010／8380 笔/步；读盘回执至上传器入口的块平均等待为 0.411／1.117 ms。原始结果、固定输入、两份 Nsight、逐项 CPU/GPU 分解和时间线保存于 `results/server5090/completion-upload-3b-16k-0bbdd74.las8w2mc/`。这轮逐块路径按块执行上传完成扫描，单块搬运还沿用调度成本估计的首尾 GPU 计时事件。
+
+   后续调整将逐完成上传接到 `DeviceCache::stage_ready_completion`，在已准备好的显存 bank 中直接提交单块复制，在完成结果处理边界统一收割票据。`prefetch_fakes.hpp` 增加完成查询计数，`prefetch_test.cpp` 核对逐块提交期间查询数为零，并继续检查源缓冲生命周期。该调整通过服务器编译、54 项 CPU 检查与 22 项脚本检查，记录为 `completion-dispatch-check/refined-compile-and-cpu.log`。
 
 ## 五、论文系统的工程接入
 

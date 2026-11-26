@@ -283,7 +283,8 @@ void completion_delivery(solid::KvLayout layout,bool fail_upload) {
             const auto segments=layout==solid::KvLayout::separate?2u:1u;
             require(observe->counters.completed_reads==callbacks*segments,"upload deferred until other ready CQEs were drained");
             transport.fail_upload=fail_upload && callbacks==2;
-            cache.stage_ready_batch({lease},{});
+            cache.stage_ready_completion(lease,{});
+            require(transport.completion_polls==0,"completion upload rescanned outstanding transfers per block");
         },{},false,{},false,true); };
     if (fail_upload) rejects([&] { (void) resolve(); });
     else {
