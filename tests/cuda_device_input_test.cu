@@ -4,6 +4,10 @@
 #include "solid/llama_adapter.hpp"
 #include "ggml-cuda.h"
 #include "ggml-cpu.h"
+#include "ggml-backend-impl.h"
+#include <chrono>
+#include <condition_variable>
+#include <mutex>
 #include <iostream>
 #include <cmath>
 #include <cstring>
@@ -31,6 +35,41 @@ struct Capture {
         if (executable) (void) cudaGraphExecDestroy(executable);
         if (graph) (void) cudaGraphDestroy(graph);
         if (stream) (void) cudaStreamDestroy(stream);
+    }
+};
+// Keep historical reads pending until the actual CUDA current-row download
+// has completed. A download placed behind the KV join cannot pass this gate.
+struct ArchiveGate {
+    ggml_backend_t backend;
+    decltype(ggml_backend_i::get_tensor_async) original;
+    cudaEvent_t downloaded=nullptr;
+    std::mutex mutex;
+    std::condition_variable cv;
+    std::uint64_t count=0,base=0;
+    bool failed=false;
+    inline static ArchiveGate * active=nullptr;
+    explicit ArchiveGate(ggml_backend_t backend):backend(backend),original(backend->iface.get_tensor_async) {
+        checked(cudaEventCreateWithFlags(&downloaded,cudaEventDisableTiming),"create archive read gate");
+        require(!active && original,"archive probe backend"); active=this;
+        backend->iface.get_tensor_async=[](ggml_backend_t backend,const ggml_tensor * tensor,void * output,std::size_t offset,std::size_t bytes) {
+            auto & gate=*active; gate.original(backend,tensor,output,offset,bytes);
+            if (solid::device_op(tensor)!=solid::DeviceOp::consolidate_kv) return;
+            std::lock_guard<std::mutex> lock(gate.mutex);
+            checked(cudaEventRecord(gate.downloaded,static_cast<cudaStream_t>(solid_cuda_queue(backend))),"record actual current-row download");
+            ++gate.count; gate.cv.notify_all();
+        };
+    }
+    ~ArchiveGate() { backend->iface.get_tensor_async=original; active=nullptr; (void) cudaEventDestroy(downloaded); }
+    void begin(std::uint64_t step) { std::lock_guard<std::mutex> lock(mutex); base=2*step; }
+    void wait(std::uint32_t layer) {
+        std::unique_lock<std::mutex> lock(mutex);
+        if (!cv.wait_for(lock,std::chrono::seconds(2),[&] { return failed || count>=base+layer+1; })) {
+            // Let cleanup drain the reader after reporting the first failure.
+            failed=true; cv.notify_all();
+            throw std::runtime_error("current KV archive waited for historical reads");
+        }
+        if (failed) return;
+        checked(cudaEventSynchronize(downloaded),"finish current-row download before historical read");
     }
 };
 struct Observer {
@@ -119,15 +158,24 @@ void operations() {
 // Model-free integration on the experiment machine: two actual CUDA/CPU split
 // layers, private ranker stream, native completion and one allocated graph reused
 // across decode positions. CPU scalar sparse attention is the numerical oracle.
-void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bool baseline=false,bool prefetch_ahead=true,bool separate=false,bool coalesce_uploads=true,bool per_completion=false) {
+void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bool baseline=false,bool prefetch_ahead=true,bool separate=false,bool coalesce_uploads=true,bool per_completion=false,bool gate_history=false) {
     const solid::KvGeometry g{2,2,128,2,32,64,baseline||separate?solid::KvLayout::separate:solid::KvLayout::interleaved};
     const solid::SparseBudget budget=infllm?solid::SparseBudget{6,1,2,2,true,true}:solid::SparseBudget{6,1,1,1};
     const auto rope=infllm?std::optional<solid::RelativeRope>{{128,10000.f,true}}:std::nullopt;
     std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> gpu(ggml_backend_cuda_init(device),ggml_backend_free),
         cpu(ggml_backend_cpu_init(),ggml_backend_free);
     require(gpu && cpu,"decode check backends");
-    solid::AttentionSession session(std::make_unique<solid::MemoryKvStore>(g),4,budget,true,6,{}, {},
-        baseline?std::unique_ptr<solid::AsyncReader>{}:std::make_unique<test_prefetch::Reader>(),budget.cache_slots(g),{},rope,prefetch_ahead);
+    auto gate=gate_history?std::make_unique<ArchiveGate>(gpu.get()):nullptr;
+    auto file=gate_history?std::make_unique<test_prefetch::File>():nullptr;
+    auto reader=baseline?nullptr:std::make_unique<test_prefetch::Reader>(file.get());
+    if (gate) {
+        auto * pending=reader.get();
+        reader->before_wait=[&,pending] { gate->wait(pending->pending.back().offset>=g.block_offset(1,0,0)?1:0); };
+    }
+    std::unique_ptr<solid::KvStore> store=gate_history?
+        std::unique_ptr<solid::KvStore>{std::make_unique<solid::FileKvStore>(g,std::move(file),2048)}:
+        std::unique_ptr<solid::KvStore>{std::make_unique<solid::MemoryKvStore>(g)};
+    solid::AttentionSession session(std::move(store),4,budget,true,6,{}, {},std::move(reader),budget.cache_slots(g),{},rope,prefetch_ahead);
     solid::AttentionSession reference(std::make_unique<solid::MemoryKvStore>(g),4,budget,true,6,{}, {},{},0,{},rope);
     auto ranker=solid::make_cuda_block_ranker(session.representative_geometry(),4,1,6,device,infllm?0:1,infllm?g.heads:0);
     if (infllm) require(ranker->configure_probability_builder(budget.initial,budget.local,budget.representatives),"native decode probability builder");
@@ -218,6 +266,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
     ggml_build_forward_expand(graph,outputs[1]);
     require(ggml_backend_sched_alloc_graph(scheduler.get(),graph),"allocate CUDA split graph");
     for (int p=6;p<14;++p) {
+        if (gate) gate->begin(p-6);
         if (absolute) { const std::int32_t position=p; ggml_backend_tensor_set(absolute,&position,0,sizeof(position)); }
         if (!baseline) cache->begin_prefetch(0,p);
         std::vector<float> expected[2];
@@ -238,6 +287,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
     }
     if (cache) cache->quiesce(); session.finish();
     const auto after=session.stats();
+    if (gate) require(!gate->failed && gate->count==16 && after.prefetch.io.completed_reads>0,
+        "archive/read independence gate missed CUDA downloads or historical reads");
     if (!prefetch_ahead) require(!after.prefetch.ahead_enabled && after.prefetch.predicted_blocks==0 && after.prefetch.formal_resolutions==16,
         "on-demand GPU path submitted speculative reads or skipped formal attention");
     if (baseline) {
@@ -301,6 +352,7 @@ int main(int argc,char ** argv) {
         decode(device,false,solid::ScheduleMode::sync_reuse,true,false,true,false,false,true);
         for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse})
             decode(device,false,mode,true,false,true,true);
+        decode(device,false,solid::ScheduleMode::sync_reuse,true,false,false,false,true,false,true);
         std::cout<<"CUDA borrowed Q/K, FP16 kernels, split graphs and replay checks passed\n"; return 0;
     } catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

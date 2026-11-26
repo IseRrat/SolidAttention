@@ -153,6 +153,10 @@ public:
             }
         }
 #endif
+        // The inference thread may enqueue the current-row download while
+        // the coordinator owns historical uploads. Allocate its private
+        // host buffer before either thread starts using the transport.
+        if (can_archive_on_attention_stream()) allocate_archive_buffer();
     }
     ~GgmlTransport() override {
         if (!events_.empty() || archive_pending_) {
@@ -498,14 +502,9 @@ public:
         auto * device=ggml_backend_get_device(archive_backend);
         const auto row_bytes=static_cast<std::size_t>(2)*geometry_.dimension*sizeof(Half);
         const auto bytes=row_bytes*geometry_.heads;
-        if (!archive_buffer_) {
-            auto * type=device?ggml_backend_dev_host_buffer_type(device):nullptr;
-            if (!type) type=ggml_backend_get_default_buffer_type(copy_backend_);
-            if (!ggml_backend_buft_is_host(type)) throw std::runtime_error("KV archive needs host-accessible storage");
-            archive_buffer_.reset(ggml_backend_buft_alloc_buffer(type,bytes));
-            if (!archive_buffer_) throw std::runtime_error("KV archive allocation failed");
-            stats_.staging_bytes+=ggml_backend_buffer_get_size(archive_buffer_.get());
-        }
+        if (source && (source->type!=GGML_TYPE_F16 || !ggml_is_contiguous(source) || ggml_nbytes(source)!=bytes))
+            throw std::invalid_argument("KV archive requires a contiguous current FP16 row");
+        allocate_archive_buffer(archive_backend);
 #ifdef SOLID_HAVE_SYCL
         if (!sycl_copy_)
 #endif
@@ -601,6 +600,18 @@ public:
     }
     ggml_tensor * tensor() const { return tensor_; }
 private:
+    void allocate_archive_buffer(ggml_backend_t backend=nullptr) {
+        if (archive_buffer_) return;
+        if (!backend) backend=backend_;
+        auto * device=ggml_backend_get_device(backend);
+        auto * type=device?ggml_backend_dev_host_buffer_type(device):nullptr;
+        if (!type) type=ggml_backend_get_default_buffer_type(copy_backend_);
+        if (!ggml_backend_buft_is_host(type)) throw std::runtime_error("KV archive needs host-accessible storage");
+        const auto bytes=static_cast<std::size_t>(geometry_.heads)*2*geometry_.dimension*sizeof(Half);
+        archive_buffer_.reset(ggml_backend_buft_alloc_buffer(type,bytes));
+        if (!archive_buffer_) throw std::runtime_error("KV archive allocation failed");
+        stats_.staging_bytes+=ggml_backend_buffer_get_size(archive_buffer_.get());
+    }
     std::size_t planes() const { return geometry_.layout==KvLayout::interleaved?1:2; }
     std::size_t slot_offset(std::uint32_t slot,std::size_t plane) const {
         return (slot/per_head_)*tensor_->nb[2]+(slot%per_head_)*geometry_.block_tokens*tensor_->nb[1]+plane*tensor_->nb[3];
@@ -1113,6 +1124,14 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         else current->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), "kv_download_complete");
     }
     const auto consumer_ready=impl_->trace.now();
+    if (early_enabled() && deferred && current->archive_at_attention) {
+        // Figure 11(c): current KV download depends on KV projection,
+        // independently of the selected historical blocks still loading.
+        // Archive state belongs to this thread until the KV worker joins;
+        // historical uploads use the separate copy backend and slot state.
+        current->dag.start(kv_d2h,impl_->trace.now());
+        impl_->transport.start_archive({},position,source);
+    }
     const auto wait_begin = std::chrono::steady_clock::now();
     {
         trace::Scope wait("CPU Wait KV", layer, position);
@@ -1188,11 +1207,6 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         work->dag.fence({store_task}, impl_->trace.now(), "serial_buffered_store");
         impl_->next_layer(work);
     } else {
-        if (work->archive_at_attention) {
-            const auto archive_start=impl_->trace.now();
-            impl_->transport.start_archive({},position,source);
-            work->dag.start(kv_d2h,archive_start);
-        }
         if (reuses_sync()) impl_->transport.wait_on_compute();
         else {
             work->dag.complete(current_h2d, impl_->trace.now(), "upload_complete");

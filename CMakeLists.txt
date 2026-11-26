@@ -143,6 +143,7 @@ if(SOLID_BUILD_TESTS)
                 CUDA_ARCHITECTURES "${SOLID_SELECTION_ARCHITECTURES}")
             add_executable(solid-cuda-device-input-test tests/cuda_device_input_test.cu)
             target_link_libraries(solid-cuda-device-input-test PRIVATE solid_cuda_selection llama)
+            target_include_directories(solid-cuda-device-input-test PRIVATE third_party/llama.cpp/ggml/src)
             set_target_properties(solid-cuda-device-input-test PROPERTIES CUDA_STANDARD 17 CUDA_STANDARD_REQUIRED ON
                 CUDA_ARCHITECTURES "${SOLID_SELECTION_ARCHITECTURES}")
         endif()

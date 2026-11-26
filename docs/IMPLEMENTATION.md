@@ -214,11 +214,11 @@
 
 3. **当前行安装与主机归档**
 
-   当前设备行装入显存 KV 缓冲区时保留尾块前缀，只复制缺口。CUDA 的 `overlap+sync_reuse` 模式从连续的 FP16 投影一次下载所有 KV 头。下载在 attention 的计算流上排在等待历史 KV 上传之前，可与另一条流上的上传重叠。协调线程收到 attention 完成通知后读取已下载的当前行，将其追加到主机缓冲区，释放上一层显存槽位，推进下一层上传和当前层聚合回写。多层模型的下一层 SSD 读取可提前派发。普通 `overlap` 保留独立的归档完成点。上下文容量末尾照常完成当前 attention、归档和回写。
+   当前设备行装入显存 KV 缓冲区时保留尾块前缀，只复制缺口。CUDA 的 `overlap+sync_reuse` 模式从连续的 FP16 投影一次下载所有 KV 头。KV 投影就绪后立即提交下载，再等待历史补读和上传提交；下载在 attention 的计算流上排在等待历史 KV 上传之前，可与另一条流上的上传重叠。协调线程收到 attention 完成通知后读取已下载的当前行，将其追加到主机缓冲区，释放上一层显存槽位，推进下一层上传和当前层聚合回写。多层模型的下一层 SSD 读取可提前派发。普通 `overlap` 保留独立的归档完成点。上下文容量末尾照常完成当前 attention、归档和回写。
 
    实验结果记录共享 attention 完成点和单独确认归档的次数。调度轨迹核对脚本校验共享归档对应的投影依赖。CUDA 回归用例核对两种调度模式的完成次数及 attention 输出。
 
-   设备 Q 提前选择入口支持同步、异步调用，并显式指定后续 KV 的归档方式。已下载到主机的 FP16 KV 采用“下载完成→追加→当前行安装”的依赖，进入 FP16 追加函数；设备 KV 采用“当前行安装→下载归档→追加”的依赖，默认模型图使用这一方式。两种入口均保留选择位置、输入类型和归档方式的一致性检查。
+   设备 Q 提前选择入口支持同步、异步调用，并显式指定后续 KV 的归档方式。已下载到主机的 FP16 KV 采用“下载完成→追加→当前行安装”的依赖，进入 FP16 追加函数；同步复用路径的设备 KV 采用“投影就绪→下载归档→attention 完成确认→追加”，普通重叠路径在当前行安装后独立归档。两种入口均保留选择位置、输入类型和归档方式的一致性检查。
 
    [ggml_prefetch.hpp](../include/solid/ggml_prefetch.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[session.cpp](../src/session.cpp)、[device_cache.cpp](../src/device_cache.cpp)、[scheduler.hpp](../include/solid/scheduler.hpp)、[baseline.cpp](../src/baseline.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)、[cuda_device_input_test.cu](../tests/cuda_device_input_test.cu)。
 
@@ -363,6 +363,12 @@
    `scheduler.hpp`、`scheduler.cpp` 增加只含运行状态、时间和优先级字段的 `TaskSnapshot`，`block_stage.cpp`、`ggml_prefetch.cpp` 在调度与完成处理中使用该接口，省去复制任务名称及依赖数组。完整任务记录仍用于显式记录查询。DAG 建立时用一份标记数组检查重复依赖，并预留任务、拓扑序和队列空间；拓扑次序、关键路径、最晚启动时间与优先级规则保持原样。
 
    `ScheduleTrace` 提供建立后固定的开启状态。关闭逐块记录时，`BlockStage` 使用简短任务名称，省去逐块拼接 head、block、version；DAG 不再进入关闭的记录器及其互斥锁。开启记录时保留完整名称、任务身份、依赖和事件。`scheduler_test.cpp` 对照轻量状态与完整记录的状态、时间、优先级及 GPU 计时；`block_stage_test.cpp` 对照记录开关两种情况的调度顺序和关键路径优先级，并检查开启后的块身份。服务器编译、54 项 CPU 检查及原生 CUDA 数值和生命周期核验通过，记录位于 `results/server5090/dag-runtime-check/`；原生采集为 `infllm-port-check-dag-runtime.bXyh4Z39/nsys/dag-runtime.nsys-rep`。
+
+15. **当前 KV 回传与历史补读独立推进**
+
+   `ggml_prefetch.cpp` 在 CUDA 同步复用路径的当前 KV 就绪处，先按层图的投影依赖启动当前行回传，再进入历史补读、上传提交的消费者等待。历史块仍由协调线程沿独立复制队列处理。当前行使用独立的页锁定缓冲，在调度器建立时分配；回传只操作归档状态，后续归档收取继续由 attention 完成回执确认。入口检查当前张量为连续 FP16、字节数等于一层当前 token 的全部 K/V。缓存加载阻塞仍以提交回传前的原 KV 消费者入口计时。
+
+   `cuda_device_input_test.cu` 新增实际 CUDA 下载门控：暂缓历史读盘结果，等待本层 FP16 KV 的真实下载完成后才放行读取；核对 8 个连续 Decode 步、两层共 16 次下载、历史读取及 attention 数值。`CMakeLists.txt` 为该核验提供 GGML 后端接口头文件。旧版回传顺序在首层明确报出等待错误，退出码为 1；修复版通过并能正常排空。旧版仅在自己的构建容器内挂载单个源码文件，核验后恢复当前源码构建。服务器 54 项 CPU 检查通过，正反核验、构建日志和源码哈希位于 `results/server5090/archive-frontier-check/`；修复版原始采集为 `infllm-port-check-archive-restored.Vi36Z5oc/nsys/archive-restored.nsys-rep`。
 
 ## 五、论文系统的工程接入
 
