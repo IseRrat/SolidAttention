@@ -272,6 +272,10 @@
 
 1. **llama.cpp 模型图接入**
 
+   `generate_adapter.py` 在启用自定义 attention 的模型图中，为每层新增的聚集、相对 RoPE 视图、两分支 attention 和概率回执预留额外的主机节点元数据，按每层 128 个对象加全图 128 个对象计入上游容量估算，并检查整数范围。该容量同时用于构图上下文与图节点上限。固定上游的原版路径沿用原容量估算。
+
+   服务器完成该覆盖生成后的 CUDA 编译、54 项 CPU 检查及两项生成器检查。编译记录位于 `results/server5090/llama-graph-capacity-check/`。首次 Llama-3.1-8B 构图中，原元数据池在需要 997,072 字节、可用 996,704 字节时退出；该次日志与 Nsight 保存在 `results/server5090/figure16-cuda-llama-7b18b73.pzwmonZt/`。
+
    已在固定上游接入 Llama/Qwen2 单序列的自定义 KV、attention、选择和预取。模型输出投影、残差、FFN 及量化矩阵乘法继续使用上游实现。构建目录生成适配图与设备后端文件。连续单 token decode 接入上游计算图复用：各层保持固定 bank、mask 和节点，输入阶段更新位置并启动预取；复用检查覆盖逐层连续位置、单序列与容量边界。prefill 切换到 decode 时重新构图。
 
    [llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[generate_adapter.py](../scripts/generate_adapter.py)、[Adapter.cmake](../cmake/Adapter.cmake)。

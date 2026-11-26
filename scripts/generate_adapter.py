@@ -41,6 +41,17 @@ def generate(source, destination):
     context = (source / "llama-context.cpp").read_text(encoding="utf-8")
     context = '#include "solid/llama_adapter.hpp"\n' + context
     context = replace_once(context, "/*.no_alloc  =*/ model.no_alloc(),", "/*.no_alloc  =*/ model.no_alloc() || solid::adapter_active(&model),")
+    anchor = '    // every sampler builds n_outputs_max_per_seq chains, see llm_graph_context::build_sampling\n'
+    context = replace_once(context, anchor, '''    if (solid::adapter_active(&model)) {
+        // InfLLM adds per-layer gathers, relative-RoPE views, two attention
+        // branches and probability receipts to the upstream graph. Reserve
+        // metadata for those tensors as well as the original model nodes.
+        const uint64_t extra = 128ull * (static_cast<uint64_t>(model.hparams.n_layer()) + 1);
+        GGML_ASSERT(extra <= UINT32_MAX - static_cast<uint64_t>(res));
+        res += static_cast<uint32_t>(extra);
+    }
+
+''' + anchor)
     backend = (source.parent / "ggml/src/ggml-backend.cpp").read_text(encoding="utf-8")
     backend = '#include "solid/profile.hpp"\n' + backend
     # Copy scopes synchronize only during profiling. Prefetched reads have their own
