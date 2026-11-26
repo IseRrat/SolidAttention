@@ -292,6 +292,10 @@
 
    `cuda-paper.json` 增加 16K、1K 预算的调度套件，使用已有 `prefetch`、`overlap`、`solid` 变体，分别对应 `naive`、`overlap`、`overlap+sync_reuse`。`test_experiments.py` 检查三组配置除 `attention.schedule` 外完全相同。
 
+   `b891ce7` 完成三个模型、九组 CUDA 调度消融，配置为 16K WikiText-2、512 输出、每组一次，开启 Nsight、8 GiB 显存限制、16 GiB 内存限制和 Decode O_DIRECT。按 naive／+ol／+ol+sr 顺序，3B 的统一入口 attention 延迟为 53.37／67.67／72.73 ms/步，8B 为 69.91／78.79／86.86，Qwen 为 28.09／28.89／28.05；完整 Decode 吞吐分别为 14.02／11.02／11.54、10.72／9.43／9.58、25.36／23.35／25.61 token/s。九组计时覆盖全部层调用，GPU 评分规模和 token 预算相同。三组的 attention 完成、独立归档及归档同步复用次数按实际模式核对。原始结果、逐组配置、attention 与完整 Decode 的归一化图、九份采集保存在 `results/server5090/figure17b-cuda-three-models-b891ce7.bnhwmtdk/`。
+
+   对该轮 Nsight 的离线分解显示：3B 三组的 H2D 为 3.148／4.089／4.963 ms/步，其中与 GPU kernel 重叠为 0／0.593／0.332 ms/步；每笔历史上传平均包含 13.75／7.54／4.32 个块。三模型的 +ol、+sr 比 naive 均多出每层 5 次 CUDA 流同步调用，+sr 的事件同步调用减少而流同步次数与 +ol 相同。完整分解保存在同轮 `nsys-scheduler-analysis.json`；报告将统一入口区间与完整 Decode 分别呈现。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。
