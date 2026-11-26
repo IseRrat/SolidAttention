@@ -34,7 +34,10 @@ std::unique_ptr<AttentionEvents> attention_events(AttentionSession & session,ggm
         return supplied;
     }
 #ifdef SOLID_HAVE_CUDA_SELECTION
-    if (mode==ScheduleMode::sync_reuse && ggml_backend_is_cuda(backend)) {
+    // Both CUDA overlap modes need a completion wakeup to keep the existing
+    // coordinator progressing while attention runs. Archive/upload fence
+    // reuse is still selected separately by ScheduleMode::sync_reuse.
+    if (mode!=ScheduleMode::naive && ggml_backend_is_cuda(backend)) {
         auto * registry=ggml_backend_cuda_reg();
         for (std::size_t ordinal=0;ordinal<ggml_backend_reg_dev_count(registry);++ordinal)
             if (ggml_backend_reg_dev_get(registry,ordinal)==ggml_backend_get_device(backend))

@@ -279,6 +279,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
             "CUDA decode blocked the host on an attention upload batch");
         if (!infllm) require(after.ranking.builder_compute_appends==16,"CUDA decode waited for representative key append on the host");
     } else if (mode==solid::ScheduleMode::overlap) {
+        require(schedule.device_event_completions==16 && schedule.device_boundary_fallbacks==0,
+            "CUDA overlap coordinator did not progress with native attention completion");
         require(schedule.archive_attention_reuses==0 && schedule.archive_separate_completions==16,
             "CUDA overlap did not retain independent KV archive completions");
     }

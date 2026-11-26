@@ -342,6 +342,12 @@
 
    下一次 Q 入口和请求结束沿用 `worker.join()`，在新一层正式选块及状态复用前检查并等待协调任务。上传源仍由完成票据持有；当前 KV 归档和 attention 读者释放继续先于推理放行。Nsight 增加 `CPU Wait Attention Release` 与 `CPU Schedule Next Prefetch` 两个阶段，分别记录推理等待当前层释放、协调线程提交后续工作的区间。服务器 54 项 CPU 检查及原生 CUDA 数值核验通过，记录位于 `results/server5090/attention-release-followup-check/`；原生采集为 `infllm-port-check-attention-release.tFfGXIc8/nsys/attention-release-followup.nsys-rep`。
 
+12. **CUDA OL 协调线程的原生完成通知**
+
+   `ggml_prefetch.cpp` 为 CUDA 的 OL 与 SR 路径共同创建已有的 attention 完成通知。OL 的协调线程由此在 attention 运行期间持续处理 I/O 完成回执，并在 attention 完成后释放设备读者和推进预取；原先 OL 缺少通知对象，`progress_after_attention` 会直接返回。当前 KV 独立归档完成票据、历史上传等待及 SR 的归档同步复用仍由各自调度模式决定，OL 继续保留独立同步。
+
+   `cuda_device_input_test.cu` 在原有 OL 独立归档检查外，要求 16 次原生 attention 完成回执、零 CPU 边界替代，并继续逐值核对输出与参考结果。服务器 54 项 CPU 检查和原生 CUDA 检查通过，记录保存于 `results/server5090/ol-native-progress-check/`；原生采集为 `infllm-port-check-ol-native.3kgVa2bb/nsys/ol-native-progress.nsys-rep`。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。
