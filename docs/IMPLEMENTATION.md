@@ -336,6 +336,12 @@
 
    `0549556` 完成相同输入的三组 8 步同步归因复核。两条优化路径的 CPU 控制值回传区间消失，每组减少 672 次流同步，即每层 3 次；相对 naive 的额外流同步从每层 5 次降为 2 次。剩余差额全部位于 Q 就绪标记的 GPU→CPU 复制区间。其余共同索引、mask、attention 回执和非复制区间的同步次数保持一致。复核脚本严格检查同步差额与区间消失，原始采集、配置与结果位于 `results/server5090/ol-sr-sync-audit-0549556.zn__4omh/`。
 
+11. **Attention 完成后的推理放行与预取提交并行**
+
+   `ggml_prefetch.cpp` 将 attention 完成处理拆为读者与归档确认、后续预取和写回提交两部分。同步复用路径在现有 attention 完成回执确认历史上传依赖、本层当前 KV 已完成归档、设备读者已释放后，立即发布 `released_epoch` 并唤醒推理线程，再由协调线程执行剩余预取上传及写回提交。推理线程可继续提交设备概率更新和 FFN。普通重叠路径在已有 CPU attention 完成边界确认后，将同样的后续处理交给协调线程；naive 路径保持原处理顺序。
+
+   下一次 Q 入口和请求结束沿用 `worker.join()`，在新一层正式选块及状态复用前检查并等待协调任务。上传源仍由完成票据持有；当前 KV 归档和 attention 读者释放继续先于推理放行。Nsight 增加 `CPU Wait Attention Release` 与 `CPU Schedule Next Prefetch` 两个阶段，分别记录推理等待当前层释放、协调线程提交后续工作的区间。服务器 54 项 CPU 检查及原生 CUDA 数值核验通过，记录位于 `results/server5090/attention-release-followup-check/`；原生采集为 `infllm-port-check-attention-release.tFfGXIc8/nsys/attention-release-followup.nsys-rep`。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。

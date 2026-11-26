@@ -833,7 +833,27 @@ struct GgmlPrefetch::Impl {
         session.archive_device_kv(frame->layer,frame->position,kv);
         frame->dag.complete(append,trace.now());
     }
-    void release_attention(const char * proof,std::optional<std::uint64_t> device_ns={},const std::function<void()> & before_upload={}) {
+    void finish_attention_release(const std::shared_ptr<LayerWork> & finished,const std::function<void()> & before_upload) {
+        trace::Scope phase("CPU Schedule Next Prefetch",finished->layer,finished->position);
+        if (per_completion_uploads) {
+            device.prefetch_ready(before_upload,true);
+            session.prefetcher().poll(false,[&](const SlotLease & lease) {
+                device.stage_ready_completion(lease,{},before_upload);
+            });
+            device.reap_transfers();
+            observe_stores();
+        } else {
+            session.prefetcher().poll();
+            observe_stores();
+            device.prefetch_ready(before_upload);
+        }
+        if (finished->archive_at_attention) {
+            start_store(finished);
+            if (finished->dag.finished()) finish_frame(finished);
+        }
+    }
+    void release_attention(const char * proof,std::optional<std::uint64_t> device_ns={},const std::function<void()> & before_upload={},
+                           bool defer_followup=false) {
         if (!device.attention_pending()) return;
         if (work->archive_at_attention) {
             // No successor upload may be submitted until the attention reader retires.
@@ -862,24 +882,19 @@ struct GgmlPrefetch::Impl {
                 if (work->dag.task(next_prefetch).state==TaskState::pending) next_layer(work);
             }
             if (work->dag.finished()) finish_frame(work);
-            if (per_completion_uploads) {
-                device.prefetch_ready(before_upload,true);
-                session.prefetcher().poll(false,[&](const SlotLease & lease) {
-                    device.stage_ready_completion(lease,{},before_upload);
-                });
-                device.reap_transfers();
-                observe_stores();
-            } else {
-                session.prefetcher().poll();
-                observe_stores();
-                device.prefetch_ready(before_upload);
-            }
-            if (work->archive_at_attention) {
-                start_store(work);
-                if (work->dag.finished()) finish_frame(work);
-            }
+            // The attention reader and current-row archive have retired.
+            // Let inference enqueue probability updates/FFN while this worker
+            // submits next-layer copies and stores. The next Q frontier still
+            // joins the worker before reusing its graph/session state.
             released_epoch.store(device.attention_epoch(), std::memory_order_release);
             worker.notify_progress();
+            if (defer_followup) {
+                ++totals.worker_jobs;
+                worker.submit([this,finished=work,before_upload] {
+                    std::lock_guard<std::mutex> lock(mutex);
+                    finish_attention_release(finished,before_upload);
+                });
+            } else finish_attention_release(work,before_upload);
         }
     }
     void progress_after_attention(const std::shared_ptr<LayerWork> & current,std::uint64_t epoch) {
@@ -1218,6 +1233,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
     return mask;
 }
 void GgmlPrefetch::completed(std::uint64_t epoch) {
+    trace::Scope wait("CPU Wait Attention Release");
     if (impl_->events && epoch!=impl_->device.attention_epoch()) return;
     if (impl_->events) {
         impl_->events->boundary(AttentionProof::attention_boundary,epoch);
@@ -1227,7 +1243,7 @@ void GgmlPrefetch::completed(std::uint64_t epoch) {
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->device.attention_pending() && epoch == impl_->device.attention_epoch()) {
-        ++impl_->totals.attention_fences; impl_->release_attention("attention_backend_complete");
+        ++impl_->totals.attention_fences; impl_->release_attention("attention_backend_complete",{}, {},early_enabled());
     }
 }
 void GgmlPrefetch::process_complete() {
