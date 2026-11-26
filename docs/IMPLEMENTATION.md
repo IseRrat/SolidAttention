@@ -32,7 +32,7 @@
 
 5. **独立关闭 KV 交织的 CUDA 消融路径**
 
-   `solid-no-interleaved` 从完整 `solid` 配置复制，只将 `attention.layout` 改为 `separate`。两组保留相同的融合投影、GPU 评分、预算、提前预取、细粒度重叠和同步复用。`config.cpp`、`session.cpp`、`device_cache.cpp` 允许分离布局接入原预取链路；`ggml_prefetch.cpp` 为设备槽位建立 K、V 两个平面，分别提交历史块和当前行的搬运，以同一完成票据保护两份数据。历史批量上传按目标地址合并连续范围，槽位生命周期保持原样。`llama_adapter.cpp` 按布局选择 K/V 视图的 stride 与偏移，attention 算法和算子保持相同。
+   `solid-no-interleaved` 从完整 `solid` 配置复制，只将 `attention.layout` 改为 `separate`。两组保留相同的融合投影、GPU 评分、预算、提前预取、细粒度重叠和同步复用。`config.cpp`、`session.cpp`、`device_cache.cpp` 允许分离布局接入原预取链路；`ggml_prefetch.cpp` 为设备槽位建立 K、V 两个平面，分别提交历史块和当前行的搬运，以同一完成票据保护两份数据。两组历史批量上传使用同一规则：按目标地址排序，仅在源地址与目标地址均连续时合并同层的多个 KV 块；槽位生命周期保持原样。`llama_adapter.cpp` 按布局选择 K/V 视图的 stride 与偏移，attention 算法和算子保持相同。
 
    `experiments.py` 增加上述单开关变体，`cuda-paper.json` 增加 16K、1K 预算的交织对照套件。`config_test.cpp` 与 `test_experiments.py` 检查分离布局保留融合投影和预取；`prefetch_graph_test.cpp` 覆盖分离布局的内存、SSD 及三种调度模式；`cuda_device_input_test.cu` 对照标量参考核对分离布局的真实 CUDA 输出、连续图复用及完成通知。服务器编译、54 项 CPU 检查、18 项实验脚本检查及 CUDA 数值核验通过，记录位于 `results/server5090/figure17-interleaving-check/`，CUDA 原始采集位于 `results/server5090/infllm-port-check-figure17.N1VYwkeX/nsys/figure17-layout-native.nsys-rep`。
 
@@ -40,7 +40,7 @@
 
    `1cd52d7` 完成三个模型、六组 CUDA 交织对照，16K WikiText-2 输入、512 输出、每组一次，开启 Nsight、8 GiB 显存限制、16 GiB 内存限制和 Decode O_DIRECT。Llama-3.2-3B、Llama-3.1-8B、Qwen2.5-7B 的关闭／开启交织 attention 延迟分别为 145.91／69.02、160.18／86.49、57.75／29.70 ms/步，归一化值为 0.473、0.540、0.514。六组使用同一提交与二进制，同模型的评分次数、候选块数、选中 token 数与层调用数相同；完成通知全部来自设备回执。数据、逐组配置、论文样式柱状图及六份原始采集保存在 `results/server5090/figure17a-cuda-three-models-1cd52d7.gtnrrhbp/`，其中 `capture/nsys/INDEX.tsv` 标明方法与文件对应关系。
 
-   本轮 Nsight 离线分解覆盖全部 511 次 Decode。三个模型关闭／开启交织的 GPU kernel 并集分别为 5.298／5.296、7.646／7.647、6.087／6.090 ms/步；H2D 并集为 22.09／4.21、25.73／5.54、10.29／2.72 ms/步。分离布局的页锁定主机槽位按块保存 K、V，设备缓存采用整体 K、V 平面；现有上传合并要求源和目标同时连续。3B 两组历史上传范围数为 8,563,924／724,211，8B 为 9,784,042／1,061,194。逐项 GPU 活动、复制数量及 CPU 提交时间保存于同轮 `nsys-interleaving-analysis.json`。
+   本轮 Nsight 离线分解覆盖全部 511 次 Decode。三个模型关闭／开启交织的 GPU kernel 并集分别为 5.298／5.296、7.646／7.647、6.087／6.090 ms/步；H2D 并集为 22.09／4.21、25.73／5.54、10.29／2.72 ms/步。分离布局的页锁定主机槽位按块保存 K、V，设备缓存采用整体 K、V 平面；现有上传合并要求源和目标同时连续。3B 两组历史上传范围数为 8,563,924／724,211，8B 为 9,784,042／1,061,194。交织组每个历史上传范围平均包含 5.31、4.39、3.01 个块，分离组均为每块两笔请求；三模型使用相同合并规则。逐项 GPU 活动、复制数量及 CPU 提交时间保存于同轮 `nsys-interleaving-analysis.json`。
 
 ## 二、动态稀疏 Attention
 
