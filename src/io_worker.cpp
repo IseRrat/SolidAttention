@@ -8,6 +8,7 @@
 #include <condition_variable>
 #include <deque>
 #include <map>
+#include <set>
 #include <mutex>
 #include <stdexcept>
 #include <system_error>
@@ -30,6 +31,21 @@ class IoWorker final:public AsyncReader {
         bool cancelled=false,cancel_sent=false,write=false;
         ReadDispatch dispatch{};
     };
+    struct ReadyKey { ReadDispatch dispatch; std::uint64_t sequence,id; };
+    struct ReadyBefore {
+        bool operator()(const ReadyKey & a,const ReadyKey & b) const {
+            if (a.dispatch.before(b.dispatch)) return true;
+            if (b.dispatch.before(a.dispatch)) return false;
+            return std::tie(a.sequence,a.id)<std::tie(b.sequence,b.id);
+        }
+    };
+    static ReadyKey ready_key(std::uint64_t id,const Request & request) { return {request.dispatch,request.sequence,id}; }
+    void queue_cancel(std::uint64_t id,Request & request) {
+        if (request.phase!=Phase::complete && !request.cancelled) {
+            pending_cancels_.push_back(id); request.cancelled=true;
+            if (request.phase==Phase::queued) ready_requests_.erase(ready_key(id,request));
+        }
+    }
 public:
     IoWorker(std::function<std::unique_ptr<AsyncReader>()> factory,std::uint32_t depth,int cpu,bool notify_each,bool measure_ready):
         factory_(std::move(factory)),depth_(depth),cpu_(cpu),notify_each_(notify_each),measure_ready_(measure_ready) {
@@ -73,6 +89,8 @@ public:
             if (sequence_==UINT64_MAX) throw std::overflow_error("I/O submission sequence exhausted");
             auto request=Request{fd,data,bytes,offset,++sequence_}; request.dispatch=dispatch; request.write=write;
             requests_.emplace(id,request);
+            try { ready_requests_.insert(ready_key(id,request)); }
+            catch (...) { requests_.erase(id); throw; }
         }
         notify(); return true;
     }
@@ -81,12 +99,20 @@ public:
     }
     void schedule(std::uint64_t id,ReadDispatch dispatch) override {
         { std::lock_guard<std::mutex> lock(mutex_); check(); const auto found=requests_.find(id);
-          if (found!=requests_.end() && found->second.phase!=Phase::complete && dispatch.before(found->second.dispatch)) found->second.dispatch=dispatch; }
+          if (found!=requests_.end() && found->second.phase!=Phase::complete && dispatch.before(found->second.dispatch)) {
+              auto & request=found->second;
+              if (request.phase==Phase::queued && !request.cancelled) {
+                  auto changed=ready_key(id,request); changed.dispatch=dispatch;
+                  ready_requests_.insert(changed);
+                  ready_requests_.erase(ready_key(id,request));
+              }
+              request.dispatch=dispatch;
+          } }
         notify();
     }
     void cancel(std::uint64_t id) override {
         { std::lock_guard<std::mutex> lock(mutex_); check(); const auto found=requests_.find(id);
-          if (found!=requests_.end() && found->second.phase!=Phase::complete) found->second.cancelled=true; }
+          if (found!=requests_.end()) queue_cancel(id,found->second); }
         notify();
     }
     void flush() override { { std::lock_guard<std::mutex> lock(mutex_); check(); } notify(); }
@@ -103,12 +129,12 @@ public:
         std::unique_lock<std::mutex> lock(mutex_);
         if (!ended_) {
             draining_=true; const auto epoch=++drain_requested_;
-            for (auto & item:requests_) item.second.cancelled=true;
+            for (auto & item:requests_) queue_cancel(item.first,item.second);
             lock.unlock(); notify(); lock.lock();
             cv_.wait(lock,[&] { return ended_ || drain_completed_>=epoch; });
         }
         if (ended_ && !safe_) throw std::logic_error("I/O worker exited before buffer drain");
-        requests_.clear(); completed_.clear(); draining_=false;
+        requests_.clear(); completed_.clear(); ready_requests_.clear(); pending_cancels_.clear(); draining_=false;
     }
     AsyncIoStats stats() const override { std::lock_guard<std::mutex> lock(mutex_); return stats_; }
     void rethrow_failure() const override { std::lock_guard<std::mutex> lock(mutex_); if (error_) std::rethrow_exception(error_); }
@@ -162,33 +188,40 @@ private:
                 std::vector<std::uint64_t> cancel;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    for (auto & item:requests_) {
-                        auto & request=item.second;
-                        if (request.phase==Phase::queued && request.cancelled) {
+                    for (const auto id:pending_cancels_) {
+                        const auto found=requests_.find(id);
+                        if (found==requests_.end()) continue;
+                        auto & request=found->second;
+                        if (request.phase==Phase::queued) {
+                            ready_requests_.erase(ready_key(id,request));
                             request.phase=Phase::complete; ++queued_cancellations_;
-                            completed_.push_back({item.first,-ECANCELED});
+                            completed_.push_back({id,-ECANCELED});
                             delivered=true;
-                        } else if (request.phase==Phase::active && request.cancelled && !request.cancel_sent) {
-                            request.cancel_sent=true; cancel.push_back(item.first);
+                        } else if (request.phase==Phase::active && !request.cancel_sent) {
+                            request.cancel_sent=true; cancel.push_back(id);
                         }
                     }
+                    pending_cancels_.clear();
                 }
                 for (const auto id:cancel) reader->cancel(id);
                 for (;;) {
                     std::uint64_t id=0; Request request{};
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
-                        auto best=requests_.end();
-                        for (auto it=requests_.begin();it!=requests_.end();++it) if (it->second.phase==Phase::queued && !it->second.cancelled &&
-                            (best==requests_.end() || it->second.dispatch.before(best->second.dispatch) ||
-                             (!best->second.dispatch.before(it->second.dispatch) && it->second.sequence<best->second.sequence))) best=it;
-                        if (best==requests_.end()) break;
-                        id=best->first; request=best->second; best->second.phase=Phase::active;
+                        if (ready_requests_.empty()) break;
+                        const auto best=ready_requests_.begin();
+                        id=best->id; auto & selected=requests_.at(id);
+                        if (selected.phase!=Phase::queued || selected.cancelled) throw std::logic_error("stale I/O ready request");
+                        request=selected; selected.phase=Phase::active;
+                        ready_requests_.erase(best);
                     }
                     const bool submitted = request.write ? reader->submit_write(id,request.fd,request.data,request.bytes,request.offset) :
                         reader->submit(id,request.fd,const_cast<void *>(request.data),request.bytes,request.offset);
                     if (!submitted) {
-                        std::lock_guard<std::mutex> lock(mutex_); requests_.at(id).phase=Phase::queued; break;
+                        std::lock_guard<std::mutex> lock(mutex_);
+                        auto & pending=requests_.at(id); pending.phase=Phase::queued;
+                        if (!pending.cancelled) ready_requests_.insert(ready_key(id,pending));
+                        break;
                     }
                     ++submissions_;
                 }
@@ -252,6 +285,8 @@ private:
     std::condition_variable cv_;
     std::thread thread_;
     std::map<std::uint64_t,Request> requests_;
+    std::set<ReadyKey,ReadyBefore> ready_requests_;
+    std::vector<std::uint64_t> pending_cancels_;
     std::deque<ReadCompletion> completed_;
     std::exception_ptr error_;
     bool ready_=false,ended_=false,safe_=false,stopping_=false,draining_=false;

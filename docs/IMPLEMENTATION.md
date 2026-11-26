@@ -348,6 +348,14 @@
 
    `cuda_device_input_test.cu` 在原有 OL 独立归档检查外，要求 16 次原生 attention 完成回执、零 CPU 边界替代，并继续逐值核对输出与参考结果。服务器 54 项 CPU 检查和原生 CUDA 检查通过，记录保存于 `results/server5090/ol-native-progress-check/`；原生采集为 `infllm-port-check-ol-native.3kgVa2bb/nsys/ol-native-progress.nsys-rep`。
 
+13. **I/O 待发索引与关键完成回执优先处理**
+
+   `io_worker.cpp` 为待发请求维护按原 `ReadDispatch::before` 规则及提交序号排序的索引。提交时直接取首项；内核队列暂满时按请求当前优先级重新入队。请求提升同步更新索引，同等优先级保持 FIFO。取消时立即从待发索引移除，用独立的取消 ID 列表交给 I/O 所有者处理；已进入内核的请求继续等待原始完成回执。请求身份表、队列容量、READ/WRITE 规则和排空回执沿用原实现。该索引省去每次提交前遍历全部活动及待发请求，取消处理也省去每轮全表扫描。
+
+   `io_worker_test.cpp` 新增混合请求提升、较弱重复提升、重复取消、同优先级顺序及取消目标零写入的核验。`ggml_prefetch.cpp` 在后台推进循环中先处理 attention 完成和已到达的正式 Q 交接，再收取预测 I/O 完成结果，保留缓冲区读者及上传票据的原释放条件。服务器 54 项 CPU 检查和原生 CUDA 核验通过，记录位于 `results/server5090/io-ready-index-check/`；原生采集为 `infllm-port-check-priority-progress.50j5wyxn/nsys/priority-progress.nsys-rep`。
+
+   优化依据来自 `4330d1c` 的独立三组 CPU 栈诊断：3B、16K、固定 32 步，I/O 线程的请求表迭代占 naive、OL、SR 运行样本的约 55.4%、55.5%、57.3%。采样按 Decode 时间窗与实际推理、协调和 I/O 线程 ID 过滤，分别保存栈顶和调用链计数。诊断使用自建容器的 PERFMON 能力及进程树 DWARF 采样；原始记录和分析源码位于 `results/server5090/ol-sr-cpu-stacks-retry-4330d1c.s7vpqyby/`。正常对照单独保存于 `ol-sr-fixed-input-b002582.t_p8x8cv/` 和 `ol-sr-release-4330d1c.fitisqx1/`，各含三模型九组、相同 127 步输入与标准 Nsight 采集。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。

@@ -219,6 +219,27 @@ void scheduled_progress(bool prediction) {
     { std::lock_guard<std::mutex> lock(control->mutex);
       require(control->submissions==std::vector<std::uint64_t>{1,4,5,3,2},"I/O owner ignored critical/LST/FIFO keys"); }
 }
+void queued_updates_and_cancel() {
+    auto control=std::make_shared<Control>(); control->engine_capacity=1;
+    auto io=solid::make_io_worker([control] { return std::make_unique<Reader>(control); },6); Release release{control};
+    std::array<unsigned char,6> bytes{};
+    require(io->submit(1,0,&bytes[0],1,0),"indexed queue gate");
+    require(control->wait([&] { return control->submissions.size()==1; }),"indexed queue gate not active");
+    for (std::uint64_t id=2;id<=6;++id) require(io->submit_prioritized(id,0,&bytes[id-1],1,0,
+        id==2 || id==4 ? solid::ReadPriority::deterministic:solid::ReadPriority::selected),"indexed queue admission");
+    io->prioritize(4,solid::ReadPriority::correction_selected);
+    io->prioritize(4,solid::ReadPriority::selected); // A later weaker promotion must not undo correction.
+    io->schedule(2,{solid::ReadPriority::selected,true,0});
+    io->cancel(5); io->cancel(5);
+    control->release(); solid::ReadCompletion result{}; std::size_t canceled=0;
+    for (int n=0;n<6;++n) {
+        require(io->poll(result,true),"updated queue lost a completion");
+        if (result.id==5) { require(result.result<0 && bytes[4]==0,"queued canceled read reached the engine"); ++canceled; }
+    }
+    { std::lock_guard<std::mutex> lock(control->mutex);
+      require(control->submissions==std::vector<std::uint64_t>{1,4,2,3,6},"promotion/cancellation left a stale ready entry or changed FIFO order"); }
+    require(canceled==1 && io->stats().queued_cancellations==1,"duplicate cancellation changed queue accounting");
+}
 void placement() {
     const auto original=solid::thread_cpus(); require(!original.empty(),"missing test CPU affinity");
     {
@@ -246,7 +267,7 @@ void placement() {
 } // namespace
 int main() {
 #ifdef __linux__
-    try { completion_notification(false); completion_notification(true); cancellation_and_drain(); backlog_progress(); priority_progress(); scheduled_progress(false); scheduled_progress(true); failures(); placement(); std::cout<<"I/O ownership, cancellation, drain and placement passed\n"; return 0; }
+    try { completion_notification(false); completion_notification(true); cancellation_and_drain(); backlog_progress(); priority_progress(); scheduled_progress(false); scheduled_progress(true); queued_updates_and_cancel(); failures(); placement(); std::cout<<"I/O ownership, cancellation, drain and placement passed\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 #else
     std::cout<<"Linux I/O worker checks\n"; return 77;

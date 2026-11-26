@@ -912,11 +912,6 @@ struct GgmlPrefetch::Impl {
             // arriving after these checks leaves a counter for the next wait.
             events->acknowledge();
             if (current->archive_at_attention && !released) device.reap_transfers();
-            const Prefetcher::ReadyBlock upload_ready=per_completion_uploads && released ?
-                Prefetcher::ReadyBlock{[&](const SlotLease & lease) { device.stage_ready_completion(lease,{},before_upload); }} : Prefetcher::ReadyBlock{};
-            host.poll(false,upload_ready);
-            if (per_completion_uploads && released) device.reap_transfers();
-            observe_stores();
             if (!released) if (const auto receipt=events->poll(current->layer,epoch)) {
                 const char * proof;
                 if (receipt->proof==AttentionProof::device_signal) {
@@ -932,6 +927,14 @@ struct GgmlPrefetch::Impl {
                 device.reap_transfers();
                 released=true;
             }
+            // Completion and the formal Q handoff are critical frontiers;
+            // service them before draining the speculative I/O backlog.
+            if (released && events->handoff_seen(epoch)) return;
+            const Prefetcher::ReadyBlock upload_ready=per_completion_uploads && released ?
+                Prefetcher::ReadyBlock{[&](const SlotLease & lease) { device.stage_ready_completion(lease,{},before_upload); }} : Prefetcher::ReadyBlock{};
+            host.poll(false,upload_ready);
+            if (per_completion_uploads && released) device.reap_transfers();
+            observe_stores();
             if (released) {
                 // Give formal correction the coordinator as soon as its query
                 // reaches the CPU. Remaining predicted SSD jobs stay queued.
