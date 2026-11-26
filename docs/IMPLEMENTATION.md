@@ -152,6 +152,8 @@
 
    服务器完成 54 项 CPU 检查、17 项实验脚本检查，以及开启/关闭提前预取的 CUDA 图复用数值与通知检查。编译和 CPU 记录位于 `results/server5090/prefetch-ahead-ablation-check/`，GPU 记录位于 `results/server5090/infllm-port-check-10d694c.uyfXf9xR/prefetch-ahead-isolation-v3.log`，同目录 `nsys/` 保存对应采集。
 
+   `c7e3c4c` 完成 Qwen2.5-7B Q4_0、16K 输入、512 输出的预取单项消融，两组各一次，均开启 Nsight、8 GiB 显存限制、16 GiB 主机内存限制及 Decode O_DIRECT。关闭/开启提前预取时，Prefill 为 2.544/2.559 秒，Decode 为 19.63/26.22 token/s；主线程每步等待正式 KV 任务为 30.95/13.02 ms，GPU 实际计算为 6.077/6.090 ms，H2D 与计算重叠为 0.008/0.768 ms。两组均评分 14,308 次、扫描 7,203,868 个候选块，选中 token 总数相同。开启组多读约 2.9% 的数据；容器物理读盘增量分别为 27.29/28.09 GiB，与 Decode 读请求数据一致。配置、原始结果、Nsight、图及逐项比较保存在 `results/server5090/prefetch-ablation-16k-c7e3c4c.0hKwLEjI/`，主线程等待口径在其中 `RESULTS.md` 说明。
+
 2. **正式选择纠错**
 
    已实现命中块保留、在途请求提升、缺块补读和错误预测回收。尾块版本变化会处理在途旧前缀并补齐缺口。正式纠错优先于预测；同一前沿内先比较 critical 和 LST，相同时 selected 优先于 init/local。SSD 队列与上传派发使用同一组排序键。
