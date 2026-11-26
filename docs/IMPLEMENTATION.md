@@ -38,6 +38,10 @@
 
    `scheduler.hpp`、`ggml_prefetch.cpp` 累计本层 Q 就绪到 attention 完成回执的主机观察时长，包含该区间内的 KV 投影、评分及未隐藏的读盘、搬运等待；结束点位于本层归档处理前。`baseline.cpp` 输出 `attention_layer_span_ms` 与 `attention_layer_span_layers`，按实际 Decode 步数计算每步所有层的 attention 总时长。计时复用已有时间戳，不插入同步；上述 CPU 图及 CUDA 核验分别检查 12、16 次层调用全部计入。
 
+   `1cd52d7` 完成三个模型、六组 CUDA 交织对照，16K WikiText-2 输入、512 输出、每组一次，开启 Nsight、8 GiB 显存限制、16 GiB 内存限制和 Decode O_DIRECT。Llama-3.2-3B、Llama-3.1-8B、Qwen2.5-7B 的关闭／开启交织 attention 延迟分别为 145.91／69.02、160.18／86.49、57.75／29.70 ms/步，归一化值为 0.473、0.540、0.514。六组使用同一提交与二进制，同模型的评分次数、候选块数、选中 token 数与层调用数相同；完成通知全部来自设备回执。数据、逐组配置、论文样式柱状图及六份原始采集保存在 `results/server5090/figure17a-cuda-three-models-1cd52d7.gtnrrhbp/`，其中 `capture/nsys/INDEX.tsv` 标明方法与文件对应关系。
+
+   本轮 Nsight 离线分解覆盖全部 511 次 Decode。三个模型关闭／开启交织的 GPU kernel 并集分别为 5.298／5.296、7.646／7.647、6.087／6.090 ms/步；H2D 并集为 22.09／4.21、25.73／5.54、10.29／2.72 ms/步。分离布局的页锁定主机槽位按块保存 K、V，设备缓存采用整体 K、V 平面；现有上传合并要求源和目标同时连续。3B 两组历史上传范围数为 8,563,924／724,211，8B 为 9,784,042／1,061,194。逐项 GPU 活动、复制数量及 CPU 提交时间保存于同轮 `nsys-interleaving-analysis.json`。
+
 ## 二、动态稀疏 Attention
 
 对应论文 §3.1、图 4。
