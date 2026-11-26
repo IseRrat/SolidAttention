@@ -326,6 +326,10 @@
 
    本轮单块上传沿用 GPU 首尾计时事件，为调度器更新块搬运成本；多块批次通常省略单块计时。合并／逐完成的 `cudaEventRecordWithFlags` 为约 616／16982 次/步，对应 CPU 累计 0.826／24.353 ms/步。报告将这项管理与计时成本单列，分别呈现完整 Decode、复制调用、实际 H2D、GPU 计算、完成回执至上传器入口等待，以及相同输入位置的时间线。原始 Nsight、配置、固定输入、资源与结果校验、绘图和离线分析源码保存于 `results/server5090/completion-upload-3b-16k-c027329.nrcd418i/`；`job-000000` 为逐完成上传，`job-000001` 为集中合并上传。
 
+10. **OL/SR 的后端搬运同步归因**
+
+   `generate_adapter.py` 在现有后端复制作用域中增加诊断用 NVTX 区间。仅当 `SOLID_SYNC_AUDIT_TRACE=1` 且已开启 Nsight 标记时记录，区间包含张量名、源后端、目标后端和字节数，便于将 CUDA 同步调用对应到具体的跨后端输入复制。标记沿用 `trace::Scope`；复制、预取、同步及缓冲区生命周期沿用原代码。`Adapter.cmake` 为生成的 `ggml-base` 接入已有追踪实现。服务器编译、54 项 CPU 检查及两项覆盖生成器检查通过，记录保存于 `results/server5090/ol-sr-sync-audit-check/compile-and-cpu.log`。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。

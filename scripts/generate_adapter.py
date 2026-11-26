@@ -53,7 +53,7 @@ def generate(source, destination):
 
 ''' + anchor)
     backend = (source.parent / "ggml/src/ggml-backend.cpp").read_text(encoding="utf-8")
-    backend = '#include "solid/profile.hpp"\n' + backend
+    backend = '#include "solid/profile.hpp"\n#include "solid/trace.hpp"\n#include <cstdlib>\n#include <cstdio>\n' + backend
     # Copy scopes synchronize only during profiling. Prefetched reads have their own
     # scope; the consuming split returns before opening a second scope.
     helper = '''
@@ -65,7 +65,18 @@ struct solid_copy_scope {
     ggml_backend_t source;
     ggml_backend_t target;
     std::chrono::steady_clock::time_point start;
+    solid::trace::Scope audit;
     solid_copy_scope(const ggml_tensor * t, ggml_backend_t s, ggml_backend_t d) : tensor(t), source(s), target(d) {
+        static const bool audit_enabled = [] {
+            const char * value = std::getenv("SOLID_SYNC_AUDIT_TRACE");
+            return value && value[0] == '1' && value[1] == 0;
+        }();
+        if (audit_enabled && solid::trace::enabled()) {
+            char detail[384];
+            std::snprintf(detail, sizeof(detail), "%s %s->%s bytes=%zu", ggml_get_name(tensor),
+                ggml_backend_name(source), ggml_backend_name(target), ggml_nbytes(tensor));
+            audit.start("Diagnostic backend copy", UINT32_MAX, UINT64_MAX, detail);
+        }
         if (solid_transfer_observer) {
             ggml_backend_synchronize(source);
             ggml_backend_synchronize(target);

@@ -102,6 +102,7 @@ foreach(SOLID_SOURCE IN LISTS SOLID_GGML_SOURCES)
 endforeach()
 set_property(TARGET ggml-base PROPERTY SOURCES "${SOLID_ADAPTED_GGML}")
 target_include_directories(ggml-base PRIVATE "${PROJECT_SOURCE_DIR}/include" "${SOLID_GGML_DIR}")
+target_link_libraries(ggml-base PRIVATE solid_core)
 
 if(TARGET ggml-cpu)
     get_target_property(SOLID_CPU_SOURCES ggml-cpu SOURCES)
