@@ -40,6 +40,7 @@ private:
     std::uint32_t slots_per_head_;
 };
 struct PrefetchStats {
+    bool ahead_enabled = true;
     std::uint64_t history_resolutions = 0;
     std::uint64_t formal_resolutions = 0;
     std::uint64_t predicted_blocks = 0;
@@ -69,7 +70,7 @@ public:
     using StagePlan = std::function<void(const std::vector<BlockIdentity> &)>;
     using StageFactory = std::function<std::shared_ptr<BlockStage>(const std::vector<BlockWork> &)>;
     Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t slots_per_head,
-               std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace = {});
+               std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace = {}, bool prefetch_ahead = true);
     ~Prefetcher();
     void bind_shared_blocks(const std::vector<Half *> & addresses, std::shared_ptr<void> owner,bool defer_prediction_slots=false);
     void begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
@@ -130,6 +131,7 @@ private:
     PrefetchStats stats_;
     bool failed_ = false;
     bool defer_prediction_slots_ = false;
+    const bool prefetch_ahead_;
     void check() const;
     void issue(const SlotLease & lease, std::uint32_t prefix, ReadDispatch dispatch,bool dispatch_now=true,
                const std::shared_ptr<trace::Batch> & phase = {});

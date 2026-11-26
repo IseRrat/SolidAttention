@@ -107,5 +107,6 @@ struct ScheduleStats {
     std::uint64_t backend_drains = 0, backend_compute_waits = 0, batch_groups = 0, events_coalesced = 0;
     std::uint64_t historical_upload_batches = 0, historical_upload_blocks = 0, historical_upload_ranges = 0;
     std::uint64_t archive_attention_reuses = 0, archive_separate_completions = 0;
+    std::uint64_t history_consumer_wait_ns = 0, history_consumer_wait_calls = 0;
 };
 } // namespace solid

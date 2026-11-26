@@ -100,11 +100,12 @@ void SlotTable::unpin(const SlotLease & lease) {
     }
 }
 Prefetcher::Prefetcher(KvStore & store, SparseBudget budget, std::uint32_t per_head,
-                       std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace) :
+                       std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace, bool prefetch_ahead) :
     store_(store), budget_(budget), slots_(store.geometry().heads, per_head), blocks_(slots_.size()), pending_(slots_.size()),stages_(slots_.size()),
     upload_order_(slots_.size()),
     history_(store.geometry().layers, std::vector<std::vector<std::uint64_t>>(store.geometry().heads)), reader_(std::move(reader)),
-    store_receipts_(store.geometry().layers) {
+    store_receipts_(store.geometry().layers), prefetch_ahead_(prefetch_ahead) {
+    stats_.ahead_enabled = prefetch_ahead_;
     budget.validate(store.geometry());
     if (!reader_) throw std::invalid_argument("prefetch reader is required");
     if (reader_->supports_write() && store_.native_handle() >= 0) disk_ = dynamic_cast<FileKvStore *>(&store_);
@@ -374,7 +375,7 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
     layer_ = layer;
     position_ = position;
     std::vector<BlockIdentity> predicted;
-    for (std::uint32_t head = 0; head < g.heads; ++head) {
+    if (prefetch_ahead_) for (std::uint32_t head = 0; head < g.heads; ++head) {
         std::vector<std::uint64_t> ids;
         const auto add = [&](std::uint64_t id) {
             if (id * g.block_tokens < position && std::find(ids.begin(), ids.end(), id) == ids.end() && ids.size() < slots_.slots_per_head()) ids.push_back(id);

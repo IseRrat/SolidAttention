@@ -44,7 +44,7 @@ public:
                      bool sparse, std::uint64_t prefill_tokens, const std::filesystem::path & selection_trace = {},
                      const std::filesystem::path & selection_replay = {}, std::unique_ptr<AsyncReader> reader = {},
                      std::uint32_t prefetch_slots_per_head = 0, const std::filesystem::path & prefetch_trace = {},
-                     std::optional<RelativeRope> rope = {});
+                     std::optional<RelativeRope> rope = {}, bool prefetch_ahead = true);
     std::vector<float> process(std::uint32_t layer, std::uint64_t first_position, std::size_t tokens,
                                const std::vector<float> & queries, const std::vector<float> & keys,
                                const std::vector<float> & values, float scale, bool interleaved_inputs = false);

@@ -37,7 +37,7 @@ AttentionSession::AttentionSession(std::unique_ptr<KvStore> store, std::uint32_t
                                    bool sparse, std::uint64_t prefill_tokens, const std::filesystem::path & selection_trace,
                                    const std::filesystem::path & selection_replay, std::unique_ptr<AsyncReader> reader,
                                    std::uint32_t prefetch_slots_per_head, const std::filesystem::path & prefetch_trace,
-                                   std::optional<RelativeRope> rope) :
+                                   std::optional<RelativeRope> rope, bool prefetch_ahead) :
     store_(std::move(store)), query_heads_(query_heads), budget_(budget), rope_(rope), sparse_(sparse), prefill_tokens_(prefill_tokens) {
     if (!store_ || query_heads == 0 || query_heads % store_->geometry().heads != 0 ||
         prefill_tokens == 0 || prefill_tokens > store_->geometry().capacity_tokens) throw std::invalid_argument("invalid attention session");
@@ -51,7 +51,7 @@ AttentionSession::AttentionSession(std::unique_ptr<KvStore> store, std::uint32_t
     if (reader) {
         if (!sparse_ || geometry().layout != KvLayout::interleaved) throw std::invalid_argument("prefetch requires sparse interleaved KV");
         if (!prefetch_slots_per_head) prefetch_slots_per_head = budget.cache_slots(geometry());
-        prefetch_ = std::make_unique<Prefetcher>(*store_, budget, prefetch_slots_per_head, std::move(reader), prefetch_trace);
+        prefetch_ = std::make_unique<Prefetcher>(*store_, budget, prefetch_slots_per_head, std::move(reader), prefetch_trace, prefetch_ahead);
     }
     if (!selection_replay.empty()) {
         if (!sparse_) throw std::invalid_argument("selection replay requires sparse attention");

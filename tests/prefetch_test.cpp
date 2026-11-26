@@ -97,6 +97,29 @@ void capacity() {
     rejects([&] { (void) host.resolve(0, 6, {{{0, 1, 2, 6}, {}}}); });
     host.finish();
 }
+void on_demand_only() {
+    const solid::KvGeometry g{2,1,2,1,16,64,solid::KvLayout::interleaved};
+    auto file=std::make_unique<File>();
+    auto reader=std::make_unique<Reader>(file.get());
+    auto * observe=reader.get();
+    solid::FileKvStore store(g,std::move(file),8);
+    fill(store,6);
+    solid::Prefetcher host(store,{4,1,1,1},4,std::move(reader),{},false);
+    for (std::uint64_t p=6;p<8;++p) for (std::uint32_t layer=0;layer<2;++layer) {
+        const auto reads=observe->stats().read_requests;
+        host.begin(layer,p);
+        host.poll();
+        require(observe->stats().read_requests==reads && !host.pending_reads(),"disabled lookahead submitted an early SSD read");
+        store.append_interleaved(layer,p,token(g,layer,p));
+        const auto leases=host.resolve(layer,p,{{{0,1,p-1,p},{}}});
+        verify(store,host,leases);
+        require(observe->stats().read_requests>reads,"on-demand correction skipped committed SSD rows");
+        for (const auto & lease:leases) host.unpin(lease);
+    }
+    require(!host.stats().ahead_enabled && host.stats().predicted_blocks==0 && host.stats().formal_resolutions==4,
+        "lookahead ablation changed formal loading or prediction counters");
+    host.finish();
+}
 void device() {
     const solid::KvGeometry g{1, 1, 2, 1, 16, 64, solid::KvLayout::interleaved};
     solid::MemoryKvStore store(g);
@@ -289,7 +312,7 @@ void shared_prediction_admission(std::uint32_t slots) {
 int main() {
     try {
         slots(); prefix(); wrong_predictions(); read_error(solid::KvLayout::interleaved);
-        read_error(solid::KvLayout::separate); capacity(); device(); deferred_device(); batched_device();
+        read_error(solid::KvLayout::separate); capacity(); on_demand_only(); device(); deferred_device(); batched_device();
         for (const auto layout:{solid::KvLayout::separate,solid::KvLayout::interleaved}) for (const auto capacity:{1u,64u}) selected_first(layout,capacity);
         streaming(false); streaming(true);
         shared_prediction_admission(3); shared_prediction_admission(4);

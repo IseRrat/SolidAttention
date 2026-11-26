@@ -22,6 +22,7 @@ struct AttentionConfig {
     bool fuse_kv_projection = false;
     bool profile = false;
     bool prefetch = false;
+    bool prefetch_ahead = true;
     bool prefetch_trace = false;
     std::string schedule = "naive";
     bool schedule_trace = false;

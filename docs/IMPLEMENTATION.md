@@ -146,6 +146,12 @@
 
    [prefetch.cpp](../src/prefetch.cpp)、[prefetch.hpp](../include/solid/prefetch.hpp)。
 
+   `attention.prefetch_ahead` 默认开启。关闭时不构造 init/local 和历史 selected 的提前读取请求，正式选块后仍按原预算补读和上传 KV。`config.hpp`、`config.cpp` 解析开关，`session.hpp`、`session.cpp`、`llama_adapter.cpp` 将它传到 `Prefetcher`，`baseline.cpp` 写出实际开关和预测块数。`prefetch_test.cpp` 检查跨层、跨解码步的提前读取为零、正式读取仍发生，以及待写 KV 与磁盘 KV 的拼接结果；`config_test.cpp` 检查关闭提前预取后保持原调度。
+
+   `experiments.py` 增加 `solid-no-prefetch`，从完整 `solid` 配置复制后仅关闭 `prefetch_ahead`。两组保留同一 CUDA 评分、交织 KV、融合权重及同步复用调度。`cuda-paper.json` 的预取消融采用这对配置；`experiment_common.py` 核对结果中的实际开关，`test_experiments.py` 检查配置差异和结果匹配。`cuda_device_input_test.cu` 增加关闭提前预取的原生 InfLLM 解码图核验，逐值核对输出，并要求预测块数为零、正式解析 16 次和设备完成通知 16 次。
+
+   服务器完成 54 项 CPU 检查、17 项实验脚本检查，以及开启/关闭提前预取的 CUDA 图复用数值与通知检查。编译和 CPU 记录位于 `results/server5090/prefetch-ahead-ablation-check/`，GPU 记录位于 `results/server5090/infllm-port-check-10d694c.uyfXf9xR/prefetch-ahead-isolation-v3.log`，同目录 `nsys/` 保存对应采集。
+
 2. **正式选择纠错**
 
    已实现命中块保留、在途请求提升、缺块补读和错误预测回收。尾块版本变化会处理在途旧前缀并补齐缺口。正式纠错优先于预测；同一前沿内先比较 critical 和 LST，相同时 selected 优先于 init/local。SSD 队列与上传派发使用同一组排序键。
@@ -215,6 +221,10 @@
    SolidAttention 的 CUDA InfLLM attention 在 QK 矩阵乘法前记录开始，在概率乘 V 后通知协调线程。下一层 SSD 预取可先发起，完成通知用于确认当前层上传依赖和当前 KV 回传，再推进当前层聚合写回及下一层显存上传。CPU 回执在归档完成后用近期概率更新代表索引。回归用例以相同输入核对重用解码图的输出、设备选块调用和 FP16 归档字节。 [llama_adapter.cpp](../src/llama_adapter.cpp)、[stream_completion.hpp](../include/solid/stream_completion.hpp)、[generate_adapter.py](../scripts/generate_adapter.py)、[prefetch_graph_test.cpp](../tests/prefetch_graph_test.cpp)、[representative_builder_cases.hpp](../tests/representative_builder_cases.hpp)。
 
    `generate_adapter.py` 将设备事件边界接入 FlashAttention、矩阵乘法、CONT 输出整理和 Softmax 四种实际执行节点。`CompletionPhase` 分别控制开始、结束或两端事件；两分支 Decode 图的末端 CONT 在两次 PV 与求和完成后记录结束事件并向协调线程通知，只含局部分支时由 Softmax 记录开始事件。带完成标记的节点保留独立派发，沿用原有 CUDA 事件及图捕获/重放接口。`cuda_device_input_test.cu` 的同步复用检查要求 16 次设备事件、零次 CPU 边界替代；`test_adapter_generator.py` 检查四类节点的事件顺序、覆盖结果可重复及上游文件保持原样。服务器 CUDA 编译、54 项 CPU 检查与两项生成器检查通过，记录位于 `results/server5090/attention-output-completion-check/compile-and-cpu.log`。
+
+   `b7c0d85` 的 CUDA 图复用核验通过严格的 16 次设备通知、零次 CPU 替代检查。8K、512 输出的 Qwen 单点记录 14,308 次设备通知、零次 CPU 替代；修复前为零次设备通知、14,308 次 CPU 替代。Prefill 从 1.345 秒变为 1.314 秒，Decode 从 25.33 变为 25.10 token/s。结果位于 `results/server5090/attention-completion-8k-b7c0d85.415j2qhz/`。固定 88 个 Decode 输入的补充对照中，旧通知路径重复运行也在第 88 个输出发生贪心结果分歧；旧路径重复、新路径重复、跨路径对照的 logits 平均绝对差分别为 0.05337、0.06011、0.05443，逐步比较保存在 `results/server5090/completion-notification-replay-VfjhDvIK/verified-comparison.json`。
+
+   `scheduler.hpp`、`ggml_prefetch.cpp` 累计当前层 K/V 投影就绪后，计算线程等待正式读取协调任务完成的耗时和次数；`baseline.cpp` 输出 `history_consumer_wait_ms`、`history_consumer_wait_calls`。Nsight 对应条为 `CPU Wait KV`。计时包住原有等待，不增加设备同步；此项包括协调任务剩余工作，GPU 后续等待上传完成仍由实际 CUDA 时间线查看。`cuda_device_input_test.cu` 检查连续 16 次解码层调用均计入。
 
    CUDA `overlap+sync_reuse` 的设备 KV 路径允许历史上传在构建掩码和提交当前行时继续执行。计算流统一等待最后一个上传事件，协调线程用 attention 完成回执确认整个上传批次并归还槽位。下一层 SSD 请求可以先排队，暂时被上传占用的页锁定槽位在写入方归还后才接收新数据。调度轨迹核对共同上传依赖，CUDA 回归用例检查计算流等待和主机批次等待的次数。 [device_cache.hpp](../include/solid/device_cache.hpp)、[device_cache.cpp](../src/device_cache.cpp)、[prefetch.hpp](../include/solid/prefetch.hpp)、[prefetch.cpp](../src/prefetch.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)、[cuda_device_input_test.cu](../tests/cuda_device_input_test.cu)。
 

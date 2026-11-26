@@ -84,6 +84,10 @@ int main() {
         const auto async_mode = ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"interleaved\",\"prefetch\":true";
         write(prefix + async_mode + ",\"prefetch_queue_depth\":2,\"prefetch_slots_per_head\":4}}");
         if (!solid::RunConfig::load(config).attention.prefetch) throw std::runtime_error("prefetch config parsing");
+        write(prefix+async_mode+",\"prefetch_ahead\":false,\"schedule\":\"overlap+sync_reuse\"}}");
+        const auto on_demand=solid::RunConfig::load(config).attention;
+        if (!on_demand.prefetch || on_demand.prefetch_ahead || on_demand.schedule!="overlap+sync_reuse")
+            throw std::runtime_error("prefetch-only ablation changed scheduler configuration");
         write(prefix+async_mode+",\"io_cpu\":0,\"coordinator_cpu\":1}}");
         const auto placement=solid::RunConfig::load(config).attention;
         if (placement.io_cpu!=0 || placement.coordinator_cpu!=1) throw std::runtime_error("worker CPU parsing");

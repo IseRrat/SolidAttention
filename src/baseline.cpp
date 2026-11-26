@@ -557,6 +557,7 @@ int main(int argc, char ** argv) {
             };
             if (config.attention.prefetch) {
                 result["prefetch"] = {
+                    {"ahead_enabled", stats.prefetch.ahead_enabled},
                     {"io_engine", "liburing"}, {"queue_depth", config.attention.prefetch_queue_depth},
                     {"io_execution",stats.prefetch.io.dedicated_worker?"dedicated_thread":"caller_thread"},
                     {"io_cpu",stats.prefetch.io.worker_cpu},{"inference_cpus",adapter->inference_cpus()},
@@ -613,6 +614,8 @@ int main(int argc, char ** argv) {
                     {"historical_upload_ranges",schedule.historical_upload_ranges},
                     {"archive_attention_reuses",schedule.archive_attention_reuses},
                     {"archive_separate_completions",schedule.archive_separate_completions},
+                    {"history_consumer_wait_ms",schedule.history_consumer_wait_ns/1e6},
+                    {"history_consumer_wait_calls",schedule.history_consumer_wait_calls},
                     {"backend_compute_waits", schedule.backend_compute_waits}, {"staging_buffer_bytes", schedule.staging_bytes}
                 };
                 const auto schedule_trace = config.output.parent_path() / "schedule.jsonl";

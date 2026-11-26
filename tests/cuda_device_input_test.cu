@@ -119,7 +119,7 @@ void operations() {
 // Model-free integration on the experiment machine: two actual CUDA/CPU split
 // layers, private ranker stream, native completion and one allocated graph reused
 // across decode positions. CPU scalar sparse attention is the numerical oracle.
-void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bool baseline=false) {
+void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bool baseline=false,bool prefetch_ahead=true) {
     const solid::KvGeometry g{2,2,128,2,32,64,baseline?solid::KvLayout::separate:solid::KvLayout::interleaved};
     const solid::SparseBudget budget=infllm?solid::SparseBudget{6,1,2,2,true,true}:solid::SparseBudget{6,1,1,1};
     const auto rope=infllm?std::optional<solid::RelativeRope>{{128,10000.f,true}}:std::nullopt;
@@ -127,7 +127,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
         cpu(ggml_backend_cpu_init(),ggml_backend_free);
     require(gpu && cpu,"decode check backends");
     solid::AttentionSession session(std::make_unique<solid::MemoryKvStore>(g),4,budget,true,6,{}, {},
-        baseline?std::unique_ptr<solid::AsyncReader>{}:std::make_unique<test_prefetch::Reader>(),budget.cache_slots(g),{},rope);
+        baseline?std::unique_ptr<solid::AsyncReader>{}:std::make_unique<test_prefetch::Reader>(),budget.cache_slots(g),{},rope,prefetch_ahead);
     solid::AttentionSession reference(std::make_unique<solid::MemoryKvStore>(g),4,budget,true,6,{}, {},{},0,{},rope);
     auto ranker=solid::make_cuda_block_ranker(session.representative_geometry(),4,1,6,device,infllm?0:1,infllm?g.heads:0);
     if (infllm) require(ranker->configure_probability_builder(budget.initial,budget.local,budget.representatives),"native decode probability builder");
@@ -237,6 +237,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
     }
     if (cache) cache->quiesce(); session.finish();
     const auto after=session.stats();
+    if (!prefetch_ahead) require(!after.prefetch.ahead_enabled && after.prefetch.predicted_blocks==0 && after.prefetch.formal_resolutions==16,
+        "on-demand GPU path submitted speculative reads or skipped formal attention");
     if (baseline) {
         require(after.ranking.device_rank_queries>before.ranking.device_rank_queries &&
             after.ranking.query_upload_bytes==before.ranking.query_upload_bytes &&
@@ -252,6 +254,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
         after.ranking.builder_key_upload_bytes==before.ranking.builder_key_upload_bytes,"direct decode re-uploaded Q/K or skipped device inputs");
     if (!infllm) require(after.ranking.builder_rank_shared_waits>0,"CUDA decode did not reuse the block ranking wait");
     const auto schedule=cache->schedule_stats();
+    require(schedule.history_consumer_wait_calls==16,"CUDA decode omitted consumer readiness wait accounting");
     if (mode==solid::ScheduleMode::sync_reuse) {
         require(schedule.device_event_completions==16 && schedule.device_boundary_fallbacks==0,
             "CUDA graph replay replaced device completion events with CPU boundary receipts");
@@ -276,6 +279,7 @@ int main(int argc,char ** argv) {
         for (bool packed:{false,true}) for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) decode(device,packed,mode);
         for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) decode(device,false,mode,true);
         decode(device,false,solid::ScheduleMode::naive,true,true);
+        decode(device,false,solid::ScheduleMode::sync_reuse,true,false,false);
         std::cout<<"CUDA borrowed Q/K, FP16 kernels, split graphs and replay checks passed\n"; return 0;
     } catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

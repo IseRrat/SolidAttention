@@ -57,6 +57,38 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_prefetch_ablation_changes_only_advance_reads(self):
+        template = {"attention": {"infllm_attention":True, "selection_backend":"cuda", "direct_decode_reads":True}}
+        full = experiments.variant_config(template, "solid", 32, 1024)
+        demand = experiments.variant_config(template, "solid-no-prefetch", 32, 1024)
+        self.assertTrue(full["attention"]["prefetch_ahead"])
+        self.assertFalse(demand["attention"].pop("prefetch_ahead"))
+        del full["attention"]["prefetch_ahead"]
+        self.assertEqual(demand, full)
+        self.assertTrue(demand["attention"]["prefetch"])
+        self.assertEqual(demand["attention"]["schedule"], "overlap+sync_reuse")
+
+    def test_prefetch_result_matches_requested_advance_reads(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary)
+            source, template=fixture(root)
+            config=experiments.variant_config(template,"solid-no-prefetch",32,0)
+            config["output"]=str(root/"run/result.json")
+            write(root/"config.json",config)
+            output,result=write_run(root/"config.json")
+            result["prefetch"]={"ahead_enabled":False}
+            write(output,result)
+            manifest=common.load(output.parent/"manifest.json")
+            manifest["result_sha256"]=common.digest(output)
+            write(output.parent/"manifest.json",manifest)
+            common.audit_run(output)
+            result["prefetch"]["ahead_enabled"]=True
+            write(output,result)
+            manifest["result_sha256"]=common.digest(output)
+            write(output.parent/"manifest.json",manifest)
+            with self.assertRaisesRegex(ValueError,"prefetch-ahead"):
+                common.audit_run(output)
+
     def test_paired_sparse_variants_share_budget(self):
         with tempfile.TemporaryDirectory() as temporary:
             root=Path(temporary)

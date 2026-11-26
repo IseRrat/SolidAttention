@@ -97,6 +97,8 @@ def audit_run(result_path, source_config=None, source_sha=None):
             if actual.get(key,defaults.get(key)) != configured.get(key,defaults.get(key)): raise ValueError(f"result attention setting differs: {key}")
         for key in ("context_budget_tokens","init_tokens","local_tokens"):
             if key in configured and actual[key] != configured[key]: raise ValueError("result context budget differs")
+        if configured.get("prefetch") and result.get("prefetch", {}).get("ahead_enabled", True) != configured.get("prefetch_ahead", True):
+            raise ValueError("result prefetch-ahead setting differs")
         expected_io = "direct_decode_reads" if configured.get("direct_decode_reads", False) else "buffered"
         if actual.get("io_mode", "buffered") != expected_io: raise ValueError("result KV I/O mode differs")
         if configured.get("infllm_attention") and configured.get("prefill_backend") == "cuda":

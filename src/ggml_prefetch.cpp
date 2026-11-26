@@ -11,6 +11,7 @@
 #include "solid/sycl_backend.hpp"
 #endif
 #include <limits>
+#include <chrono>
 #include <map>
 #include <array>
 #include <cstring>
@@ -1008,8 +1009,15 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         if (deferred) current->dag.complete(kv_projection, impl_->trace.now(), "kv_device_ready",projection_ns);
         else current->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), "kv_download_complete");
     }
-    impl_->worker.join();
+    const auto wait_begin = std::chrono::steady_clock::now();
+    {
+        trace::Scope wait("CPU Wait KV", layer, position);
+        impl_->worker.join();
+    }
+    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-wait_begin).count();
     std::lock_guard<std::mutex> lock(impl_->mutex);
+    impl_->totals.history_consumer_wait_ns += static_cast<std::uint64_t>(waited);
+    ++impl_->totals.history_consumer_wait_calls;
     impl_->quiesced = false;
     auto work = current;
     if (!early_enabled()) {

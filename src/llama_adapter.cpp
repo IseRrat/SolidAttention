@@ -1216,7 +1216,8 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens,
         options.selection_trace ? trace : std::filesystem::path{},
         options.selection_replay, options.prefetch ? make_threaded_uring_reader(options.prefetch_queue_depth,impl_->placement->io_cpu(),static_cast<std::uint32_t>(admission)) : nullptr,
-        options.prefetch_slots_per_head, options.prefetch_trace ? trace.parent_path() / "prefetch.jsonl" : std::filesystem::path{}, rope);
+        options.prefetch_slots_per_head, options.prefetch_trace ? trace.parent_path() / "prefetch.jsonl" : std::filesystem::path{}, rope,
+        options.prefetch_ahead);
     if (options.prefetch_trace) impl_->residency_trace = trace.parent_path() / "residency.jsonl";
     impl_->schedule = parse_schedule_mode(options.schedule);
     if (options.schedule_trace) impl_->schedule_trace = trace.parent_path() / "schedule.jsonl";
