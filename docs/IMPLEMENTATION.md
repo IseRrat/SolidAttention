@@ -334,6 +334,8 @@
 
    `llama_adapter.cpp` 将设备 KV 整合节点的就绪依赖改为已有 GPU Q token，保留 Q 的设备内存生命周期。CPU 提前选块节点仍由模型接入层显式展开在 KV 子图之前；其标量结果省去回传 GPU。`prefetch_graph_test.cpp` 核对 GPU KV 节点引用原 Q token、无 CPU 控制值输入，并检查 CPU 选块节点在最终图中排于 KV 整合之前。服务器 54 项 CPU 检查与原生 CUDA 数值核验通过，记录为 `ol-sr-sync-audit-check/control-fix-compile-and-cpu.log`、`control-fix-cuda.log`；原生采集位于 `infllm-port-check-control-fix.4CVOCqOz/nsys/ol-control-fix.nsys-rep`。
 
+   `0549556` 完成相同输入的三组 8 步同步归因复核。两条优化路径的 CPU 控制值回传区间消失，每组减少 672 次流同步，即每层 3 次；相对 naive 的额外流同步从每层 5 次降为 2 次。剩余差额全部位于 Q 就绪标记的 GPU→CPU 复制区间。其余共同索引、mask、attention 回执和非复制区间的同步次数保持一致。复核脚本严格检查同步差额与区间消失，原始采集、配置与结果位于 `results/server5090/ol-sr-sync-audit-0549556.zn__4omh/`。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。
