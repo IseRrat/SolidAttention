@@ -19,7 +19,7 @@ from experiment_runtime import Background, condition, cuda_memory_limit, fio_com
 from process_lifetime import stop_process, termination_signals
 
 ROOT = Path(__file__).resolve().parents[1]
-VARIANTS = {"origin", "quant", "indram", "indram-sparse", "offload", "offload-sparse", "interleaved", "prefetch", "overlap", "solid", "solid-no-prefetch", "solid-no-interleaved"}
+VARIANTS = {"origin", "quant", "indram", "indram-sparse", "offload", "offload-sparse", "interleaved", "prefetch", "overlap", "solid", "solid-no-prefetch", "solid-no-interleaved", "solid-no-coalescing"}
 
 
 def name(value):
@@ -30,10 +30,11 @@ def name(value):
 
 def variant_config(template, variant, block, budget):
     if variant not in VARIANTS: raise ValueError("unknown experiment variant")
-    if variant in ("solid-no-prefetch", "solid-no-interleaved"):
+    if variant in ("solid-no-prefetch", "solid-no-interleaved", "solid-no-coalescing"):
         config = variant_config(template, "solid", block, budget)
         if variant == "solid-no-prefetch": config["attention"]["prefetch_ahead"] = False
-        else: config["attention"]["layout"] = "separate"
+        elif variant == "solid-no-interleaved": config["attention"]["layout"] = "separate"
+        else: config["attention"]["coalesce_uploads"] = False
         return config
     config = copy.deepcopy(template)
     for key in ("attention", "replay_token_ids", "prompt_token_ids"): config.pop(key,None)
@@ -71,7 +72,7 @@ def variant_config(template, variant, block, budget):
         if selector not in ("auto", "cpu", "cuda"): raise ValueError("unknown selection backend")
         attention["selection_backend"] = selector
     if prefetch:
-        attention.update(prefetch_ahead=True, prefetch_trace=False, prefetch_queue_depth=64, schedule_trace=False,
+        attention.update(prefetch_ahead=True, coalesce_uploads=True, prefetch_trace=False, prefetch_queue_depth=64, schedule_trace=False,
                          schedule={"prefetch":"naive","overlap":"overlap","solid":"overlap+sync_reuse"}[variant])
         for key in ("io_cpu","coordinator_cpu"):
             if key in template.get("attention",{}): attention[key]=template["attention"][key]
@@ -132,7 +133,7 @@ def create(spec_path, destination):
             raise ValueError("offload_sparse_budgets must map input lengths in the suite to budgets")
         if sparse_budgets and ("offload-sparse" not in suite["variants"] or suite["budgets"]!=[0]):
             raise ValueError("offload_sparse_budgets replaces the automatic budget for offload-sparse")
-        if sparse_budgets and {"solid", "solid-no-prefetch", "solid-no-interleaved"}.intersection(suite["variants"]):
+        if sparse_budgets and {"solid", "solid-no-prefetch", "solid-no-interleaved", "solid-no-coalescing"}.intersection(suite["variants"]):
             raise ValueError("offload-sparse and solid must use the same budget in a comparison suite")
         for value in sparse_budgets.values():
             if value!="full": number(value,1,True)

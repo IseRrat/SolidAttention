@@ -296,6 +296,12 @@
 
    对该轮 Nsight 的离线分解显示：3B 三组的 H2D 为 3.148／4.089／4.963 ms/步，其中与 GPU kernel 重叠为 0／0.593／0.332 ms/步；每笔历史上传平均包含 13.75／7.54／4.32 个块。三模型的 +ol、+sr 比 naive 均多出每层 5 次 CUDA 流同步调用，+sr 的事件同步调用减少而流同步次数与 +ol 相同。完整分解保存在同轮 `nsys-scheduler-analysis.json`；报告将统一入口区间与完整 Decode 分别呈现。
 
+8. **相邻上传合并的独立诊断开关**
+
+   `AttentionConfig::coalesce_uploads` 默认开启，`config.cpp` 解析后由 `llama_adapter.cpp` 传入 `GgmlPrefetch` 与设备搬运器。关闭时仅跳过历史上传中连续地址范围的合并循环，仍用同一批已就绪块、页锁定缓冲、复制队列及完成票据；交织 K/V 的单块仍作为一个传输单元。当前行安装、预算、评分、预取和同步复用保持原样。`scheduler.hpp`、`ggml_prefetch.cpp` 保存实际开关，`baseline.cpp` 在 `schedule.coalesce_uploads` 输出实际值。
+
+   `experiments.py` 的 `solid-no-coalescing` 复制完整 SolidAttention 配置后只关闭上述开关；`experiment_common.py` 核对实际运行模式。`config_test.cpp` 检查解析与适用范围，`test_experiments.py` 检查两组配置只有该开关不同；`cuda_device_input_test.cu` 在关闭合并时要求每个交织历史块恰好对应一笔上传，并逐值核对 CUDA 输出与参考结果。服务器编译、54 项 CPU 检查、20 项实验脚本检查及 CUDA 核验通过。记录位于 `results/server5090/upload-coalescing-check/`，CUDA 采集为 `results/server5090/infllm-port-check-coalescing.821puqfR/nsys/upload-coalescing-native.nsys-rep`。对应接口文件为 `config.hpp`、`ggml_prefetch.hpp`，实现文件为 `config.cpp`、`llama_adapter.cpp`、`ggml_prefetch.cpp`、`baseline.cpp` 及上述实验脚本和检查文件。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。

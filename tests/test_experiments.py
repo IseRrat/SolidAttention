@@ -57,6 +57,16 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_coalescing_ablation_changes_only_adjacent_upload_merging(self):
+        template={"attention":{"infllm_attention":True,"selection_backend":"cuda","direct_decode_reads":True}}
+        on=experiments.variant_config(template,"solid",32,1024)
+        off=experiments.variant_config(template,"solid-no-coalescing",32,1024)
+        self.assertTrue(on["attention"].pop("coalesce_uploads"))
+        self.assertFalse(off["attention"].pop("coalesce_uploads"))
+        self.assertEqual(on,off)
+        self.assertEqual(off["attention"]["layout"],"interleaved")
+        self.assertEqual(off["attention"]["schedule"],"overlap+sync_reuse")
+
     def test_scheduler_ablation_changes_only_schedule(self):
         template={"attention":{"infllm_attention":True,"selection_backend":"cuda","direct_decode_reads":True}}
         configs=[]

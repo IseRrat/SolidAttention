@@ -61,9 +61,10 @@ class GgmlTransport final : public DeviceTransport {
 #endif
     };
 public:
-    GgmlTransport(ggml_backend_t backend, KvGeometry geometry, std::uint32_t per_head, ScheduleMode mode,AttentionEvents * native,bool share_host_cache) :
+    GgmlTransport(ggml_backend_t backend, KvGeometry geometry, std::uint32_t per_head, ScheduleMode mode,AttentionEvents * native,bool share_host_cache,bool coalesce_uploads) :
         backend_(backend), geometry_(geometry), per_head_(per_head),native_(native) {
         if (!backend) throw std::invalid_argument("invalid GGML prefetch transport");
+        stats_.coalesce_uploads=coalesce_uploads;
         if (share_host_cache) {
             if (!ggml_backend_buft_is_host(ggml_backend_get_default_buffer_type(backend))) throw std::invalid_argument("explicit shared cache requires a host-addressable backend");
             shared_=true;
@@ -246,7 +247,7 @@ public:
             if (blocks.size()==1) begin_copy_interval(record,blocks.front().slot);
             for (std::size_t i=0;i<ranges.size();) {
                 auto range=ranges[i++];
-                while (i<ranges.size() && range.offset+range.bytes==ranges[i].offset &&
+                while (stats_.coalesce_uploads && i<ranges.size() && range.offset+range.bytes==ranges[i].offset &&
                        range.source+range.bytes==ranges[i].source) {
                     range.bytes+=ranges[i++].bytes;
                 }
@@ -746,11 +747,11 @@ struct GgmlPrefetch::Impl {
     bool quiesced = true;
     std::atomic<std::uint64_t> released_epoch{0};
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
-        const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied,bool share_host_cache) :
+        const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied,bool share_host_cache,bool coalesce_uploads) :
         session(s), backend(backend), mode(mode), worker(cpu,"sa.coordinator"), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
             schedule.parent_path()/(schedule.stem().string()+".blocks"+schedule.extension().string())),
         events(attention_events(s,backend,mode,std::move(supplied))),
-        transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode,events.get(),share_host_cache),
+        transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode,events.get(),share_host_cache,coalesce_uploads),
         device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) {
         estimates.fill(1); totals.coordinator_cpu=cpu; totals.completion_backend=events?events->name():"graph_boundaries";
     }
@@ -924,8 +925,8 @@ struct GgmlPrefetch::Impl {
     }
 };
 GgmlPrefetch::GgmlPrefetch(AttentionSession & session, ggml_backend_t backend, const std::filesystem::path & trace,
-                          ScheduleMode mode, const std::filesystem::path & schedule_trace,int cpu,std::unique_ptr<AttentionEvents> events,bool share_host_cache) :
-    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace,cpu,std::move(events),share_host_cache)) {}
+                          ScheduleMode mode, const std::filesystem::path & schedule_trace,int cpu,std::unique_ptr<AttentionEvents> events,bool share_host_cache,bool coalesce_uploads) :
+    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace,cpu,std::move(events),share_host_cache,coalesce_uploads)) {}
 GgmlPrefetch::~GgmlPrefetch() { if (!impl_->quiesced) { try { quiesce(); } catch (...) {} } }
 ggml_tensor * GgmlPrefetch::tensor() const { return impl_->transport.tensor(); }
 std::uint32_t GgmlPrefetch::tokens_per_head() const { return impl_->device.tokens_per_head(); }
@@ -1271,6 +1272,7 @@ ScheduleStats GgmlPrefetch::schedule_stats() const {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     auto result = impl_->totals;
     const auto transport = impl_->transport.stats();
+    result.coalesce_uploads=transport.coalesce_uploads;
     result.event_waits = transport.event_waits; result.batch_waits = transport.batch_waits;
     result.stream_waits = transport.stream_waits; result.staging_bytes = transport.staging_bytes;
     result.backend_drains = transport.backend_drains; result.backend_compute_waits = transport.backend_compute_waits;

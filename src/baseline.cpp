@@ -614,6 +614,7 @@ int main(int argc, char ** argv) {
                     {"copy_stream_waits", schedule.stream_waits}, {"copy_batch_groups", schedule.batch_groups},
                     {"copy_events_coalesced", schedule.events_coalesced}, {"backend_drains", schedule.backend_drains},
                     {"historical_upload_batches",schedule.historical_upload_batches},
+                    {"coalesce_uploads",schedule.coalesce_uploads},
                     {"historical_upload_blocks",schedule.historical_upload_blocks},
                     {"historical_upload_ranges",schedule.historical_upload_ranges},
                     {"archive_attention_reuses",schedule.archive_attention_reuses},

@@ -119,7 +119,7 @@ void operations() {
 // Model-free integration on the experiment machine: two actual CUDA/CPU split
 // layers, private ranker stream, native completion and one allocated graph reused
 // across decode positions. CPU scalar sparse attention is the numerical oracle.
-void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bool baseline=false,bool prefetch_ahead=true,bool separate=false) {
+void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bool baseline=false,bool prefetch_ahead=true,bool separate=false,bool coalesce_uploads=true) {
     const solid::KvGeometry g{2,2,128,2,32,64,baseline||separate?solid::KvLayout::separate:solid::KvLayout::interleaved};
     const solid::SparseBudget budget=infllm?solid::SparseBudget{6,1,2,2,true,true}:solid::SparseBudget{6,1,1,1};
     const auto rope=infllm?std::optional<solid::RelativeRope>{{128,10000.f,true}}:std::nullopt;
@@ -168,7 +168,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
         fill(layer,p); (void) session.process(layer,p,1,q,k,v,scale); (void) reference.process(layer,p,1,q,k,v,scale);
     }
     const auto before=session.stats();
-    auto cache=baseline?nullptr:std::make_unique<solid::GgmlPrefetch>(session,gpu.get(),std::filesystem::path{},mode);
+    auto cache=baseline?nullptr:std::make_unique<solid::GgmlPrefetch>(session,gpu.get(),std::filesystem::path{},mode,
+        std::filesystem::path{},-1,std::unique_ptr<solid::AttentionEvents>{},false,coalesce_uploads);
     auto selected_cache=baseline?solid::make_infllm_selected_cache(session,gpu.get()):nullptr;
     require(baseline || cache->direct_memory()==solid::DeviceMemory::cuda,"actual CUDA direct mode missing");
     std::unique_ptr<ggml_context,decltype(&ggml_free)> context(ggml_init({4*1024*1024,nullptr,true}),ggml_free);
@@ -256,6 +257,9 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
     const auto schedule=cache->schedule_stats();
     require(schedule.staging_bytes>0 && schedule.historical_upload_batches>0 && schedule.historical_upload_blocks>0,
         "CUDA scheduling modes did not retain pinned slots and historical upload batching");
+    require(schedule.coalesce_uploads==coalesce_uploads,"CUDA transport ignored upload coalescing switch");
+    if (!coalesce_uploads) require(schedule.historical_upload_ranges==schedule.historical_upload_blocks*(separate?2u:1u),
+        "disabled coalescing still combined adjacent historical blocks");
     require(schedule.history_consumer_wait_calls==16,"CUDA decode omitted consumer readiness wait accounting");
     require(schedule.attention_layer_span_layers==16 && schedule.attention_layer_span_ns>0,
         "CUDA replay omitted Q-frontier-to-attention latency samples");
@@ -289,6 +293,7 @@ int main(int argc,char ** argv) {
         for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse}) decode(device,false,mode,true);
         decode(device,false,solid::ScheduleMode::naive,true,true);
         decode(device,false,solid::ScheduleMode::sync_reuse,true,false,false);
+        decode(device,false,solid::ScheduleMode::sync_reuse,true,false,true,false,false);
         for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse})
             decode(device,false,mode,true,false,true,true);
         std::cout<<"CUDA borrowed Q/K, FP16 kernels, split graphs and replay checks passed\n"; return 0;

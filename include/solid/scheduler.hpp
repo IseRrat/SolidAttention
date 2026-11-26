@@ -102,6 +102,7 @@ private:
     void run();
 };
 struct ScheduleStats {
+    bool coalesce_uploads = true;
     std::string completion_backend="graph_boundaries";
     int coordinator_cpu=-1;
     std::uint64_t frames = 0, tasks = 0, worker_jobs = 0;

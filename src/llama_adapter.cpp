@@ -1120,6 +1120,7 @@ struct AttentionAdapter::Impl {
     std::filesystem::path residency_trace;
     std::filesystem::path schedule_trace;
     ScheduleMode schedule = ScheduleMode::naive;
+    bool coalesce_uploads = true;
     ggml_backend_t prefetch_backend = nullptr;
     std::unique_ptr<GgmlPrefetch> device;
     std::string selection_backend;
@@ -1221,6 +1222,7 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
         options.prefetch_ahead);
     if (options.prefetch_trace) impl_->residency_trace = trace.parent_path() / "residency.jsonl";
     impl_->schedule = parse_schedule_mode(options.schedule);
+    impl_->coalesce_uploads = options.coalesce_uploads;
     if (options.schedule_trace) impl_->schedule_trace = trace.parent_path() / "schedule.jsonl";
     std::lock_guard<std::mutex> lock(registry_mutex);
     if (!registry.emplace(model, this).second) throw std::invalid_argument("one attention session per model is supported");
@@ -1319,7 +1321,7 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
         if (!backend) throw std::logic_error("prefetch decode backend is required");
         if (!impl_->device) {
             impl_->device = std::make_unique<GgmlPrefetch>(*impl_->session, backend, impl_->residency_trace, impl_->schedule, impl_->schedule_trace,
-                impl_->placement->coordinator_cpu());
+                impl_->placement->coordinator_cpu(),nullptr,false,impl_->coalesce_uploads);
             impl_->prefetch_backend = backend;
         } else if (impl_->prefetch_backend != backend) throw std::logic_error("prefetch decode backend changed");
     }

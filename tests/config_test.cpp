@@ -95,6 +95,9 @@ int main() {
         for (const auto value:{"-2","true","1.5","2147483648","18446744073709551615"}) reject(prefix+async_mode+",\"io_cpu\":"+value+"}}");
         reject(prefix+",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"io_cpu\":0}}");
         reject(prefix + async_mode + ",\"prefetch_queue_depth\":1}}");
+        write(prefix + async_mode + ",\"coalesce_uploads\":false}}");
+        if (solid::RunConfig::load(config).attention.coalesce_uploads) throw std::runtime_error("upload coalescing flag ignored");
+        reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"coalesce_uploads\":false}}");
         reject(prefix + async_mode + ",\"prefetch_slots_per_head\":1000}}");
         reject(prefix + async_mode + ",\"gpu_decode\":false}}");
         reject(prefix + ",\"attention\":{\"storage\":\"memory\",\"sparse\":true,\"layout\":\"interleaved\",\"prefetch\":true}}");
