@@ -57,6 +57,19 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_scheduler_ablation_changes_only_schedule(self):
+        template={"attention":{"infllm_attention":True,"selection_backend":"cuda","direct_decode_reads":True}}
+        configs=[]
+        for variant,mode in (("prefetch","naive"),("overlap","overlap"),("solid","overlap+sync_reuse")):
+            config=experiments.variant_config(template,variant,32,1024)
+            self.assertEqual(config["attention"].pop("schedule"),mode)
+            self.assertTrue(config["attention"]["prefetch_ahead"])
+            self.assertTrue(config["attention"]["fuse_kv_projection"])
+            self.assertEqual(config["attention"]["layout"],"interleaved")
+            configs.append(config)
+        self.assertEqual(configs[0],configs[1])
+        self.assertEqual(configs[1],configs[2])
+
     def test_interleaving_ablation_keeps_prefetch_scoring_and_projection(self):
         template={"attention":{"infllm_attention":True,"selection_backend":"cuda","direct_decode_reads":True}}
         full=experiments.variant_config(template,"solid",32,1024)

@@ -111,11 +111,17 @@ public:
         ggml_backend_buffer_clear(buffer_.get(), 0);
         copy_backend_ = backend_;
         if (shared_) return;
-        if (mode != ScheduleMode::naive) {
+        bool pinned_staging=mode != ScheduleMode::naive;
+#ifdef SOLID_HAVE_CUDA_SELECTION
+        pinned_staging=pinned_staging || ggml_backend_is_cuda(backend_);
+#endif
+        if (pinned_staging) {
             auto * device = ggml_backend_get_device(backend_);
             if (!device) throw std::runtime_error("copy backend requires a registered device");
 #ifdef SOLID_HAVE_SYCL
-            if (!sycl_copy_)
+            if (mode != ScheduleMode::naive && !sycl_copy_)
+#else
+            if (mode != ScheduleMode::naive)
 #endif
             {
                 copy_owner_.reset(ggml_backend_dev_init(device, nullptr));
@@ -683,6 +689,7 @@ struct LayerWork {
     bool direct = false;
     bool deferred_archive;
     bool archive_at_attention;
+    std::optional<std::uint64_t> consumer_entry_ns;
     LayerWork(std::uint32_t layer, std::uint64_t position, ScheduleMode mode, ScheduleTrace & trace,
                 std::uint64_t id, const std::array<std::uint64_t, task_count> & estimates, bool archive, bool single_layer,
                 bool shared_archive) :
@@ -843,6 +850,9 @@ struct GgmlPrefetch::Impl {
             work->dag.complete(attention, completed, proof, device_ns);
             totals.attention_layer_span_ns+=completed-work->dag.task(q_ready).end_ns;
             ++totals.attention_layer_span_layers;
+            if (!work->consumer_entry_ns) throw std::logic_error("attention completed without its KV adapter entry");
+            totals.attention_consumer_span_ns+=completed-*work->consumer_entry_ns;
+            ++totals.attention_consumer_span_layers;
             if (work->archive_at_attention) {
                 finish_archive(work);
                 if (work->dag.task(next_prefetch).state==TaskState::pending) next_layer(work);
@@ -1049,6 +1059,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
                                           const std::vector<float> & keys, const std::vector<float> & values, bool packed,
                                           const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * source,
                                           std::optional<std::uint64_t> projection_ns) {
+    const auto consumer_entry=impl_->trace.now();
     const auto current = impl_->work;
     const bool deferred = device && !half;
     if ((half && !device) || (device && (early_enabled() == (serial_query!=nullptr)))) {
@@ -1106,6 +1117,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
             work->dag.complete(append, impl_->trace.now());
         }
     }
+    work->consumer_entry_ns=consumer_entry;
     auto & host = impl_->session.prefetcher();
     if (!deferred) work->history = host.resolve(layer, position, work->selection);
     if (!early_enabled()) {

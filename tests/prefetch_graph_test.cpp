@@ -313,6 +313,8 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     require(stats.frames == 12 && stats.tasks == 144, "microtask frames not fully completed");
     require(stats.attention_layer_span_layers==12 && stats.attention_layer_span_ns>0,
         "attention latency did not cover every replayed layer");
+    require(stats.attention_consumer_span_layers==12 && stats.attention_consumer_span_ns>0,
+        "common KV adapter entry latency did not cover every replayed layer");
     require(mode==solid::ScheduleMode::naive ? stats.block_frames==0 : stats.block_frames==12 && stats.block_tasks>12,
             "historical block DAG not completed through actual copy receipts");
     if (infllm && !native) require(stats.attention_fences == 12 && observer.completions == 0, "InfLLM probability receipts did not complete attention");

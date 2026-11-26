@@ -284,6 +284,14 @@
 
    [device_timing.hpp](../include/solid/device_timing.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[scheduler.cpp](../src/scheduler.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)。
 
+7. **CUDA 调度消融的公共搬运与计时**
+
+   三种调度均保留 KV 交织、融合投影、GPU 评分、提前预取和相邻块合并。`ggml_prefetch.cpp` 为 CUDA `naive` 分配与其余模式相同的页锁定主机槽位，上传仍使用模型队列并等待完成；`overlap` 和 `overlap+sync_reuse` 保留独立复制队列。`device_cache.cpp` 在串行准备路径中也将缺失的历史块交给已有批量上传函数，沿用两端地址同时连续才合并的规则。三组通过调度模式控制提前选块、补读重叠和同步复用。
+
+   `scheduler.hpp`、`ggml_prefetch.cpp` 从各路径进入 `decode_impl` 的共同 KV 适配器入口记录主机时间，到 attention 完成回执为止；`baseline.cpp` 输出 `attention_consumer_span_ms` 和 `attention_consumer_span_layers`。计时复用原有调用与回执，不插入同步，另保留 Q 就绪口径供既有记录使用。`prefetch_graph_test.cpp`、`cuda_device_input_test.cu` 检查连续 12、16 次层调用的覆盖；CUDA 检查另外要求三种模式都有页锁定缓冲及历史批量上传。服务器编译、54 项 CPU 检查、19 项实验脚本检查和 CUDA 数值核验通过，记录位于 `results/server5090/figure17b-scheduler-check/`，原始核验采集为 `results/server5090/infllm-port-check-figure17b.c2lom9JJ/nsys/figure17b-native-schedules.nsys-rep`。
+
+   `cuda-paper.json` 增加 16K、1K 预算的调度套件，使用已有 `prefetch`、`overlap`、`solid` 变体，分别对应 `naive`、`overlap`、`overlap+sync_reuse`。`test_experiments.py` 检查三组配置除 `attention.schedule` 外完全相同。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。

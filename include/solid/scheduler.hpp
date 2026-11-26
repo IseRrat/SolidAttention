@@ -120,5 +120,6 @@ struct ScheduleStats {
     std::uint64_t cache_load_device_block_ns = 0, cache_load_device_block_layers = 0;
     // Host-observed Q frontier to attention completion, including exposed I/O.
     std::uint64_t attention_layer_span_ns = 0, attention_layer_span_layers = 0;
+    std::uint64_t attention_consumer_span_ns = 0, attention_consumer_span_layers = 0;
 };
 } // namespace solid

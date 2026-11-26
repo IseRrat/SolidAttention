@@ -16,6 +16,7 @@
     {"name": "in-memory", "lengths": [1024, 2048, 4096, 8192, 16384, 32768, 65536, 131072], "variants": ["indram", "indram-sparse", "solid"], "blocks": [32], "budgets": [0], "conditions": ["cuda-8g-16g"]},
     {"name": "prefetch", "lengths": [16384], "variants": ["solid-no-prefetch", "solid"], "blocks": [32], "budgets": [1024], "conditions": ["cuda-8g-16g"]},
     {"name": "kv-interleaving", "lengths": [16384], "variants": ["solid-no-interleaved", "solid"], "blocks": [32], "budgets": [1024], "conditions": ["cuda-8g-16g"]},
+    {"name": "ssd-aware-scheduler", "lengths": [16384], "variants": ["prefetch", "overlap", "solid"], "blocks": [32], "budgets": [1024], "conditions": ["cuda-8g-16g"]},
     {"name": "sensitivity", "lengths": [16384], "variants": ["solid"], "blocks": [16, 32, 64, 128], "budgets": [1024, 2048, 3072, 4096], "conditions": ["cuda-8g-16g"]}
   ]
 }

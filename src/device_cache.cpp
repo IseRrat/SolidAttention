@@ -386,6 +386,7 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
     }
     retain(actual);
     std::vector<SlotLease> used;
+    std::vector<SlotLease> batched;
     for (const auto & host:host_leases) {
         if (current && host.identity.block==current_ids.front().block) continue;
         auto device = slots_.find(host.identity);
@@ -393,8 +394,13 @@ std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_lease
             if (device && device->slot==host.identity.head*slots_.slots_per_head()+host.slot%host_.slots_per_head()) ++stats_.reused_blocks;
             device=upload(host);
         } else if (device) ++stats_.reused_blocks;
+        else if (transport_.batches_uploads()) { batched.push_back(host); continue; }
         else device = upload(host);
         used.push_back(*device);
+    }
+    if (!batched.empty()) {
+        upload_batch(batched,{});
+        for (const auto & host:batched) used.push_back(*slots_.find(host.identity));
     }
     for (const auto & id:current_ids) {
         if (const auto ready=slots_.find(id)) { ++stats_.reused_blocks; used.push_back(*ready); }

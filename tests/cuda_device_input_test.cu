@@ -254,9 +254,14 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
         after.ranking.builder_key_upload_bytes==before.ranking.builder_key_upload_bytes,"direct decode re-uploaded Q/K or skipped device inputs");
     if (!infllm) require(after.ranking.builder_rank_shared_waits>0,"CUDA decode did not reuse the block ranking wait");
     const auto schedule=cache->schedule_stats();
+    require(schedule.staging_bytes>0 && schedule.historical_upload_batches>0 && schedule.historical_upload_blocks>0,
+        "CUDA scheduling modes did not retain pinned slots and historical upload batching");
     require(schedule.history_consumer_wait_calls==16,"CUDA decode omitted consumer readiness wait accounting");
     require(schedule.attention_layer_span_layers==16 && schedule.attention_layer_span_ns>0,
         "CUDA replay omitted Q-frontier-to-attention latency samples");
+    require(schedule.attention_consumer_span_layers==16 && schedule.attention_consumer_span_ns>0 &&
+            (mode==solid::ScheduleMode::naive || schedule.attention_consumer_span_ns<=schedule.attention_layer_span_ns),
+        "CUDA replay omitted common KV-adapter-entry attention latency samples");
     if (mode==solid::ScheduleMode::sync_reuse) {
         require(schedule.cache_load_host_block_layers==16 && schedule.cache_load_device_block_layers==16,
             "CUDA graph replay omitted CPU/GPU cache loading blocking measurements");
