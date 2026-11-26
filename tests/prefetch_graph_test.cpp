@@ -232,7 +232,8 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
             }
             require(solid::device_op(kv)==solid::DeviceOp::consolidate_kv,"device KV consolidator missing");
             if (mode!=solid::ScheduleMode::naive) {
-                require(solid::graph_depends_on(kv,operations[layer]->selection_node()),"device KV must depend on early selection");
+                require(!solid::graph_depends_on(kv,operations[layer]->selection_node()) &&
+                    kv->src[3]==operations[layer]->selection_node()->src[0],"device KV must retain GPU Q without uploading the CPU control scalar");
                 require(kv->src[2]==operations[layer]->selection_node()->src[0]->src[0],"Q lifetime dependency is missing");
             } else require(kv->src[2]==kv->src[3]->src[0] && solid::device_op(kv->src[3])==solid::DeviceOp::query_token,
                 "serial KV lacks its GPU query frontier");
@@ -256,6 +257,16 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         require(solid::to_half(-INFINITY) == 0xfc00, "half mask representation");
     }
     ggml_build_forward_expand(graph, outputs[1]);
+    if (direct && mode!=solid::ScheduleMode::naive) for (const auto & node:operations) {
+        const auto * early=node->selection_node();
+        const auto * kv=node->host_node()->src[0]->src[0];
+        int early_index=-1,kv_index=-1;
+        for (int i=0;i<ggml_graph_n_nodes(graph);++i) {
+            if (ggml_graph_node(graph,i)==early) early_index=i;
+            if (ggml_graph_node(graph,i)==kv) kv_index=i;
+        }
+        require(early_index>=0 && kv_index>early_index,"CPU selection frontier must execute before device KV processing");
+    }
     std::unique_ptr<ggml_backend_buffer, decltype(&ggml_backend_buffer_free)> buffer(
         direct ? nullptr : ggml_backend_alloc_ctx_tensors(context.get(), backend.get()), ggml_backend_buffer_free);
     require(direct || buffer != nullptr, "prefetch graph allocation");

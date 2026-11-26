@@ -819,8 +819,10 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
             return source;
         };
         key=vectors(key); value=vectors(value);
-        // The query and early frontier extend Q's allocation through selection.
-        impl_->device_kv = on_device(device_consolidate_kv(context,key,value,impl_->device_query,impl_->early?impl_->early:token));
+        // Early selection is expanded as a CPU graph frontier before visiting
+        // KV. Its scalar value is unused on GPU; retain Q with its GPU token
+        // instead of copying the CPU control result back to the device.
+        impl_->device_kv = on_device(device_consolidate_kv(context,key,value,impl_->device_query,token));
         inputs[0] = impl_->prefetch && impl_->early ? on_device(device_kv_token(context,impl_->device_kv)) : impl_->device_kv;
         if (impl_->timing && impl_->early) bind_device_timing(inputs[0],impl_->timing->kv.get());
         input_count = 1;

@@ -330,6 +330,10 @@
 
    `generate_adapter.py` 在现有后端复制作用域中增加诊断用 NVTX 区间。仅当 `SOLID_SYNC_AUDIT_TRACE=1` 且已开启 Nsight 标记时记录，区间包含张量名、源后端、目标后端和字节数，便于将 CUDA 同步调用对应到具体的跨后端输入复制。标记沿用 `trace::Scope`；复制、预取、同步及缓冲区生命周期沿用原代码。`Adapter.cmake` 为生成的 `ggml-base` 接入已有追踪实现。服务器编译、54 项 CPU 检查及两项覆盖生成器检查通过，记录保存于 `results/server5090/ol-sr-sync-audit-check/compile-and-cpu.log`。
 
+   `35d8f46` 完成 3B、16K、相同 8 步 Decode 的 naive、+OL、+OL+SR 同步归因。每组覆盖 224 次层调用；两条优化路径均比 naive 多出 1120 次流同步，即每层 5 次。其中 Q 就绪标记的 GPU→CPU 复制从每层 4 次同步增为 6 次，`solid_early_selection_device` 的 4 字节 CPU→GPU 控制结果复制额外引入每层 3 次同步。索引、mask 和 attention 回执的复制同步次数三组一致。逐项归因、配置和原始 Nsight 保存于 `results/server5090/ol-sr-sync-audit-35d8f46.zx3r990i/`。
+
+   `llama_adapter.cpp` 将设备 KV 整合节点的就绪依赖改为已有 GPU Q token，保留 Q 的设备内存生命周期。CPU 提前选块节点仍由模型接入层显式展开在 KV 子图之前；其标量结果省去回传 GPU。`prefetch_graph_test.cpp` 核对 GPU KV 节点引用原 Q token、无 CPU 控制值输入，并检查 CPU 选块节点在最终图中排于 KV 整合之前。服务器 54 项 CPU 检查与原生 CUDA 数值核验通过，记录为 `ol-sr-sync-audit-check/control-fix-compile-and-cpu.log`、`control-fix-cuda.log`；原生采集位于 `infllm-port-check-control-fix.4CVOCqOz/nsys/ol-control-fix.nsys-rep`。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。
