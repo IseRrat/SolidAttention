@@ -24,6 +24,8 @@ struct AttentionConfig {
     bool prefetch = false;
     bool prefetch_ahead = true;
     bool coalesce_uploads = true;
+    bool per_completion_uploads = false;
+    bool measure_upload_ready_time = false;
     bool prefetch_trace = false;
     std::string schedule = "naive";
     bool schedule_trace = false;

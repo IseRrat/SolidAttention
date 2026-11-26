@@ -304,9 +304,19 @@
 
    固定 Decode 输入的诊断使用 `replay_token_ids`，评分和选块仍在 GPU 实时执行。`experiments.py` 核对其 `replay_length` 正常结束标记、完整输出长度、实际输入模式及全部 Decode 输入 token；自由生成继续要求 `length` 结束。`test_experiments.py` 检查正常记录、输入不一致和结束标记不一致三种情况，服务器 21 项实验脚本检查通过，记录为 `results/server5090/upload-coalescing-check/fixed-input-audit.log`。
 
-   `f807642` 完成 3B、16K 提示、128 输出位置的两组相邻上传合并诊断。两组固定相同的 127 个 Decode 输入，评分与 Top-K 均在 GPU 实时执行，配置仅合并开关不同；两组各一次，均采集 Nsight，启用原资源限制和 Decode O_DIRECT。合并／逐块的完整 Decode 为 79.82／87.94 ms/步，吞吐为 12.53／11.37 token/s；异步复制 API 的 CPU 累计用时为 6.53／19.70 ms/步，GPU H2D 为 4.95／11.52 ms/步，GPU kernel 为 5.294／5.286 ms/步。两组 H2D 为约 2091／8353 笔/步，平均大小为 64.71／16.22 KiB；Decode 读量为 15.654／15.655 GiB，上传量为 15.836／15.853 GiB。逐块组历史上传范围数与块数完全相同，计时、设备回执和 GPU 评分覆盖全部 3556 次层调用。
+   `f807642` 完成 3B、16K 提示、128 输出位置的两组相邻上传合并诊断。两组固定相同的 127 个 Decode 输入，评分与 Top-K 均在 GPU 实时执行，配置仅合并开关不同；两组各一次，均采集 Nsight，启用原资源限制和 Decode O_DIRECT。合并／同批逐块提交的完整 Decode 为 79.82／87.94 ms/步，吞吐为 12.53／11.37 token/s；异步复制 API 的 CPU 累计用时为 6.53／19.70 ms/步，GPU H2D 为 4.95／11.52 ms/步，GPU kernel 为 5.294／5.286 ms/步。两组 H2D 为约 2091／8353 笔/步，平均大小为 64.71／16.22 KiB；Decode 读量为 15.654／15.655 GiB，上传量为 15.836／15.853 GiB。逐块组历史上传范围数与块数完全相同，计时、设备回执和 GPU 评分覆盖全部 3556 次层调用。
 
    两组原始结果、固定输入及来源哈希、资源记录、Nsight 文件、耗时对照图，以及输入位置 16410 的完整 Decode 和前 4 ms 实际时间线保存在 `results/server5090/upload-coalescing-3b-16k-f807642.8jdiwgje/`。报告分别列出统一入口区间、完整 Decode、实际复制活动和无计算/复制活动区间；CPU 复制调用用时按各线程累计，GPU 复制与计算用时分别求并集。图表分析代码随结果保存。
+
+9. **按 SSD 完成逐块上传的诊断路径**
+
+   `attention.per_completion_uploads` 默认关闭。开启后，`io_worker.cpp` 在发布每条原始 I/O 完成结果后立即发送通知，再继续收取下一条结果。`prefetch.cpp` 在一个完整 KV 块的所有读取分段完成后、消费下一条完成结果之前调用上传入口；分离布局等待该块 K、V 两段均完成。正式补读通过块身份和槽位版本定位本次所需数据，上传期间持续持有主机源缓冲。异常路径释放临时引用，并由现有排空逻辑保护仍在进行的读写。
+
+   `ggml_prefetch.cpp` 将上述入口接入正式补读和下一层预测读取。当前 attention 释放显存读者后，`device_cache.cpp` 先整理可复用槽位，将此前已经读好的积压块逐块提交；随后新读好的块直接进入单块上传。每块沿用原页锁定主机槽位、设备槽位选择、独立复制队列和完成票据。`solid-per-completion` 从完整 SolidAttention 配置复制，只开启逐完成上传并关闭相邻块合并；预算、评分、交织、预测及同步复用沿用原配置。`scheduler.hpp` 和结果中的 `schedule.per_completion_uploads` 记录实际派发模式。
+
+   `attention.measure_upload_ready_time` 默认关闭。诊断开启时，`async_reader.hpp` 的完成结果记录 I/O 线程观察到完成回执的单调时钟时间；`prefetch.hpp` 按槽位保存完整块最后一段回执的时间，槽位重新读取时重置。`device_cache.hpp`、`device_cache.cpp` 在实际进入上传器前累计样本数、总等待及最大等待，`baseline.cpp` 写出 `ready_time_measured`、`ready_upload_samples`、`ready_upload_delay_sum_ms`、`ready_upload_delay_max_ms`。该区间包含线程交接、程序处理及显存槽位依赖等待；计时只保存汇总数据。
+
+   `config.hpp`、`config.cpp`、`llama_adapter.cpp`、`ggml_prefetch.hpp` 贯通配置与实际读取器、上传器，逐完成模式要求开启预取、关闭相邻合并并使用重叠调度。`experiments.py` 接入变体，`experiment_common.py` 核对实际派发模式和计时开关。`io_worker_test.cpp` 阻塞第二次完成检查，核对第一次通知已送达；`prefetch_test.cpp` 核对每块在下一条可用回执被消费前开始上传、分离 K/V 完整性及失败清理；`cuda_device_input_test.cu` 对照原生 CUDA 输出，并要求逐块上传的批次数与历史块数一致。配置与变体检查位于 `config_test.cpp`、`test_experiments.py`。服务器编译、54 项 CPU 检查、22 项实验脚本检查及原生 CUDA 数值核验通过，记录保存于 `results/server5090/completion-dispatch-check/`；CUDA 采集为 `results/server5090/infllm-port-check-completion.2H2PnXkQ/nsys/completion-dispatch-native.nsys-rep`。
 
 ## 五、论文系统的工程接入
 

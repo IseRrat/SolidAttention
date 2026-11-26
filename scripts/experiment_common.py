@@ -99,6 +99,10 @@ def audit_run(result_path, source_config=None, source_sha=None):
             if key in configured and actual[key] != configured[key]: raise ValueError("result context budget differs")
         if configured.get("prefetch") and result.get("prefetch", {}).get("ahead_enabled", True) != configured.get("prefetch_ahead", True):
             raise ValueError("result prefetch-ahead setting differs")
+        if configured.get("prefetch") and result.get("prefetch", {}).get("ready_time_measured", False) != configured.get("measure_upload_ready_time", False):
+            raise ValueError("result upload readiness timing differs from configuration")
+        if configured.get("prefetch") and result.get("schedule", {}).get("per_completion_uploads", False) != configured.get("per_completion_uploads", False):
+            raise ValueError("result upload dispatch differs from configuration")
         if configured.get("prefetch") and result.get("schedule", {}).get("coalesce_uploads", True) != configured.get("coalesce_uploads", True):
             raise ValueError("result upload coalescing setting differs")
         expected_io = "direct_decode_reads" if configured.get("direct_decode_reads", False) else "buffered"

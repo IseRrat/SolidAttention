@@ -731,6 +731,7 @@ struct GgmlPrefetch::Impl {
     AttentionSession & session;
     ggml_backend_t backend;
     ScheduleMode mode;
+    const bool per_completion_uploads;
     TaskWorker worker;
     mutable std::mutex mutex;
     ScheduleTrace trace;
@@ -747,12 +748,14 @@ struct GgmlPrefetch::Impl {
     bool quiesced = true;
     std::atomic<std::uint64_t> released_epoch{0};
     Impl(AttentionSession & s, ggml_backend_t backend, const std::filesystem::path & residency, ScheduleMode mode,
-        const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied,bool share_host_cache,bool coalesce_uploads) :
-        session(s), backend(backend), mode(mode), worker(cpu,"sa.coordinator"), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
+        const std::filesystem::path & schedule,int cpu,std::unique_ptr<AttentionEvents> supplied,bool share_host_cache,bool coalesce_uploads,bool per_completion) :
+        session(s), backend(backend), mode(mode), per_completion_uploads(per_completion), worker(cpu,"sa.coordinator"), trace(schedule), block_trace(schedule.empty()?std::filesystem::path{}:
             schedule.parent_path()/(schedule.stem().string()+".blocks"+schedule.extension().string())),
         events(attention_events(s,backend,mode,std::move(supplied))),
         transport(backend, s.geometry(), s.prefetcher().slots_per_head(), mode,events.get(),share_host_cache,coalesce_uploads),
         device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) {
+        if (per_completion && (coalesce_uploads || mode==ScheduleMode::naive)) throw std::invalid_argument("invalid per-completion upload schedule");
+        totals.per_completion_uploads=per_completion;
         estimates.fill(1); totals.coordinator_cpu=cpu; totals.completion_backend=events?events->name():"graph_boundaries";
     }
     std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position,bool direct=false,
@@ -859,9 +862,17 @@ struct GgmlPrefetch::Impl {
                 if (work->dag.task(next_prefetch).state==TaskState::pending) next_layer(work);
             }
             if (work->dag.finished()) finish_frame(work);
-            session.prefetcher().poll();
-            observe_stores();
-            device.prefetch_ready(before_upload);
+            if (per_completion_uploads) {
+                device.prefetch_ready(before_upload,true);
+                session.prefetcher().poll(false,[&](const SlotLease & lease) {
+                    device.stage_ready_batch({lease},{},before_upload);
+                });
+                observe_stores();
+            } else {
+                session.prefetcher().poll();
+                observe_stores();
+                device.prefetch_ready(before_upload);
+            }
             if (work->archive_at_attention) {
                 start_store(work);
                 if (work->dag.finished()) finish_frame(work);
@@ -882,7 +893,9 @@ struct GgmlPrefetch::Impl {
             // arriving after these checks leaves a counter for the next wait.
             events->acknowledge();
             if (current->archive_at_attention && !released) device.reap_transfers();
-            host.poll(); observe_stores();
+            const Prefetcher::ReadyBlock upload_ready=per_completion_uploads && released ?
+                Prefetcher::ReadyBlock{[&](const SlotLease & lease) { device.stage_ready_batch({lease},{},before_upload); }} : Prefetcher::ReadyBlock{};
+            host.poll(false,upload_ready); observe_stores();
             if (!released) if (const auto receipt=events->poll(current->layer,epoch)) {
                 const char * proof;
                 if (receipt->proof==AttentionProof::device_signal) {
@@ -903,10 +916,10 @@ struct GgmlPrefetch::Impl {
                 // reaches the CPU. Remaining predicted SSD jobs stay queued.
                 if (events->handoff_seen(epoch)) return;
                 if ((host.pending_reads() || host.pending_stores()) && host.completion_handle()<0) {
-                    host.poll(true);
+                    host.poll(true,upload_ready);
                     observe_stores();
                 }
-                device.prefetch_ready(before_upload);
+                if (!per_completion_uploads) device.prefetch_ready(before_upload);
                 if (!host.pending_reads() && !host.pending_stores()) {
                     device.reap_transfers();
                     return;
@@ -925,8 +938,8 @@ struct GgmlPrefetch::Impl {
     }
 };
 GgmlPrefetch::GgmlPrefetch(AttentionSession & session, ggml_backend_t backend, const std::filesystem::path & trace,
-                          ScheduleMode mode, const std::filesystem::path & schedule_trace,int cpu,std::unique_ptr<AttentionEvents> events,bool share_host_cache,bool coalesce_uploads) :
-    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace,cpu,std::move(events),share_host_cache,coalesce_uploads)) {}
+                          ScheduleMode mode, const std::filesystem::path & schedule_trace,int cpu,std::unique_ptr<AttentionEvents> events,bool share_host_cache,bool coalesce_uploads,bool per_completion_uploads) :
+    impl_(std::make_unique<Impl>(session, backend, trace, mode, schedule_trace,cpu,std::move(events),share_host_cache,coalesce_uploads,per_completion_uploads)) {}
 GgmlPrefetch::~GgmlPrefetch() { if (!impl_->quiesced) { try { quiesce(); } catch (...) {} } }
 ggml_tensor * GgmlPrefetch::tensor() const { return impl_->transport.tensor(); }
 std::uint32_t GgmlPrefetch::tokens_per_head() const { return impl_->device.tokens_per_head(); }
@@ -1024,7 +1037,10 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
         auto leases = host.resolve_history(work->layer, work->position, work->selection,
             [&](const std::vector<BlockIdentity> & plan) { impl_->device.begin_stage(plan,
                 work->direct?std::optional<CurrentBlock>{CurrentBlock{work->layer,work->position}}:std::optional<CurrentBlock>{}); },
-            {},[&](const std::vector<BlockWork> & plan) {
+            impl_->per_completion_uploads ? Prefetcher::ReadyBlock{[&](const SlotLease & lease) {
+                if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
+                impl_->device.stage_ready_batch({lease},work->blocks);
+            }} : Prefetcher::ReadyBlock{},[&](const std::vector<BlockWork> & plan) {
                 auto blocks=plan;
                 const auto ready=host.ready();
                 for (auto & block:blocks) {
@@ -1033,10 +1049,10 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
                 }
                 work->blocks=std::make_shared<BlockStage>(std::move(blocks),&impl_->block_trace,impl_->sequence,work->layer,work->position,impl_->mode);
                 return work->blocks;
-            }, work->deferred_archive,[&](const std::vector<SlotLease> & ready) {
+            }, work->deferred_archive,impl_->per_completion_uploads ? Prefetcher::ReadyBatch{} : Prefetcher::ReadyBatch{[&](const std::vector<SlotLease> & ready) {
                 if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
                 impl_->device.stage_ready_batch(ready,work->blocks);
-            }, admit_before_stage);
+            }}, admit_before_stage,impl_->per_completion_uploads);
         if (work->deferred_archive) work->history = std::move(leases);
         else for (const auto & lease : leases) host.unpin(lease);
         work->dag.complete(miss_read, impl_->trace.now());

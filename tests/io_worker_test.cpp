@@ -25,6 +25,7 @@ struct Control {
     std::condition_variable cv;
     int event=-1;
     bool block_submit=false,entered=false,allow_submit=false,allow_completion=false,poll_error=false;
+    bool block_second_poll=false,second_poll_entered=false,allow_second_poll=false;
     int cancellations=0;
     std::size_t engine_capacity=2;
     std::thread::id owner;
@@ -35,7 +36,7 @@ struct Control {
         if (event>=0) { std::uint64_t n=1; require(write(event,&n,sizeof(n))==static_cast<ssize_t>(sizeof(n)),"test completion signal"); }
     }
     void release() {
-        { std::lock_guard<std::mutex> lock(mutex); allow_submit=true; allow_completion=true; }
+        { std::lock_guard<std::mutex> lock(mutex); allow_submit=true; allow_completion=true; allow_second_poll=true; }
         cv.notify_all(); signal();
     }
     bool wait(const std::function<bool()> & predicate) {
@@ -82,7 +83,11 @@ public:
     void flush() override { owned(); }
     bool poll(solid::ReadCompletion & result,bool wait) override {
         owned(); require(!wait,"I/O worker blocked inside engine poll instead of readiness wait");
-        { std::lock_guard<std::mutex> lock(control->mutex);
+        { std::unique_lock<std::mutex> lock(control->mutex);
+          if (control->block_second_poll && counters.completed_reads==1) {
+              control->second_poll_entered=true; control->cv.notify_all();
+              control->cv.wait(lock,[&] { return control->allow_second_poll; });
+          }
           if (control->poll_error) throw std::runtime_error("synthetic poll failure");
           if (!control->allow_completion) return false; }
         if (requests.empty()) return false;
@@ -107,6 +112,24 @@ public:
 };
 std::unique_ptr<solid::AsyncReader> worker(const std::shared_ptr<Control> & control,int cpu=-1) {
     return solid::make_io_worker([control] { return std::make_unique<Reader>(control); },2,cpu);
+}
+void completion_notification(bool immediate) {
+    auto control=std::make_shared<Control>(); control->block_second_poll=true;
+    auto io=solid::make_io_worker([control] { return std::make_unique<Reader>(control); },2,-1,immediate,immediate);
+    Release release{control}; std::array<unsigned char,8> a{},b{};
+    require(io->submit(1,0,a.data(),a.size(),0) && io->submit(2,0,b.data(),b.size(),0),"notification reads rejected");
+    require(control->wait([&] { return control->submissions.size()==2; }),"notification reads not submitted");
+    { std::lock_guard<std::mutex> lock(control->mutex); control->allow_completion=true; }
+    control->signal();
+    require(control->wait([&] { return control->second_poll_entered; }),"completion drain did not reach its gate");
+    pollfd fd{io->completion_handle(),POLLIN,0};
+    const auto notified=::poll(&fd,1,immediate?1000:50);
+    require((notified>0)==immediate,"per-CQE notification waited for the completion drain");
+    solid::ReadCompletion result{};
+    require(io->poll(result,false) && result.id==1 && a[0]==1 && b[0]==0,"notification did not publish completed data");
+    require((result.observed_ns>0)==immediate,"optional completion timing was ignored");
+    control->release();
+    require(io->poll(result,true) && result.id==2 && b[0]==2,"second notification lost");
 }
 void cancellation_and_drain() {
     auto control=std::make_shared<Control>(); control->block_submit=true;
@@ -223,7 +246,7 @@ void placement() {
 } // namespace
 int main() {
 #ifdef __linux__
-    try { cancellation_and_drain(); backlog_progress(); priority_progress(); scheduled_progress(false); scheduled_progress(true); failures(); placement(); std::cout<<"I/O ownership, cancellation, drain and placement passed\n"; return 0; }
+    try { completion_notification(false); completion_notification(true); cancellation_and_drain(); backlog_progress(); priority_progress(); scheduled_progress(false); scheduled_progress(true); failures(); placement(); std::cout<<"I/O ownership, cancellation, drain and placement passed\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 #else
     std::cout<<"Linux I/O worker checks\n"; return 77;

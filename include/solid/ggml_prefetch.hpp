@@ -11,7 +11,7 @@ class GgmlPrefetch {
 public:
     GgmlPrefetch(AttentionSession & session, ggml_backend * backend, const std::filesystem::path & trace = {},
                  ScheduleMode mode = ScheduleMode::naive, const std::filesystem::path & schedule_trace = {},int coordinator_cpu=-1,
-                 std::unique_ptr<AttentionEvents> events = {},bool share_host_cache = false,bool coalesce_uploads = true);
+                 std::unique_ptr<AttentionEvents> events = {},bool share_host_cache = false,bool coalesce_uploads = true,bool per_completion_uploads = false);
     ~GgmlPrefetch();
     ggml_tensor * tensor() const;
     std::uint32_t tokens_per_head() const;

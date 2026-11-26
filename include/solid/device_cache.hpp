@@ -58,6 +58,7 @@ struct DeviceCacheStats {
     std::uint64_t shared_resident_bytes = 0, shared_host_copy_bytes = 0;
     std::uint64_t current_device_rows=0,current_device_bytes=0,current_host_bytes=0;
     std::uint64_t refreshed_tails=0,retained_prefix_bytes=0;
+    std::uint64_t ready_upload_samples=0,ready_upload_delay_ns=0,ready_upload_delay_max_ns=0;
 };
 class DeviceCache {
 public:
@@ -66,14 +67,16 @@ public:
     ~DeviceCache();
     // before_upload runs immediately before a new transfer starts, not after its
     // enqueue returns; the graph boundary may arrive during that enqueue.
-    void prefetch_ready(const std::function<void()> & before_upload = {});
+    void prefetch_ready(const std::function<void()> & before_upload = {},bool individual=false);
     void reap_transfers();
     void wait_transfers();
     void wait_transfers_coalesced();
     void stage(const std::vector<SlotLease> & host_leases);
     void begin_stage(const std::vector<BlockIdentity> & identities,std::optional<CurrentBlock> current = {});
-    void stage_ready(const SlotLease & host_lease,const std::shared_ptr<BlockStage> & stage = {});
-    void stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage);
+    void stage_ready(const SlotLease & host_lease,const std::shared_ptr<BlockStage> & stage = {},
+                     const std::function<void()> & before_upload = {});
+    void stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage,
+                           const std::function<void()> & before_upload = {});
     std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
                               bool deferred_upload = false,const CurrentDeviceKv * current = nullptr,
                               bool keep_history_in_flight = false,std::uint32_t local_window = 0);
@@ -110,6 +113,7 @@ private:
     std::uint64_t epoch_ = 0;
     void poll_transfers(bool wait,std::optional<std::uint64_t> through = {});
     void retain(const std::vector<BlockIdentity> & identities);
+    void observe_upload_delay(const SlotLease & host,std::uint64_t & entry_ns);
     SlotLease upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage = {},
                      const std::function<void()> & before_upload = {});
     void upload_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage,

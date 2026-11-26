@@ -267,6 +267,34 @@ void streaming(bool fail_upload) {
     }
     cache.finish(); host.finish();
 }
+void completion_delivery(solid::KvLayout layout,bool fail_upload) {
+    const solid::KvGeometry g{1,1,2,1,16,64,layout};
+    auto file=std::make_unique<File>(); auto reader=std::make_unique<Reader>(file.get(),8);
+    auto * observe=reader.get(); reader->auto_complete=true; reader->reverse=false;
+    solid::FileKvStore store(g,std::move(file),8); fill(store,6);
+    solid::Prefetcher host(store,{4,1,1,1},4,std::move(reader),{},false);
+    Transport transport; transport.batch_uploads=true;
+    solid::DeviceCache cache(host,g,2,transport); host.begin(0,6);
+    std::size_t callbacks=0;
+    const auto resolve=[&] { return host.resolve_history(0,6,{{{0,1,2,6},{}}},
+        [&](const std::vector<solid::BlockIdentity> & plan) { cache.begin_stage(plan); },
+        [&](const solid::SlotLease & lease) {
+            ++callbacks;
+            const auto segments=layout==solid::KvLayout::separate?2u:1u;
+            require(observe->counters.completed_reads==callbacks*segments,"upload deferred until other ready CQEs were drained");
+            transport.fail_upload=fail_upload && callbacks==2;
+            cache.stage_ready_batch({lease},{});
+        },{},false,{},false,true); };
+    if (fail_upload) rejects([&] { (void) resolve(); });
+    else {
+        const auto leases=resolve();
+        require(callbacks==3 && transport.copies.size()==3,"per-completion uploads were combined or lost");
+        for (const auto & lease:leases) host.unpin(lease);
+        cache.wait_transfers();
+        for (const auto & lease:leases) require(transport.memory.at(cache.find(lease.identity)->slot)==host.block(lease).data,"completion upload source lifetime");
+    }
+    cache.finish(); host.finish();
+}
 void shared_prediction_admission(std::uint32_t slots) {
     const solid::KvGeometry g{2,1,2,2,16,64,solid::KvLayout::interleaved};
     const auto elements=static_cast<std::size_t>(g.block_tokens)*2*g.dimension;
@@ -315,6 +343,7 @@ int main() {
         read_error(solid::KvLayout::separate); capacity(); on_demand_only(); device(); deferred_device(); batched_device();
         for (const auto layout:{solid::KvLayout::separate,solid::KvLayout::interleaved}) for (const auto capacity:{1u,64u}) selected_first(layout,capacity);
         streaming(false); streaming(true);
+        for (const auto layout:{solid::KvLayout::separate,solid::KvLayout::interleaved}) { completion_delivery(layout,false); completion_delivery(layout,true); }
         shared_prediction_admission(3); shared_prediction_admission(4);
         std::cout << "prefetch, correction, cancellation races, versions, host/device leases and stable slots passed\n";
         return 0;

@@ -77,9 +77,10 @@ public:
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
                                          const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {},
-                                         bool keep_tail = false, const ReadyBatch & batch = {}, bool admit_before_stage = false);
+                                         bool keep_tail = false, const ReadyBatch & batch = {}, bool admit_before_stage = false, bool per_completion = false);
     void remember_selection(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
-    void poll(bool wait = false);
+    void poll(bool wait = false, const ReadyBlock & ready = {});
+    std::uint64_t read_observed_ns(const SlotLease & lease) const;
     const KvBlock & block(const SlotLease & lease) const;
     void pin(const SlotLease & lease) { slots_.pin(lease); }
     void unpin(const SlotLease & lease) { slots_.unpin(lease); }
@@ -112,6 +113,7 @@ private:
     SlotTable slots_;
     std::vector<KvBlock> blocks_;
     std::vector<std::size_t> pending_;
+    std::vector<std::uint64_t> read_observed_ns_; // Allocated only when timing is enabled.
     std::vector<ReadStage> stages_;
     std::vector<ReadDispatch> upload_order_;
     std::vector<std::vector<std::vector<std::uint64_t>>> history_;
@@ -150,6 +152,6 @@ private:
     std::vector<SlotLease> resolve_impl(std::uint32_t layer, std::uint64_t position,
                                        const std::vector<HeadSelection> & actual, bool historical,
                                        const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {},
-                                       const ReadyBatch & batch = {}, bool admit_before_stage = false);
+                                       const ReadyBatch & batch = {}, bool admit_before_stage = false, bool per_completion = false);
 };
 } // namespace solid

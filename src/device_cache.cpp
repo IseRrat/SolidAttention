@@ -105,6 +105,17 @@ void DeviceCache::retain(const std::vector<BlockIdentity> & identities) {
         ++stats_.overwritten_blocks;
     }
 }
+void DeviceCache::observe_upload_delay(const SlotLease & host,std::uint64_t & entry_ns) {
+    const auto observed=host_.read_observed_ns(host);
+    if (!observed) return;
+    if (!entry_ns) entry_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count();
+    if (entry_ns<observed) throw std::logic_error("upload precedes read observation");
+    const auto delay=entry_ns-observed;
+    ++stats_.ready_upload_samples;
+    stats_.ready_upload_delay_ns+=delay;
+    stats_.ready_upload_delay_max_ns=std::max(stats_.ready_upload_delay_max_ns,delay);
+}
 SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage,const std::function<void()> & before_upload) {
     auto existing = slots_.find(host.identity);
     const auto shared_index=host.identity.head*slots_.slots_per_head()+host.slot%host_.slots_per_head();
@@ -140,6 +151,7 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
         if (stage) stage->copy_started(host.identity);
         if (before_upload) before_upload();
         auto phase = upload_phase(host.identity.layer, !stage);
+        std::uint64_t entry_ns=0; observe_upload_delay(host,entry_ns);
         ticket = transport_.upload(device->slot, block);
         transfers_.push_back({ticket, {{host,*device}},stage,std::move(phase)});
         ++stats_.uploads;
@@ -193,6 +205,8 @@ void DeviceCache::upload_batch(const std::vector<SlotLease> & leases,const std::
         if (copies.empty()) return;
         if (before_upload) before_upload();
         transfer.phase = upload_phase(transfer.slots.front().device.identity.layer, !stage);
+        std::uint64_t entry_ns=0;
+        for (const auto & slot:transfer.slots) if (slot.host) observe_upload_delay(*slot.host,entry_ns);
         transfer.ticket=transport_.upload_batch(copies);
         for (const auto & slot : transfer.slots) event("upload",slot.device);
         transfers_.push_back(std::move(transfer));
@@ -258,7 +272,7 @@ SlotLease DeviceCache::upload_current(const BlockIdentity & identity,const std::
     }
     return *device;
 }
-void DeviceCache::prefetch_ready(const std::function<void()> & before_upload) {
+void DeviceCache::prefetch_ready(const std::function<void()> & before_upload,bool individual) {
     if (!attention_.empty()) throw std::logic_error("prefetch upload while device attention still owns slots");
     poll_transfers(false);
     const auto ready = host_.ready();
@@ -268,7 +282,9 @@ void DeviceCache::prefetch_ready(const std::function<void()> & before_upload) {
     for (const auto & transfer : transfers_) for (const auto & slot : transfer.slots) identities.push_back(slot.device.identity);
     retain(identities);
     if (transport_.batches_uploads()) {
-        upload_batch(ready,{},before_upload);
+        if (individual) {
+            for (const auto & lease:ready) upload_batch({lease},{},before_upload);
+        } else upload_batch(ready,{},before_upload);
         return;
     }
     for (const auto & lease : ready) {
@@ -308,7 +324,7 @@ void DeviceCache::begin_stage(const std::vector<BlockIdentity> & identities,std:
     }
     retain(keep);
 }
-void DeviceCache::stage_ready(const SlotLease & lease,const std::shared_ptr<BlockStage> & stage) {
+void DeviceCache::stage_ready(const SlotLease & lease,const std::shared_ptr<BlockStage> & stage,const std::function<void()> & before_upload) {
     if (!attention_.empty()) throw std::logic_error("streamed upload while attention owns slots");
     poll_transfers(false);
     const auto existing=slots_.find(lease.identity);
@@ -317,16 +333,16 @@ void DeviceCache::stage_ready(const SlotLease & lease,const std::shared_ptr<Bloc
         if (stage) { stage->copy_started(lease.identity); stage->copy_complete(lease.identity,"device_resident"); }
         return;
     }
-    (void) upload(lease,stage);
+    (void) upload(lease,stage,before_upload);
 }
-void DeviceCache::stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage) {
+void DeviceCache::stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage,const std::function<void()> & before_upload) {
     if (!transport_.batches_uploads()) {
-        for (const auto & lease : leases) stage_ready(lease,stage);
+        for (const auto & lease : leases) stage_ready(lease,stage,before_upload);
         return;
     }
     if (!attention_.empty()) throw std::logic_error("batched upload while attention owns slots");
     poll_transfers(false);
-    upload_batch(leases,stage);
+    upload_batch(leases,stage,before_upload);
 }
 std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
                                        bool deferred_upload,const CurrentDeviceKv * current,bool keep_history_in_flight,

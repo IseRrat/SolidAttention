@@ -246,6 +246,7 @@ void Prefetcher::issue(const SlotLease & lease, std::uint32_t prefix, ReadDispat
     const auto segments = store_.plan_read(id.layer, id.head, id.block, blocks_[lease.slot], prefix);
     if (blocks_[lease.slot].version != id.version) throw std::logic_error("read plan version changed before submission");
     pending_[lease.slot] = segments.size();
+    if (!read_observed_ns_.empty()) read_observed_ns_[lease.slot]=0;
     for (const auto & segment : segments) queued_.push_back({lease, segment, dispatch, phase ? phase : read_phase_});
     if (segments.empty()) { slots_.complete(lease); read_complete(lease,"host_forwarded"); event("ready", lease); }
     if (dispatch_now) pump();
@@ -326,7 +327,7 @@ void Prefetcher::retire(const SlotLease & lease) {
     if (pending_[lease.slot] == 0) slots_.complete(lease);
     reader_->flush();
 }
-void Prefetcher::poll(bool wait) {
+void Prefetcher::poll(bool wait,const ReadyBlock & ready) {
     const auto start = std::chrono::steady_clock::now();
     reader_->acknowledge_notifications();
     pump();
@@ -344,6 +345,11 @@ void Prefetcher::poll(bool wait) {
         if (!retiring) completion.result=job.read.finish(completion.result);
         if (pending_[job.lease.slot] == 0) throw std::logic_error("duplicate read completion");
         --pending_[job.lease.slot];
+        if (completion.observed_ns && !retiring) {
+            if (read_observed_ns_.empty()) read_observed_ns_.resize(blocks_.size());
+            auto & observed=read_observed_ns_[job.lease.slot];
+            observed=std::max(observed,completion.observed_ns);
+        }
         if (!retiring && (completion.result < 0 || static_cast<std::uint64_t>(completion.result) != job.segment.bytes)) {
             slots_.retire(job.lease);
             if (pending_[job.lease.slot] == 0) slots_.complete(job.lease);
@@ -357,6 +363,13 @@ void Prefetcher::poll(bool wait) {
             slots_.complete(job.lease);
             if (!retiring) read_complete(job.lease,"original_read_complete");
             event(retiring ? "retired" : "ready", job.lease);
+            // A complete KV block can start H2D before another queued CQE is
+            // consumed. A split K/V block is delivered only after both segments.
+            if (!retiring && ready) {
+                slots_.pin(job.lease);
+                try { ready(job.lease); } catch (...) { slots_.unpin(job.lease); throw; }
+                slots_.unpin(job.lease);
+            }
         }
         pump();
     }
@@ -432,7 +445,7 @@ std::vector<SlotLease> Prefetcher::resolve(std::uint32_t layer, std::uint64_t po
 }
 std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
                                                 const StagePlan & plan, const ReadyBlock & ready, const StageFactory & factory,
-                                                bool keep_tail, const ReadyBatch & batch, bool admit_before_stage) {
+                                                bool keep_tail, const ReadyBatch & batch, bool admit_before_stage, bool per_completion) {
     auto past = actual;
     for (auto & head : past) {
         if (!head.positions.empty() && head.positions.back() == position) head.positions.pop_back();
@@ -440,15 +453,16 @@ std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uin
             head.positions.push_back(position-1);
         }
     }
-    return resolve_impl(layer, position, past, true, plan, ready, factory, batch, admit_before_stage);
+    return resolve_impl(layer, position, past, true, plan, ready, factory, batch, admit_before_stage, per_completion);
 }
 std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64_t position,
                                             const std::vector<HeadSelection> & actual, bool historical,
                                             const StagePlan & plan, const ReadyBlock & ready,const StageFactory & factory,
-                                            const ReadyBatch & batch, bool admit_before_stage) {
+                                            const ReadyBatch & batch, bool admit_before_stage, bool per_completion) {
     const auto start = std::chrono::steady_clock::now();
     check();
     const auto & g = store_.geometry();
+    if (per_completion && (!ready || batch)) throw std::invalid_argument("per-completion resolve requires an individual ready callback");
     const auto available = position + (historical ? 0 : 1);
     if (layer_ != layer || position_ != position || actual.size() != g.heads || store_.length(layer) != available) {
         throw std::invalid_argument("prefetch resolve identity mismatch");
@@ -570,10 +584,27 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
     }
     std::vector<bool> delivered(result.size(),false);
     std::map<BlockIdentity,std::size_t> result_indices;
-    if (stage) for (std::size_t i=0;i<result.size();++i) result_indices.emplace(result[i].identity,i);
+    if (stage || per_completion) for (std::size_t i=0;i<result.size();++i) result_indices.emplace(result[i].identity,i);
     std::size_t remaining=result.size();
     std::vector<SlotLease> ready_wave;
     if (batch) ready_wave.reserve(remaining);
+    const auto deliver=[&](std::size_t i) {
+        if (delivered[i]) return;
+        if (batch) ready_wave.push_back(result[i]);
+        if (ready) {
+            slots_.pin(result[i]);
+            try { ready(result[i]); } catch (...) { slots_.unpin(result[i]); throw; }
+            slots_.unpin(result[i]);
+        }
+        delivered[i]=true; --remaining;
+    };
+    const ReadyBlock on_completion=per_completion ? ReadyBlock{[&](const SlotLease & lease) {
+        const auto found=result_indices.find(lease.identity);
+        if (found!=result_indices.end()) {
+            if (!(result[found->second]==lease)) throw std::logic_error("completed block lease changed during resolve");
+            deliver(found->second);
+        }
+    }} : ReadyBlock{};
     while (remaining) {
         std::vector<std::size_t> candidates;
         if (stage) {
@@ -584,19 +615,13 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
             }
         } else for (std::size_t i=0;i<result.size();++i) candidates.push_back(i);
         for (const auto i:candidates) if (!delivered[i] && slots_.entry(result[i].slot).state!=SlotState::loading) {
-            if (batch) ready_wave.push_back(result[i]);
-            if (ready) {
-                slots_.pin(result[i]);
-                try { ready(result[i]); } catch (...) { slots_.unpin(result[i]); throw; }
-                slots_.unpin(result[i]);
-            }
-            delivered[i]=true; --remaining;
+            deliver(i);
         }
         if (!ready_wave.empty()) {
             batch(ready_wave);
             ready_wave.clear();
         }
-        if (remaining) poll(true);
+        if (remaining) poll(true,on_completion);
     }
     if (!historical) remember_selection(layer,position,actual);
     for (const auto & lease : result) slots_.pin(lease);
@@ -616,6 +641,10 @@ void Prefetcher::remember_selection(std::uint32_t layer,std::uint64_t position,c
         }
     }
     ++stats_.formal_resolutions;
+}
+std::uint64_t Prefetcher::read_observed_ns(const SlotLease & lease) const {
+    if (!slots_.matches(lease)) throw std::logic_error("read timing for stale slot");
+    return read_observed_ns_.empty()?0:read_observed_ns_.at(lease.slot);
 }
 const KvBlock & Prefetcher::block(const SlotLease & lease) const {
     if (!slots_.matches(lease) || (slots_.entry(lease.slot).state != SlotState::ready && slots_.entry(lease.slot).state != SlotState::pinned)) {

@@ -84,6 +84,15 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(off["attention"]["layout"],"interleaved")
         self.assertEqual(off["attention"]["schedule"],"overlap+sync_reuse")
 
+    def test_per_completion_ablation_changes_only_dispatch_and_merging(self):
+        template={"attention":{"infllm_attention":True,"selection_backend":"cuda","direct_decode_reads":True}}
+        on=experiments.variant_config(template,"solid",32,1024)
+        immediate=experiments.variant_config(template,"solid-per-completion",32,1024)
+        self.assertTrue(on["attention"].pop("coalesce_uploads"))
+        self.assertFalse(immediate["attention"].pop("coalesce_uploads"))
+        self.assertTrue(immediate["attention"].pop("per_completion_uploads"))
+        self.assertEqual(on,immediate)
+
     def test_scheduler_ablation_changes_only_schedule(self):
         template={"attention":{"infllm_attention":True,"selection_backend":"cuda","direct_decode_reads":True}}
         configs=[]

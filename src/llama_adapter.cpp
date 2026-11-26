@@ -1121,6 +1121,7 @@ struct AttentionAdapter::Impl {
     std::filesystem::path schedule_trace;
     ScheduleMode schedule = ScheduleMode::naive;
     bool coalesce_uploads = true;
+    bool per_completion_uploads = false;
     ggml_backend_t prefetch_backend = nullptr;
     std::unique_ptr<GgmlPrefetch> device;
     std::string selection_backend;
@@ -1217,12 +1218,13 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     if (options.prefetch && admission>16384) throw std::invalid_argument("prefetch worker admission exceeds 16384 requests");
     impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens,
         options.selection_trace ? trace : std::filesystem::path{},
-        options.selection_replay, options.prefetch ? make_threaded_uring_reader(options.prefetch_queue_depth,impl_->placement->io_cpu(),static_cast<std::uint32_t>(admission)) : nullptr,
+        options.selection_replay, options.prefetch ? make_threaded_uring_reader(options.prefetch_queue_depth,impl_->placement->io_cpu(),static_cast<std::uint32_t>(admission),options.per_completion_uploads,options.measure_upload_ready_time) : nullptr,
         options.prefetch_slots_per_head, options.prefetch_trace ? trace.parent_path() / "prefetch.jsonl" : std::filesystem::path{}, rope,
         options.prefetch_ahead);
     if (options.prefetch_trace) impl_->residency_trace = trace.parent_path() / "residency.jsonl";
     impl_->schedule = parse_schedule_mode(options.schedule);
     impl_->coalesce_uploads = options.coalesce_uploads;
+    impl_->per_completion_uploads = options.per_completion_uploads;
     if (options.schedule_trace) impl_->schedule_trace = trace.parent_path() / "schedule.jsonl";
     std::lock_guard<std::mutex> lock(registry_mutex);
     if (!registry.emplace(model, this).second) throw std::invalid_argument("one attention session per model is supported");
@@ -1321,7 +1323,7 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
         if (!backend) throw std::logic_error("prefetch decode backend is required");
         if (!impl_->device) {
             impl_->device = std::make_unique<GgmlPrefetch>(*impl_->session, backend, impl_->residency_trace, impl_->schedule, impl_->schedule_trace,
-                impl_->placement->coordinator_cpu(),nullptr,false,impl_->coalesce_uploads);
+                impl_->placement->coordinator_cpu(),nullptr,false,impl_->coalesce_uploads,impl_->per_completion_uploads);
             impl_->prefetch_backend = backend;
         } else if (impl_->prefetch_backend != backend) throw std::logic_error("prefetch decode backend changed");
     }
