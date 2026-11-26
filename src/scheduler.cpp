@@ -70,24 +70,28 @@ void ScheduleTrace::flush() {
     if (stream_.is_open()) { stream_.flush(); if (!stream_) throw std::runtime_error("schedule trace flush failed"); }
 }
 TaskDag::TaskDag(std::vector<TaskSpec> specs, ScheduleTrace * trace, std::uint64_t frame, std::uint32_t layer,
-                 std::uint64_t position, ScheduleMode mode) : trace_(trace), frame_(frame), layer_(layer), position_(position) {
+                 std::uint64_t position, ScheduleMode mode) : trace_(trace && trace->enabled() ? trace : nullptr), frame_(frame), layer_(layer), position_(position) {
     if (specs.empty() || specs.size() > UINT32_MAX) throw std::invalid_argument("invalid DAG size");
+    tasks_.reserve(specs.size());
+    order_.reserve(specs.size());
     for (auto & spec : specs) tasks_.push_back({std::move(spec)});
     if (solid::trace::enabled() && std::any_of(tasks_.begin(), tasks_.end(), [](const auto & t) {
         return t.spec.name == "kv_d2h_ready";
     })) ranges_.resize(tasks_.size());
     std::vector<std::size_t> indegree(tasks_.size());
     std::vector<std::vector<std::uint32_t>> successors(tasks_.size());
+    std::vector<std::uint32_t> seen(tasks_.size(), UINT32_MAX);
     for (std::uint32_t id = 0; id < tasks_.size(); ++id) {
-        std::set<std::uint32_t> unique;
         const auto & spec = tasks_[id].spec;
         if (spec.name.empty() || !spec.estimate_ns) throw std::invalid_argument("invalid task specification");
         for (const auto before : spec.predecessors) {
-            if (before >= tasks_.size() || before == id || !unique.insert(before).second) throw std::invalid_argument("invalid DAG edge");
+            if (before >= tasks_.size() || before == id || seen[before] == id) throw std::invalid_argument("invalid DAG edge");
+            seen[before] = id;
             successors[before].push_back(id); ++indegree[id];
         }
     }
     std::vector<std::uint32_t> queue;
+    queue.reserve(tasks_.size());
     for (std::uint32_t id = 0; id < tasks_.size(); ++id) if (!indegree[id]) queue.push_back(id);
     for (std::size_t i = 0; i < queue.size(); ++i) {
         const auto id = queue[i]; order_.push_back(id);
@@ -184,6 +188,11 @@ void TaskDag::abort(std::uint64_t now) {
     }
 }
 TaskRecord TaskDag::task(std::uint32_t id) const { std::lock_guard<std::recursive_mutex> lock(mutex_); return tasks_.at(id); }
+TaskSnapshot TaskDag::snapshot(std::uint32_t id) const {
+    std::lock_guard<std::recursive_mutex> lock(mutex_);
+    const auto & task = tasks_.at(id);
+    return {task.state,task.start_ns,task.end_ns,task.latest_start,task.critical,task.device_ns};
+}
 bool TaskDag::finished() const {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     return std::all_of(tasks_.begin(), tasks_.end(), [](const auto & task) { return task.state == TaskState::complete; });

@@ -41,11 +41,20 @@ struct TaskRecord {
     std::optional<std::uint64_t> device_ns{};
     std::uint64_t duration_ns() const { return device_ns.value_or(end_ns-start_ns); }
 };
+// Scheduling queries do not need to copy the name or predecessor storage.
+struct TaskSnapshot {
+    TaskState state;
+    std::uint64_t start_ns, end_ns, latest_start;
+    bool critical;
+    std::optional<std::uint64_t> device_ns;
+    std::uint64_t duration_ns() const { return device_ns.value_or(end_ns-start_ns); }
+};
 class ScheduleTrace {
 public:
     explicit ScheduleTrace(const std::filesystem::path & path = {});
     ~ScheduleTrace();
     std::uint64_t now() const;
+    bool enabled() const { return stream_.is_open(); }
     void define(std::uint64_t frame, std::uint32_t layer, std::uint64_t position, ScheduleMode mode,
                 std::uint32_t task, const TaskSpec & spec);
     void event(std::uint64_t frame, std::uint32_t task, const char * name, std::uint64_t timestamp,
@@ -69,6 +78,7 @@ public:
     std::uint64_t overlap_ns(std::uint32_t a, std::uint32_t b) const;
     bool finished() const;
     TaskRecord task(std::uint32_t id) const;
+    TaskSnapshot snapshot(std::uint32_t id) const;
     std::size_t size() const { return tasks_.size(); }
 private:
     std::vector<TaskRecord> tasks_;

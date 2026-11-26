@@ -763,7 +763,7 @@ struct GgmlPrefetch::Impl {
     }
     std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position,bool direct=false,
                                         std::optional<std::uint64_t> projection_ns={},bool deferred_archive=true) {
-        if (work && work->dag.task(attention).state != TaskState::complete) throw std::logic_error("new layer started before previous attention completion");
+        if (work && work->dag.snapshot(attention).state != TaskState::complete) throw std::logic_error("new layer started before previous attention completion");
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
         const bool archive=direct && deferred_archive && mode!=ScheduleMode::naive;
         work = std::make_shared<LayerWork>(layer, position, mode, trace, ++sequence, estimates, archive,
@@ -794,7 +794,7 @@ struct GgmlPrefetch::Impl {
             update(block_copy_estimate,stats.copy_ns,stats.copy_samples);
         }
         for (std::uint32_t id = 0; id < task_count; ++id) {
-            const auto task = work->dag.task(id);
+            const auto task = work->dag.snapshot(id);
             const auto duration = task.duration_ns();
             if (duration) estimates[id] = duration >= estimates[id] ? estimates[id] + (duration - estimates[id]) / 8 : estimates[id] - (estimates[id] - duration) / 8;
         }
@@ -875,14 +875,14 @@ struct GgmlPrefetch::Impl {
         if (device.attention_complete(device.attention_epoch())) {
             const auto completed=trace.now();
             work->dag.complete(attention, completed, proof, device_ns);
-            totals.attention_layer_span_ns+=completed-work->dag.task(q_ready).end_ns;
+            totals.attention_layer_span_ns+=completed-work->dag.snapshot(q_ready).end_ns;
             ++totals.attention_layer_span_layers;
             if (!work->consumer_entry_ns) throw std::logic_error("attention completed without its KV adapter entry");
             totals.attention_consumer_span_ns+=completed-*work->consumer_entry_ns;
             ++totals.attention_consumer_span_layers;
             if (work->archive_at_attention) {
                 finish_archive(work);
-                if (work->dag.task(next_prefetch).state==TaskState::pending) next_layer(work);
+                if (work->dag.snapshot(next_prefetch).state==TaskState::pending) next_layer(work);
             }
             if (work->dag.finished()) finish_frame(work);
             // The attention reader and current-row archive have retired.
@@ -1123,8 +1123,8 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
     impl_->totals.history_consumer_wait_ns += static_cast<std::uint64_t>(waited);
     ++impl_->totals.history_consumer_wait_calls;
     if (early_enabled()) {
-        const auto selection=current->dag.task(select_task);
-        const auto loading=current->dag.task(miss_read);
+        const auto selection=current->dag.snapshot(select_task);
+        const auto loading=current->dag.snapshot(miss_read);
         if (selection.state!=TaskState::complete || loading.state!=TaskState::complete)
             throw std::logic_error("KV load blocking measurement requires completed selection and loading");
         impl_->totals.cache_load_host_block_ns+=cache_load_host_block_ns(consumer_ready,selection.end_ns,loading.end_ns);
@@ -1269,7 +1269,7 @@ void GgmlPrefetch::quiesce() {
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->transport.synchronize_compute(); impl_->transport.drain();
     if (!error && impl_->device.attention_pending() && impl_->work && impl_->work->archive_at_attention &&
-        impl_->work->dag.task(kv_d2h).state==TaskState::running) {
+        impl_->work->dag.snapshot(kv_d2h).state==TaskState::running) {
         try {
             impl_->finish_archive(impl_->work);
             impl_->start_store(impl_->work);

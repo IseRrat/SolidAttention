@@ -18,6 +18,13 @@ void dependency_and_priority() {
     require(dag.task(3).state == solid::TaskState::pending, "invalid shared fence partially advanced task state");
     dag.complete(2, 6); dag.start(4, 6); dag.complete(4, 7); dag.complete(1, 9);
     dag.start(3, 9); dag.complete(3, 13);
+    for (std::uint32_t id=0;id<dag.size();++id) {
+        const auto full=dag.task(id);
+        const auto status=dag.snapshot(id);
+        require(status.state==full.state && status.start_ns==full.start_ns && status.end_ns==full.end_ns &&
+                status.latest_start==full.latest_start && status.critical==full.critical &&
+                status.device_ns==full.device_ns && status.duration_ns()==full.duration_ns(),"lightweight task state lost scheduling or timing data");
+    }
     require(dag.finished() && dag.critical_path_ns() == 13, "longest dependency chain");
     require(dag.overlap_ns(1, 2) == 5, "independent GPU and I/O overlap interval");
     rejects([&] { dag.complete(1, 14); });
@@ -29,6 +36,10 @@ void dependency_and_priority() {
     require(fence.task(0).state == solid::TaskState::running && fence.task(1).state == solid::TaskState::pending, "failed fence mutated state");
     fence.fence({0,1}, 8, "one boundary covers both");
     require(fence.finished(), "shared fence did not complete covered tasks");
+    solid::TaskDag device({{"gpu",TaskResource::gpu,{},1},{"upload",TaskResource::h2d,{0},1},{"consumer",TaskResource::host,{0,1},1}});
+    device.start(0,10); device.complete(0,20,"gpu_event",3);
+    require(device.snapshot(0).device_ns==3 && device.snapshot(0).duration_ns()==3,"snapshot replaced GPU service time with CPU receipt time");
+    rejects([&] { (void) device.snapshot(3); });
 }
 void worker_overlap_and_error() {
     solid::TaskDag dag({{"q",TaskResource::host,{},1},{"ssd",TaskResource::ssd,{0},1},

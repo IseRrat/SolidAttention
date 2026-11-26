@@ -1,9 +1,33 @@
 #include "prefetch_fakes.hpp"
 #include "solid/block_stage.hpp"
 #include <iostream>
+#include <chrono>
+#include <fstream>
 
 using namespace test_prefetch;
 namespace {
+void trace_independent_priorities() {
+    const solid::BlockIdentity a{0,0,1,32}, b{0,1,2,32};
+    const std::vector<solid::BlockWork> blocks{{a,solid::ReadPriority::selected,10,2},{b,solid::ReadPriority::selected,2,20}};
+    const auto path=std::filesystem::temp_directory_path()/("solid-block-trace-"+
+        std::to_string(std::chrono::steady_clock::now().time_since_epoch().count())+".jsonl");
+    {
+        solid::ScheduleTrace enabled(path), disabled;
+        require(enabled.enabled() && !disabled.enabled(),"trace open state");
+        solid::BlockStage logged(blocks,&enabled), normal(blocks,&disabled);
+        require(logged.read_order()==normal.read_order(),"disabling block labels changed scheduling order");
+        for (const auto & id:{a,b}) {
+            const auto x=logged.dispatch(id),y=normal.dispatch(id);
+            require(x.critical==y.critical && x.latest_start==y.latest_start,"trace switch changed dispatch priority");
+        }
+        require(logged.read_task(a).spec.name=="block_read_h0_b1_v32" &&
+                normal.read_task(a).spec.name=="block_read","optional detailed block labels");
+        enabled.flush();
+    }
+    std::ifstream input(path); std::string contents((std::istreambuf_iterator<char>(input)),{}); input.close();
+    std::filesystem::remove(path);
+    require(contents.find("block_read_h0_b1_v32")!=std::string::npos,"enabled trace lost detailed block identity");
+}
 void dependencies(bool prediction) {
     const solid::BlockIdentity a{0,0,1,1},b{0,0,2,1},c{0,1,3,1};
     const auto selected=prediction?solid::ReadPriority::selected:solid::ReadPriority::correction_selected;
@@ -96,6 +120,6 @@ void failed_read_after_upload() {
 }
 }
 int main() {
-    try { dependencies(false); dependencies(true); real_queue(false); real_queue(true); real_queue(false, true); split_segments(); failed_read_after_upload(); std::cout<<"block event DAG, critical/LST dispatch, real queue order and receipts passed\n"; return 0; }
+    try { trace_independent_priorities(); dependencies(false); dependencies(true); real_queue(false); real_queue(true); real_queue(false, true); split_segments(); failed_read_after_upload(); std::cout<<"block event DAG, critical/LST dispatch, real queue order and receipts passed\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

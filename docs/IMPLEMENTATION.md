@@ -356,6 +356,14 @@
 
    优化依据来自 `4330d1c` 的独立三组 CPU 栈诊断：3B、16K、固定 32 步，I/O 线程的请求表迭代占 naive、OL、SR 运行样本的约 55.4%、55.5%、57.3%。采样按 Decode 时间窗与实际推理、协调和 I/O 线程 ID 过滤，分别保存栈顶和调用链计数。诊断使用自建容器的 PERFMON 能力及进程树 DWARF 采样；原始记录和分析源码位于 `results/server5090/ol-sr-cpu-stacks-retry-4330d1c.s7vpqyby/`。正常对照单独保存于 `ol-sr-fixed-input-b002582.t_p8x8cv/` 和 `ol-sr-release-4330d1c.fitisqx1/`，各含三模型九组、相同 127 步输入与标准 Nsight 采集。
 
+   `51e2664` 的三模型九组对照位于 `results/server5090/ol-sr-priority-51e2664.52o3aepk/`。16K 输入、同模型固定相同的 127 个 Decode 输入，GPU 实时评分，每项一次，标准 Nsight、8 GiB 显存、16 GiB 主机内存及 Decode O_DIRECT。Naive／OL／OL+SR 的完整 Decode 分别为：3B 67.61／90.04／80.71 ms/步，8B 85.40／95.18／84.98 ms/步，Qwen 38.38／39.40／39.67 ms/步。三个配置的评分次数、候选块数和选中 token 数逐模型一致；九项均有物理读盘，记录及模型、输入哈希核对通过。该轮 3B 的 OL/SR 仍有退化。逐项表格、归一化图和分析源码保存在该目录的 `RESULTS.md`、`OL_SR_DATA.json`、`ol-sr-progress.png`、`report-source.py`。
+
+14. **逐块调度的状态查询与关闭记录后的运行开销**
+
+   `scheduler.hpp`、`scheduler.cpp` 增加只含运行状态、时间和优先级字段的 `TaskSnapshot`，`block_stage.cpp`、`ggml_prefetch.cpp` 在调度与完成处理中使用该接口，省去复制任务名称及依赖数组。完整任务记录仍用于显式记录查询。DAG 建立时用一份标记数组检查重复依赖，并预留任务、拓扑序和队列空间；拓扑次序、关键路径、最晚启动时间与优先级规则保持原样。
+
+   `ScheduleTrace` 提供建立后固定的开启状态。关闭逐块记录时，`BlockStage` 使用简短任务名称，省去逐块拼接 head、block、version；DAG 不再进入关闭的记录器及其互斥锁。开启记录时保留完整名称、任务身份、依赖和事件。`scheduler_test.cpp` 对照轻量状态与完整记录的状态、时间、优先级及 GPU 计时；`block_stage_test.cpp` 对照记录开关两种情况的调度顺序和关键路径优先级，并检查开启后的块身份。服务器编译、54 项 CPU 检查及原生 CUDA 数值和生命周期核验通过，记录位于 `results/server5090/dag-runtime-check/`；原生采集为 `infllm-port-check-dag-runtime.bXyh4Z39/nsys/dag-runtime.nsys-rep`。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。

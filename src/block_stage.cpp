@@ -9,10 +9,13 @@ BlockStage::BlockStage(std::vector<BlockWork> blocks,ScheduleTrace * trace,std::
     if (blocks_.size()>(UINT32_MAX-1)/2) throw std::invalid_argument("block stage exceeds task capacity");
     std::vector<TaskSpec> tasks;
     std::vector<std::uint32_t> copies;
+    tasks.reserve(2*blocks_.size()+1);
+    copies.reserve(blocks_.size());
+    const bool names=trace && trace->enabled();
     for (std::uint32_t i=0;i<blocks_.size();++i) {
         const auto & block=blocks_[i];
         if (block.identity.layer!=layer || !block.identity.version || !indices_.emplace(block.identity,i).second) throw std::invalid_argument("invalid block stage identity");
-        const auto suffix="_h"+std::to_string(block.identity.head)+"_b"+std::to_string(block.identity.block)+"_v"+std::to_string(block.identity.version);
+        const auto suffix=names?"_h"+std::to_string(block.identity.head)+"_b"+std::to_string(block.identity.block)+"_v"+std::to_string(block.identity.version):std::string{};
         tasks.push_back({"block_read"+suffix,TaskResource::ssd,{},block.read_ns});
         tasks.push_back({"block_h2d"+suffix,TaskResource::h2d,{2*i},block.copy_ns});
         copies.push_back(2*i+1);
@@ -21,7 +24,7 @@ BlockStage::BlockStage(std::vector<BlockWork> blocks,ScheduleTrace * trace,std::
     dag_=std::make_unique<TaskDag>(std::move(tasks),trace,frame,layer,position,mode);
     copy_priorities_.reserve(blocks_.size());
     for (std::uint32_t i=0;i<blocks_.size();++i) {
-        const auto task=dag_->task(2*i+1);
+        const auto task=dag_->snapshot(2*i+1);
         // All copy tasks share a resource. Use the DAG's critical/LST order
         // with the task index as the final tie-break.
         copy_priorities_.emplace_back(!task.critical,task.latest_start,i);
@@ -51,18 +54,18 @@ std::vector<BlockIdentity> BlockStage::copy_order() const {
     return result;
 }
 ReadDispatch BlockStage::dispatch(const BlockIdentity & id) const {
-    const auto i=index(id); const auto task=dag_->task(2*i);
+    const auto i=index(id); const auto task=dag_->snapshot(2*i);
     return {blocks_[i].priority,task.critical,task.latest_start};
 }
 ReadDispatch BlockStage::copy_dispatch(const BlockIdentity & id) const {
     const auto i = index(id);
-    const auto task = dag_->task(2*i+1);
+    const auto task = dag_->snapshot(2*i+1);
     return {blocks_[i].priority,task.critical,task.latest_start};
 }
 void BlockStage::read_started(const BlockIdentity & id,const std::string & proof) {
     const auto i=index(id);
     if (aborted_) return;
-    const auto state=dag_->task(2*i).state;
+    const auto state=dag_->snapshot(2*i).state;
     if (state==TaskState::pending) { observed_reads_[i]=!proof.empty(); dag_->start(2*i,now(),proof); }
     else if (state!=TaskState::running) throw std::logic_error("read restarted after stage completion");
 }
@@ -94,7 +97,7 @@ BlockStageStats BlockStage::stats() const {
     if (!finished()) throw std::logic_error("block stage metrics requested before all copies complete");
     BlockStageStats result; result.tasks=dag_->size(); result.critical_path_ns=dag_->critical_path_ns();
     for (std::uint32_t i=0;i<blocks_.size();++i) {
-        const auto read=dag_->task(2*i),copy=dag_->task(2*i+1);
+        const auto read=dag_->snapshot(2*i),copy=dag_->snapshot(2*i+1);
         if (!observed_reads_[i]) { result.read_ns+=read.duration_ns(); ++result.read_samples; }
         if (!resident_copies_[i]) { result.copy_ns+=copy.duration_ns(); ++result.copy_samples; }
     }
