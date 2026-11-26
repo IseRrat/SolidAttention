@@ -57,6 +57,23 @@ def write_run(source, runner_sha="runner", code="commit", timings=(2,4)):
 
 
 class ExperimentTests(unittest.TestCase):
+    def test_fixed_decode_inputs_require_matching_mode_tokens_and_length(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root=Path(temporary);_,config=fixture(root)
+            config.update(output=str(root/"run/result.json"),max_new_tokens=3,replay_token_ids=[0,0])
+            source=root/"fixed.json";write(source,config)
+            output,value=write_run(source)
+            value.update(stop_reason="replay_length",replay=True)
+            row={"result":str(output),"config":str(source),"config_sha256":common.digest(source)}
+            def save():
+                write(output,value);manifest=common.load(output.parent/"manifest.json")
+                manifest["result_sha256"]=common.digest(output);write(output.parent/"manifest.json",manifest)
+            save();experiments.audited_job(row,{},root)
+            value["decode_input_token_ids"]=[0,1];save()
+            with self.assertRaisesRegex(ValueError,"input tokens differ"):experiments.audited_job(row,{},root)
+            value["decode_input_token_ids"]=[0,0];value["stop_reason"]="length";save()
+            with self.assertRaisesRegex(ValueError,"fixed output length"):experiments.audited_job(row,{},root)
+
     def test_coalescing_ablation_changes_only_adjacent_upload_merging(self):
         template={"attention":{"infllm_attention":True,"selection_backend":"cuda","direct_decode_reads":True}}
         on=experiments.variant_config(template,"solid",32,1024)

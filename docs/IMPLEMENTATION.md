@@ -302,6 +302,8 @@
 
    `experiments.py` 的 `solid-no-coalescing` 复制完整 SolidAttention 配置后只关闭上述开关；`experiment_common.py` 核对实际运行模式。`config_test.cpp` 检查解析与适用范围，`test_experiments.py` 检查两组配置只有该开关不同；`cuda_device_input_test.cu` 在关闭合并时要求每个交织历史块恰好对应一笔上传，并逐值核对 CUDA 输出与参考结果。服务器编译、54 项 CPU 检查、20 项实验脚本检查及 CUDA 核验通过。记录位于 `results/server5090/upload-coalescing-check/`，CUDA 采集为 `results/server5090/infllm-port-check-coalescing.821puqfR/nsys/upload-coalescing-native.nsys-rep`。对应接口文件为 `config.hpp`、`ggml_prefetch.hpp`，实现文件为 `config.cpp`、`llama_adapter.cpp`、`ggml_prefetch.cpp`、`baseline.cpp` 及上述实验脚本和检查文件。
 
+   固定 Decode 输入的诊断使用 `replay_token_ids`，评分和选块仍在 GPU 实时执行。`experiments.py` 核对其 `replay_length` 正常结束标记、完整输出长度、实际输入模式及全部 Decode 输入 token；自由生成继续要求 `length` 结束。`test_experiments.py` 检查正常记录、输入不一致和结束标记不一致三种情况，服务器 21 项实验脚本检查通过，记录为 `results/server5090/upload-coalescing-check/fixed-input-audit.log`。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。

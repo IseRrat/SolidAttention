@@ -201,8 +201,14 @@ def read_plan(path):
 def audited_job(row, settings, attempt, runner_sha=None):
     result,run,config = audit_run(Path(row["result"]),row["config"],row["config_sha256"])
     if runner_sha is not None and run["runner_sha256"] != runner_sha: raise ValueError("runner differs from completed run")
-    if len(result["generated_token_ids"]) != config["max_new_tokens"] or result["stop_reason"] != "length":
-        raise ValueError("performance run did not produce the fixed output length")
+    replay = "replay_token_ids" in config
+    stop_reason = "replay_length" if replay else "length"
+    if len(result["generated_token_ids"]) != config["max_new_tokens"] or result["stop_reason"] != stop_reason:
+        raise ValueError("run did not produce the configured fixed output length")
+    if bool(result.get("replay",False)) != replay:
+        raise ValueError("fixed decode input mode differs")
+    if replay and result["decode_input_token_ids"] != config["replay_token_ids"]:
+        raise ValueError("fixed decode input tokens differ")
     metrics = run_metrics(result)
     group = run.get("cgroup_end",run.get("cgroup_last",{}))
     if settings.get("memory_max_bytes") is not None and (
