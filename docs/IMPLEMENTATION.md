@@ -228,6 +228,10 @@
 
    `scheduler.hpp`、`ggml_prefetch.cpp` 累计当前层 K/V 投影就绪后，计算线程等待正式读取协调任务完成的耗时和次数；`baseline.cpp` 输出 `history_consumer_wait_ms`、`history_consumer_wait_calls`。Nsight 对应条为 `CPU Wait KV`。计时包住原有等待，不增加设备同步；此项包括协调任务剩余工作，GPU 后续等待上传完成仍由实际 CUDA 时间线查看。`cuda_device_input_test.cu` 检查连续 16 次解码层调用均计入。
 
+   图 16 的缓存加载阻塞计时分为主机与设备两段。主机段在当前 KV 消费前沿和正式选块完成两者中取较晚者，到所需历史读取完成、上传提交结束为止；已被投影隐藏的读取以及评分等待不计入。设备段在原计算流的上传依赖前后各记录 CUDA 事件，等原有 attention 回执到达后读取耗时。两段顺序相接，事件复用且计时不新增设备等待。`baseline.cpp` 输出 `cache_loading_host_block_ms`、`cache_loading_device_block_ms`、两段之和 `cache_loading_blocking_ms`，以及主机与设备段覆盖的层数。模型每步阻塞延迟由所有层累计，最后按实际 Decode 步数取平均。`scheduler_test.cpp` 检查选块等待、投影隐藏及全命中三种边界；`cuda_device_input_test.cu` 检查复用图每层都有两段统计。对应文件为 `scheduler.hpp`、`ggml_prefetch.cpp`、`baseline.cpp` 和上述两个检查文件。
+
+   服务器完成 54 项 CPU 检查及 CUDA 图复用核验，包含开启和关闭提前预取两种设置，分别要求 16 次主机统计、16 次设备统计、16 次设备完成通知及零次 CPU 通知替代。记录位于 `results/server5090/figure16-cache-blocking-check/`，原始 Nsight 位于 `results/server5090/infllm-port-check-10d694c.uyfXf9xR/nsys/figure16-cache-blocking-v1.nsys-rep`。
+
    CUDA `overlap+sync_reuse` 的设备 KV 路径允许历史上传在构建掩码和提交当前行时继续执行。计算流统一等待最后一个上传事件，协调线程用 attention 完成回执确认整个上传批次并归还槽位。下一层 SSD 请求可以先排队，暂时被上传占用的页锁定槽位在写入方归还后才接收新数据。调度轨迹核对共同上传依赖，CUDA 回归用例检查计算流等待和主机批次等待的次数。 [device_cache.hpp](../include/solid/device_cache.hpp)、[device_cache.cpp](../src/device_cache.cpp)、[prefetch.hpp](../include/solid/prefetch.hpp)、[prefetch.cpp](../src/prefetch.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)、[cuda_device_input_test.cu](../tests/cuda_device_input_test.cu)。
 
    CUDA 在已有代表块无需发布的解码步，将代表分数更新与动态选块排入同一条流，等 Top-K 回传时一起检查更新和评分状态。需要发布新代表块或无需动态选块的步，在各自消费点确认更新完成。同步复用路径将当前 key 的追加放进 attention 计算流，共用 attention 回执，归档时验证相同 FP16 数据。结果记录选块等待复用及计算流追加次数。 [block_ranker.hpp](../include/solid/block_ranker.hpp)、[block_ranker.cu](../src/cuda/block_ranker.cu)、[attention.hpp](../include/solid/attention.hpp)、[attention.cpp](../src/attention.cpp)、[session.hpp](../include/solid/session.hpp)、[session.cpp](../src/session.cpp)、[baseline.cpp](../src/baseline.cpp)。

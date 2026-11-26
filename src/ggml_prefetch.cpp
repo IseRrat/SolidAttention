@@ -424,7 +424,20 @@ public:
 #endif
         if (!events_.empty() && events_.rbegin()->second.event) {
             const auto & last=*events_.rbegin();
+#ifdef SOLID_HAVE_CUDA_SELECTION
+            if (cuda_device_>=0) {
+                if (load_wait_pending_) throw std::logic_error("previous KV wait measurement has not been collected");
+                if (!load_wait_) load_wait_=make_cuda_device_interval(cuda_device_);
+                record_copy_interval(load_wait_.get(),false,backend_);
+            }
+#endif
             ggml_backend_event_wait(backend_,last.second.event);
+#ifdef SOLID_HAVE_CUDA_SELECTION
+            if (cuda_device_>=0) {
+                record_copy_interval(load_wait_.get(),true,backend_);
+                load_wait_pending_=true;
+            }
+#endif
             compute_dependency_ticket_=last.first;
             ++stats_.stream_waits;
         }
@@ -432,6 +445,14 @@ public:
     void acknowledge_compute_dependency() {
         completed_through_=std::max(completed_through_,compute_dependency_ticket_);
         compute_dependency_ticket_=0;
+    }
+    std::optional<std::uint64_t> collect_cache_load_wait() {
+        if (!load_wait_pending_) return {};
+        // The existing attention receipt proves both timestamps are complete.
+        const auto elapsed=load_wait_->duration();
+        if (!elapsed) throw std::logic_error("missing CUDA KV wait timestamps");
+        load_wait_pending_=false;
+        return elapsed;
     }
     bool can_archive_on_attention_stream() const {
 #ifdef SOLID_HAVE_CUDA_SELECTION
@@ -601,6 +622,8 @@ private:
 #endif
     std::unique_ptr<DeviceInterval> archive_interval_;
     std::optional<std::uint64_t> copy_interval_;
+    std::unique_ptr<DeviceInterval> load_wait_;
+    bool load_wait_pending_=false;
 #ifdef SOLID_HAVE_SYCL
     std::unique_ptr<SyclCopyQueue> sycl_copy_;
     std::unique_ptr<SyclCopyEvent> archive_sycl_;
@@ -784,6 +807,10 @@ struct GgmlPrefetch::Impl {
             // No successor upload may be submitted until the attention reader retires.
             // This receipt also covers the last upload event waited on by compute.
             transport.acknowledge_compute_dependency();
+            if (const auto wait=transport.collect_cache_load_wait()) {
+                totals.cache_load_device_block_ns+=*wait;
+                ++totals.cache_load_device_block_layers;
+            }
             device.reap_transfers();
             const auto now=trace.now();
             work->dag.complete(history_h2d,now,"attention_upload_dependency");
@@ -1009,6 +1036,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         if (deferred) current->dag.complete(kv_projection, impl_->trace.now(), "kv_device_ready",projection_ns);
         else current->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), "kv_download_complete");
     }
+    const auto consumer_ready=impl_->trace.now();
     const auto wait_begin = std::chrono::steady_clock::now();
     {
         trace::Scope wait("CPU Wait KV", layer, position);
@@ -1018,6 +1046,14 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->totals.history_consumer_wait_ns += static_cast<std::uint64_t>(waited);
     ++impl_->totals.history_consumer_wait_calls;
+    if (early_enabled()) {
+        const auto selection=current->dag.task(select_task);
+        const auto loading=current->dag.task(miss_read);
+        if (selection.state!=TaskState::complete || loading.state!=TaskState::complete)
+            throw std::logic_error("KV load blocking measurement requires completed selection and loading");
+        impl_->totals.cache_load_host_block_ns+=cache_load_host_block_ns(consumer_ready,selection.end_ns,loading.end_ns);
+        ++impl_->totals.cache_load_host_block_layers;
+    }
     impl_->quiesced = false;
     auto work = current;
     if (!early_enabled()) {

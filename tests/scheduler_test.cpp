@@ -85,6 +85,10 @@ void pending_device_reader() {
 }
 int main() {
     try {
+        require(solid::cache_load_host_block_ns(10,30,50)==20,"KV blocking included selection time");
+        require(solid::cache_load_host_block_ns(30,10,50)==20,"KV blocking included loading hidden by projection");
+        require(solid::cache_load_host_block_ns(50,10,30)==0,"fully hidden KV loading was counted as blocking");
+        require(solid::cache_load_host_block_ns(30,30,30)==0,"ready KV incurred artificial host blocking");
         dependency_and_priority(); worker_overlap_and_error(); early_representatives(); pending_device_reader();
         std::cout << "DAG priority, shared fences, worker overlap, early representatives and deferred leases passed\n";
         return 0;

@@ -17,6 +17,14 @@ namespace solid {
 enum class ScheduleMode { naive, overlap, sync_reuse };
 ScheduleMode parse_schedule_mode(const std::string & name);
 const char * schedule_mode_name(ScheduleMode mode);
+
+// CPU is at the KV consumer frontier. Exclude selection and any loading
+// already hidden before that frontier; GPU upload waits are timed separately.
+inline std::uint64_t cache_load_host_block_ns(std::uint64_t consumer_ready,
+        std::uint64_t selection_ready,std::uint64_t uploads_submitted) {
+    const auto start=consumer_ready>selection_ready?consumer_ready:selection_ready;
+    return uploads_submitted>start?uploads_submitted-start:0;
+}
 enum class TaskResource { host, ssd, h2d, d2h, gpu };
 enum class TaskState { pending, running, complete, failed };
 struct TaskSpec {
@@ -108,5 +116,7 @@ struct ScheduleStats {
     std::uint64_t historical_upload_batches = 0, historical_upload_blocks = 0, historical_upload_ranges = 0;
     std::uint64_t archive_attention_reuses = 0, archive_separate_completions = 0;
     std::uint64_t history_consumer_wait_ns = 0, history_consumer_wait_calls = 0;
+    std::uint64_t cache_load_host_block_ns = 0, cache_load_host_block_layers = 0;
+    std::uint64_t cache_load_device_block_ns = 0, cache_load_device_block_layers = 0;
 };
 } // namespace solid

@@ -256,6 +256,8 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
     const auto schedule=cache->schedule_stats();
     require(schedule.history_consumer_wait_calls==16,"CUDA decode omitted consumer readiness wait accounting");
     if (mode==solid::ScheduleMode::sync_reuse) {
+        require(schedule.cache_load_host_block_layers==16 && schedule.cache_load_device_block_layers==16,
+            "CUDA graph replay omitted CPU/GPU cache loading blocking measurements");
         require(schedule.device_event_completions==16 && schedule.device_boundary_fallbacks==0,
             "CUDA graph replay replaced device completion events with CPU boundary receipts");
         require(schedule.archive_attention_reuses==16 && schedule.archive_separate_completions==0,

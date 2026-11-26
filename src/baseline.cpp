@@ -616,6 +616,11 @@ int main(int argc, char ** argv) {
                     {"archive_separate_completions",schedule.archive_separate_completions},
                     {"history_consumer_wait_ms",schedule.history_consumer_wait_ns/1e6},
                     {"history_consumer_wait_calls",schedule.history_consumer_wait_calls},
+                    {"cache_loading_host_block_ms",schedule.cache_load_host_block_ns/1e6},
+                    {"cache_loading_device_block_ms",schedule.cache_load_device_block_ns/1e6},
+                    {"cache_loading_blocking_ms",(schedule.cache_load_host_block_ns+schedule.cache_load_device_block_ns)/1e6},
+                    {"cache_loading_host_block_layers",schedule.cache_load_host_block_layers},
+                    {"cache_loading_device_block_layers",schedule.cache_load_device_block_layers},
                     {"backend_compute_waits", schedule.backend_compute_waits}, {"staging_buffer_bytes", schedule.staging_bytes}
                 };
                 const auto schedule_trace = config.output.parent_path() / "schedule.jsonl";
