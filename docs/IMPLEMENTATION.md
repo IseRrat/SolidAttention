@@ -298,11 +298,15 @@
 
 8. **相邻上传合并的独立诊断开关**
 
-   `AttentionConfig::coalesce_uploads` 默认开启，`config.cpp` 解析后由 `llama_adapter.cpp` 传入 `GgmlPrefetch` 与设备搬运器。关闭时仅跳过历史上传中连续地址范围的合并循环，仍用同一批已就绪块、页锁定缓冲、复制队列及完成票据；交织 K/V 的单块仍作为一个传输单元。当前行安装、预算、评分、预取和同步复用保持原样。`scheduler.hpp`、`ggml_prefetch.cpp` 保存实际开关，`baseline.cpp` 在 `schedule.coalesce_uploads` 输出实际值。
+   `AttentionConfig::coalesce_uploads` 默认开启，`config.cpp` 解析后由 `llama_adapter.cpp` 传入 `GgmlPrefetch` 与设备搬运器。关闭时仅跳过历史上传中连续地址范围的合并循环，保持就绪批次处理、页锁定缓冲、复制队列及完成票据规则；交织 K/V 的单块仍作为一个传输单元。当前行安装、预算、评分、预取和同步复用保持原样。`scheduler.hpp`、`ggml_prefetch.cpp` 保存实际开关，`baseline.cpp` 在 `schedule.coalesce_uploads` 输出实际值。
 
    `experiments.py` 的 `solid-no-coalescing` 复制完整 SolidAttention 配置后只关闭上述开关；`experiment_common.py` 核对实际运行模式。`config_test.cpp` 检查解析与适用范围，`test_experiments.py` 检查两组配置只有该开关不同；`cuda_device_input_test.cu` 在关闭合并时要求每个交织历史块恰好对应一笔上传，并逐值核对 CUDA 输出与参考结果。服务器编译、54 项 CPU 检查、20 项实验脚本检查及 CUDA 核验通过。记录位于 `results/server5090/upload-coalescing-check/`，CUDA 采集为 `results/server5090/infllm-port-check-coalescing.821puqfR/nsys/upload-coalescing-native.nsys-rep`。对应接口文件为 `config.hpp`、`ggml_prefetch.hpp`，实现文件为 `config.cpp`、`llama_adapter.cpp`、`ggml_prefetch.cpp`、`baseline.cpp` 及上述实验脚本和检查文件。
 
    固定 Decode 输入的诊断使用 `replay_token_ids`，评分和选块仍在 GPU 实时执行。`experiments.py` 核对其 `replay_length` 正常结束标记、完整输出长度、实际输入模式及全部 Decode 输入 token；自由生成继续要求 `length` 结束。`test_experiments.py` 检查正常记录、输入不一致和结束标记不一致三种情况，服务器 21 项实验脚本检查通过，记录为 `results/server5090/upload-coalescing-check/fixed-input-audit.log`。
+
+   `f807642` 完成 3B、16K 提示、128 输出位置的两组相邻上传合并诊断。两组固定相同的 127 个 Decode 输入，评分与 Top-K 均在 GPU 实时执行，配置仅合并开关不同；两组各一次，均采集 Nsight，启用原资源限制和 Decode O_DIRECT。合并／逐块的完整 Decode 为 79.82／87.94 ms/步，吞吐为 12.53／11.37 token/s；异步复制 API 的 CPU 累计用时为 6.53／19.70 ms/步，GPU H2D 为 4.95／11.52 ms/步，GPU kernel 为 5.294／5.286 ms/步。两组 H2D 为约 2091／8353 笔/步，平均大小为 64.71／16.22 KiB；Decode 读量为 15.654／15.655 GiB，上传量为 15.836／15.853 GiB。逐块组历史上传范围数与块数完全相同，计时、设备回执和 GPU 评分覆盖全部 3556 次层调用。
+
+   两组原始结果、固定输入及来源哈希、资源记录、Nsight 文件、耗时对照图，以及输入位置 16410 的完整 Decode 和前 4 ms 实际时间线保存在 `results/server5090/upload-coalescing-3b-16k-f807642.8jdiwgje/`。报告分别列出统一入口区间、完整 Decode、实际复制活动和无计算/复制活动区间；CPU 复制调用用时按各线程累计，GPU 复制与计算用时分别求并集。图表分析代码随结果保存。
 
 ## 五、论文系统的工程接入
 
