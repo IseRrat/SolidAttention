@@ -2,8 +2,7 @@
 #include "solid/async_reader.hpp"
 #include "solid/block_identity.hpp"
 #include "solid/scheduler.hpp"
-#include <map>
-#include <set>
+#include <utility>
 
 namespace solid {
 struct BlockWork {
@@ -14,6 +13,9 @@ struct BlockWork {
 struct BlockStageStats {
     std::uint64_t tasks=0,read_ns=0,copy_ns=0,read_samples=0,copy_samples=0,critical_path_ns=0;
 };
+struct BlockDispatch { ReadDispatch read,copy; };
+// Algorithm 1 for the fixed parallel READ -> H2D -> join graph.
+std::vector<BlockDispatch> plan_block_dispatch(const std::vector<BlockWork> & blocks);
 // One bounded historical working set. The coordinator owns all transitions;
 // read dispatch keys can be passed to the independent I/O owner by value.
 class BlockStage {
@@ -34,17 +36,24 @@ public:
     TaskRecord read_task(const BlockIdentity & identity) const;
     TaskRecord copy_task(const BlockIdentity & identity) const;
 private:
-    using CopyOrder = std::tuple<bool,std::uint64_t,std::uint32_t>;
+    struct Progress {
+        TaskState read_state=TaskState::pending,copy_state=TaskState::pending;
+        std::uint64_t read_start=0,read_end=0,copy_start=0,copy_end=0;
+        std::optional<std::uint64_t> copy_device_ns;
+        bool observed_read=false,resident_copy=false,copy_ready=false;
+    };
+    void start_read(std::uint32_t index,std::uint64_t time,const std::string & proof);
+    TaskRecord record(std::uint32_t index,bool copy) const;
     std::uint64_t now() const;
     std::uint32_t index(const BlockIdentity & identity) const;
     std::vector<BlockWork> blocks_;
-    std::map<BlockIdentity,std::uint32_t> indices_;
-    std::unique_ptr<TaskDag> dag_;
+    std::vector<std::pair<BlockIdentity,std::uint32_t>> indices_;
+    std::unique_ptr<TaskDag> diagnostic_dag_;
     ScheduleTrace * trace_;
-    std::vector<bool> observed_reads_,resident_copies_;
-    std::vector<CopyOrder> copy_priorities_;
-    std::set<CopyOrder> ready_copies_;
+    std::vector<BlockDispatch> dispatch_;
+    std::vector<Progress> progress_;
+    std::vector<std::uint32_t> copy_order_;
     bool aborted_=false;
-    std::size_t copies_remaining_=0;
+    std::size_t copies_remaining_=0,ready_count_=0;
 };
 } // namespace solid

@@ -3,9 +3,72 @@
 #include <iostream>
 #include <chrono>
 #include <fstream>
+#include <numeric>
+#include <random>
 
 using namespace test_prefetch;
 namespace {
+void fixed_graph_matches_generic_dag() {
+    std::mt19937 random(2026);
+    for (const auto count:{0u,1u,2u,8u,32u,256u}) for (int trial=0;trial<8;++trial) {
+        std::vector<solid::BlockWork> blocks;
+        std::vector<solid::TaskSpec> specs;
+        std::vector<std::uint32_t> reads,copies;
+        for (std::uint32_t i=0;i<count;++i) {
+            blocks.push_back({{0,i%4,i/4,1},i%2?solid::ReadPriority::selected:solid::ReadPriority::deterministic,
+                1+random()%9,1+random()%9});
+            specs.push_back({"read",solid::TaskResource::ssd,{},blocks.back().read_ns});
+            specs.push_back({"copy",solid::TaskResource::h2d,{2*i},blocks.back().copy_ns});
+            reads.push_back(2*i); copies.push_back(2*i+1);
+        }
+        specs.push_back({"join",solid::TaskResource::host,copies,1});
+        solid::TaskDag reference(specs);
+        solid::BlockStage stage(blocks);
+        const auto plan=solid::plan_block_dispatch(blocks);
+        if (!count) { require(stage.finished() && stage.stats().tasks==1,"empty fixed DAG"); continue; }
+        for (std::uint32_t i=0;i<count;++i) {
+            const auto read=reference.snapshot(2*i),copy=reference.snapshot(2*i+1);
+            require(plan[i].read.critical==read.critical && plan[i].read.latest_start==read.latest_start &&
+                    plan[i].copy.critical==copy.critical && plan[i].copy.latest_start==copy.latest_start &&
+                    plan[i].read.priority==blocks[i].priority,"fixed DAG priority differs from Algorithm 1 traversal");
+        }
+        const auto identities=[&](const auto & tasks) {
+            std::vector<solid::BlockIdentity> result;
+            for (const auto task:tasks) result.push_back(blocks[task/2].identity);
+            return result;
+        };
+        require(stage.read_order()==identities(reference.ready(reads)),"fixed read order changed critical/LST/ties");
+        std::vector<std::uint32_t> arrival(count); std::iota(arrival.begin(),arrival.end(),0);
+        std::shuffle(arrival.begin(),arrival.end(),random);
+        std::uint64_t stamp=1;
+        for (const auto i:arrival) {
+            stage.read_complete(blocks[i].identity);
+            reference.start(2*i,stamp++); reference.complete(2*i,stamp++);
+            auto ready=reference.ready(copies);
+            require(stage.copy_order()==identities(ready),"out-of-order reads changed ready copy order");
+            if (i%3==0) for (const auto task:ready) {
+                stage.copy_started(blocks[task/2].identity); stage.copy_complete(blocks[task/2].identity,"copy_ticket_complete",2);
+                reference.start(task,stamp++); reference.complete(task,stamp++,"copy_ticket_complete",2);
+            }
+        }
+        for (const auto task:reference.ready(copies)) {
+            stage.copy_started(blocks[task/2].identity); stage.copy_complete(blocks[task/2].identity,"copy_ticket_complete",3);
+            reference.start(task,stamp++); reference.complete(task,stamp++,"copy_ticket_complete",3);
+        }
+        require(stage.finished() && stage.copy_order().empty(),"fixed DAG join did not wait for all copies");
+        solid::TaskDag measured(specs); std::uint64_t last=0;
+        for (const auto & block:blocks) {
+            const auto read=stage.read_task(block.identity),copy=stage.copy_task(block.identity);
+            const auto i=static_cast<std::uint32_t>(&block-blocks.data());
+            measured.start(2*i,read.start_ns); measured.complete(2*i,read.end_ns);
+            measured.start(2*i+1,copy.start_ns); measured.complete(2*i+1,copy.end_ns,"copy_ticket_complete",copy.device_ns);
+            last=std::max(last,copy.end_ns);
+        }
+        measured.fence({2*count},last,"complete");
+        require(stage.stats().critical_path_ns==measured.critical_path_ns() && stage.stats().read_samples==count &&
+                stage.stats().copy_samples==count,"fixed DAG timing differs from general dependency traversal");
+    }
+}
 void trace_independent_priorities() {
     const solid::BlockIdentity a{0,0,1,32}, b{0,1,2,32};
     const std::vector<solid::BlockWork> blocks{{a,solid::ReadPriority::selected,10,2},{b,solid::ReadPriority::selected,2,20}};
@@ -120,6 +183,6 @@ void failed_read_after_upload() {
 }
 }
 int main() {
-    try { trace_independent_priorities(); dependencies(false); dependencies(true); real_queue(false); real_queue(true); real_queue(false, true); split_segments(); failed_read_after_upload(); std::cout<<"block event DAG, critical/LST dispatch, real queue order and receipts passed\n"; return 0; }
+    try { fixed_graph_matches_generic_dag(); trace_independent_priorities(); dependencies(false); dependencies(true); real_queue(false); real_queue(true); real_queue(false, true); split_segments(); failed_read_after_upload(); std::cout<<"block event DAG, critical/LST dispatch, real queue order and receipts passed\n"; return 0; }
     catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

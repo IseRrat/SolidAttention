@@ -421,10 +421,11 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
     std::vector<BlockWork> tasks;
     tasks.reserve(predicted.size());
     for (const auto & id : predicted) tasks.push_back({id, priority(id), read_cost(id), costs.full_upload_ns});
-    const BlockStage plan(std::move(tasks), nullptr, 0, layer, position);
+    const auto plan=plan_block_dispatch(tasks);
     std::vector<Prediction> ordered;
     ordered.reserve(predicted.size());
-    for (const auto & id : predicted) ordered.push_back({id, plan.dispatch(id), plan.copy_dispatch(id), read_phase_});
+    for (std::size_t i=0;i<predicted.size();++i)
+        ordered.push_back({predicted[i],plan[i].read,plan[i].copy,read_phase_});
     std::stable_sort(ordered.begin(), ordered.end(), [](const Prediction & a, const Prediction & b) {
         return a.read.before(b.read);
     });

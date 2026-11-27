@@ -246,11 +246,9 @@ private:
                 std::uint64_t epoch=0;
                 {
                     std::lock_guard<std::mutex> lock(mutex_);
-                    quiesce=drain_requested_>drain_completed_;
-                    for (const auto & item:requests_) {
-                        if (item.second.phase!=Phase::complete) quiesce=false;
-                        if (item.second.phase==Phase::queued) queued=true;
-                    }
+                    // Complete requests remain paired with unconsumed receipts.
+                    quiesce=drain_requested_>drain_completed_ && requests_.size()==completed_.size();
+                    queued=!ready_requests_.empty();
                     epoch=drain_requested_; stop=stopping_;
                 }
                 if (quiesce) {
