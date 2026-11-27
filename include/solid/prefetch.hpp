@@ -82,6 +82,8 @@ public:
     void remember_selection(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     // 收取 SSD 完成回执并推进队列；wait 决定没有结果时是否等待。
     void poll(bool wait = false, const ReadyBlock & ready = {});
+    // Naive 的批次边界：本批预测读请求全部完成后，调用方才开始上传。
+    void wait_reads();
     const KvBlock & block(const SlotLease & lease) const;
     void pin(const SlotLease & lease) { slots_.pin(lease); }
     void unpin(const SlotLease & lease) { slots_.unpin(lease); }
@@ -95,6 +97,7 @@ public:
     PrefetchStats stats() const;
     std::uint32_t slots_per_head() const { return slots_.slots_per_head(); }
     std::optional<std::uint32_t> active_layer() const { return layer_; }
+    bool active_frame(std::uint32_t layer, std::uint64_t position) const { return layer_ == layer && position_ == position; }
     int completion_handle() const { return reader_->completion_handle(); }
     bool pending_reads() const { return !requests_.empty() || !queued_.empty() || !predictions_.empty(); }
     bool pending_stores() const { return !write_queue_.empty(); }

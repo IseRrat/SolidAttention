@@ -402,6 +402,16 @@ struct AttentionNode::Impl {
             self.current_store = trace::Range("GPU->CPU Store", self.layer, self.frame->positions.at(0));
         } catch (...) { self.failure->capture(std::current_exception(), self.layer); }
     }
+    static void naive_history(ggml_tensor * destination, int ith, int, void * userdata) {
+        if (ith) return;
+        auto & self = *static_cast<Impl *>(userdata);
+        *static_cast<float *>(destination->data) = 0;
+        try {
+            self.failure->check();
+            self.prefetch->wait_naive_prefetch();
+            self.current_store = trace::Range("GPU->CPU Store", self.layer, self.frame->positions.at(0));
+        } catch (...) { self.failure->capture(std::current_exception(), self.layer); }
+    }
     static void dense_archive(ggml_tensor * destination, int ith, int, void * userdata) {
         if (ith) return;
         auto & self = *static_cast<Impl *>(userdata);
@@ -814,6 +824,14 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
             return source;
         };
         key=vectors(key); value=vectors(value);
+        if (impl_->prefetch && !impl_->prefetch->early_enabled()) {
+            // 沿用基线的主机阶段边界，等整批预取上传完成，再允许当前 KV 回传。
+            auto * history=ggml_custom_4d(context,GGML_TYPE_F32,1,1,1,1,&token,1,Impl::naive_history,1,impl_.get());
+            ggml_set_name(history,"naive_prefetch_upload_complete");
+            if (scheduler) ggml_backend_sched_set_tensor_backend(scheduler,history,
+                ggml_backend_sched_get_backend(scheduler,ggml_backend_sched_get_n_backends(scheduler)-1));
+            token=on_device(device_query_token(context,impl_->device_query,history));
+        }
         // Early selection is expanded as a CPU graph frontier before visiting
         // KV. Its scalar value is unused on GPU; retain Q with its GPU token
         // instead of copying the CPU control result back to the device.

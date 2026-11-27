@@ -43,6 +43,8 @@ public:
     // 当前设备 KV 到达后的汇合入口，安装本层 attention 所需数据并安排归档。
     std::vector<Half> decode_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys, ggml_tensor * source);
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);
+    // 图 11(b) 的阶段边界：整批预取上传完成后，图才回传当前 KV。
+    void wait_naive_prefetch();
     ScheduleStats schedule_stats() const;
     // The caller keeps the context/backend alive until this has returned.
     // 结束会话前收齐读写、搬运和工作线程，之后调用方才能释放后端与图。

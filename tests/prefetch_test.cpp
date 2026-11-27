@@ -35,8 +35,8 @@ void prefix() {
     fill(store, 6);
     solid::Prefetcher prefetch(store, {8, 1, 2, 1}, 2, std::move(reader));
     prefetch.begin(0, 6);
-    observe->auto_complete = true;
-    prefetch.poll();
+    prefetch.wait_reads();
+    require(!prefetch.pending_reads() && observe->pending.empty(), "batch upload boundary left SSD reads in flight");
     const auto reads = observe->stats().read_requests;
     store.append_interleaved(0, 6, token(g, 0, 6));
     std::vector<solid::HeadSelection> selected(2);

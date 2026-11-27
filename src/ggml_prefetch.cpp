@@ -122,9 +122,7 @@ public:
             auto * device = ggml_backend_get_device(backend_);
             if (!device) throw std::runtime_error("copy backend requires a registered device");
 #ifdef SOLID_HAVE_SYCL
-            if (mode != ScheduleMode::naive && !sycl_copy_)
-#else
-            if (mode != ScheduleMode::naive)
+            if (!sycl_copy_)
 #endif
             {
                 copy_owner_.reset(ggml_backend_dev_init(device, nullptr));
@@ -666,7 +664,7 @@ struct LayerWork {
                 {"current_h2d", TaskResource::h2d, serial ? std::vector<std::uint32_t>{append,history_h2d} : std::vector<std::uint32_t>{append}, 1},
                 {"attention_until_boundary", TaskResource::gpu, {current_h2d}, 1},
                 {"buffered_ssd_store", TaskResource::ssd, {append}, 1},
-                {"next_layer_prefetch", TaskResource::ssd, {current_h2d}, 1},
+                {"next_layer_prefetch", TaskResource::ssd, serial ? std::vector<std::uint32_t>{attention} : std::vector<std::uint32_t>{current_h2d}, 1},
             };
             if (archive) {
                 if (!projected_archive) specs[kv_d2h].predecessors={current_h2d};
@@ -759,8 +757,20 @@ struct GgmlPrefetch::Impl {
     }
     // 启动下一层推测性 SSD 读取，读好的块随后按可用槽位推进上传。
     void begin_prediction(std::uint32_t layer, std::uint64_t position) {
+        if (mode==ScheduleMode::naive && session.prefetcher().active_frame(layer,position)) return;
         session.begin_prefetch(layer, position);
         observe_stores();
+        if (mode==ScheduleMode::naive) {
+            quiesced=false;
+            // 保留与 Q/KV 投影的粗粒度并行；读盘与上传之间保持整批边界。
+            worker.submit([this] {
+                std::lock_guard<std::mutex> lock(mutex);
+                session.prefetcher().wait_reads();
+                observe_stores();
+                device.prefetch_ready();
+                device.wait_transfers();
+            });
+        }
     }
     void finish_archive(const std::shared_ptr<LayerWork> & frame) {
         const auto kv=transport.finish_archive(frame->archive_at_attention);
@@ -773,6 +783,12 @@ struct GgmlPrefetch::Impl {
     }
     void finish_attention_release(const std::shared_ptr<LayerWork> & finished,const std::function<void()> & before_upload) {
         trace::Scope phase("CPU Schedule Next Prefetch",finished->layer,finished->position);
+        if (mode==ScheduleMode::naive) {
+            // 图 11(b)：本层 attention 已完成，才启动下一层预取。
+            next_layer(finished);
+            if (finished->dag.finished()) finish_frame(finished);
+            return;
+        }
         if (per_completion_uploads) {
             device.prefetch_ready(before_upload,true);
             session.prefetcher().poll(false,[&](const SlotLease & lease) {
@@ -901,6 +917,10 @@ void GgmlPrefetch::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     impl_->begin_prediction(layer, position);
+}
+void GgmlPrefetch::wait_naive_prefetch() {
+    if (early_enabled()) throw std::logic_error("naive prefetch boundary outside naive schedule");
+    impl_->worker.join();
 }
 void GgmlPrefetch::select_early(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, bool covers) {
     select_impl(layer, position, query, nullptr, covers);
@@ -1047,7 +1067,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
     impl_->quiesced = false;
     auto work = current;
     if (!early_enabled()) {
-        impl_->device.wait_transfers(); impl_->begin_prediction(layer, position);
+        impl_->device.wait_transfers();
         work = impl_->new_work(layer, position,half!=nullptr);
         work->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), half?"serial_kv_fp16_download_complete":"serial_kv_download_complete");
         work->dag.start(append, impl_->trace.now());
@@ -1057,6 +1077,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         } else work->selection = impl_->session.select_decode(layer, position, query, keys, values, packed);
         work->dag.complete(append, impl_->trace.now());
         work->dag.fence({select_task}, impl_->trace.now(), "serial_selection_complete");
+        impl_->start_store(work);
         work->dag.start(miss_read, impl_->trace.now());
     } else {
         if (!work->archive_at_attention) {
@@ -1099,8 +1120,6 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
     if (!early_enabled()) {
         work->dag.complete(current_h2d, impl_->trace.now(), "serial_upload_complete");
         work->dag.start(attention, impl_->trace.now());
-        work->dag.fence({store_task}, impl_->trace.now(), "serial_buffered_store");
-        impl_->next_layer(work);
     } else {
         if (reuses_sync()) {
             impl_->transport.wait_on_compute();

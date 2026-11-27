@@ -367,6 +367,10 @@ void Prefetcher::poll(bool wait,const ReadyBlock & ready) {
         pump();
     }
 }
+void Prefetcher::wait_reads() {
+    check();
+    while (pending_reads()) poll(true);
+}
 // 根据该层历史选择准备预测请求；主机槽位与请求数量受工作区容量限制。
 void Prefetcher::begin(std::uint32_t layer, std::uint64_t position) {
     check();

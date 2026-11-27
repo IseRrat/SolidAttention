@@ -72,12 +72,17 @@ private:
 };
 struct Observer {
     solid::GgmlPrefetch * device;
+    solid::AttentionSession * session;
     std::uint32_t completions = 0;
     static bool evaluate(ggml_tensor * tensor, bool ask, void * userdata) {
         auto & self = *static_cast<Observer *>(userdata);
         const bool attention = tensor->op == GGML_OP_FLASH_ATTN_EXT && std::strcmp(ggml_get_name(tensor), "solid_prefetched_flash_attention") == 0;
         if (ask) return attention;
-        if (attention) { self.device->completed(self.device->attention_epoch()); ++self.completions; }
+        if (attention) {
+            if (!self.device->early_enabled()) require(self.session->prefetcher().active_layer()==self.completions%2,
+                "naive started the next layer's SSD prefetch before attention completed");
+            self.device->completed(self.device->attention_epoch()); ++self.completions;
+        }
         return true;
     }
 };
@@ -235,8 +240,12 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
                 require(!solid::graph_depends_on(kv,operations[layer]->selection_node()) &&
                     kv->src[3]==operations[layer]->selection_node()->src[0],"device KV must retain GPU Q without uploading the CPU control scalar");
                 require(kv->src[2]==operations[layer]->selection_node()->src[0]->src[0],"Q lifetime dependency is missing");
-            } else require(kv->src[2]==kv->src[3]->src[0] && solid::device_op(kv->src[3])==solid::DeviceOp::query_token,
-                "serial KV lacks its GPU query frontier");
+            } else {
+                require(kv->src[2]==kv->src[3]->src[0] && solid::device_op(kv->src[3])==solid::DeviceOp::query_token,
+                    "serial KV lacks its GPU query frontier");
+                require(kv->src[3]->src[1] && std::strcmp(ggml_get_name(kv->src[3]->src[1]),"naive_prefetch_upload_complete")==0,
+                    "naive KV download bypasses the completed prefetch upload");
+            }
             if (!infllm) {
                 auto * mask=operations[layer]->attention_node()->src[3]->src[0];
                 require(solid::device_op(mask)==solid::DeviceOp::release_mask && mask->src[1]==kv &&
@@ -274,7 +283,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     std::unique_ptr<ggml_backend_sched, decltype(&ggml_backend_sched_free)> scheduler(
         ggml_backend_sched_new(backends, nullptr, 1, 1024, false, true), ggml_backend_sched_free);
     require(scheduler != nullptr, "prefetch graph scheduler");
-    Observer observer{&device};
+    Observer observer{&device,&session};
     ggml_backend_sched_set_eval_callback(scheduler.get(), Observer::evaluate, &observer);
     for (int p = 6; p < 12; ++p) {
         for (const auto & operation : operations) {
@@ -331,7 +340,7 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         "sync reuse did not remove per-attention host fences");
     else require(observer.completions == 12, "scheduler failed to confirm each layer's attention completion");
     if (disk) require(session.stats().prefetch.io.completed_reads > 0, "GGML path did not complete liburing reads");
-    if (disk && mode != solid::ScheduleMode::naive) {
+    if (disk) {
         require(session.stats().prefetch.io.write_bytes == 12ull*kv_heads*dimension*2*sizeof(solid::Half),
                 "decode did not commit its full write buffers through liburing");
     }

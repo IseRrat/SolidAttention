@@ -400,6 +400,16 @@
 
    `scheduler_test.cpp` 核对算法 1 的关键路径优先、I/O 优先、最小 LST、前驱就绪及实测时长不影响静态排序。`block_stage_test.cpp`、`io_worker_test.cpp` 检查固定块图和实际 I/O 队列顺序；`attention_events_test.cpp`、`native_completion_test.cpp`、`prefetch_graph_test.cpp`、`cuda_device_input_test.cu`、`gather_test.cpp` 保留完成协议和数值检查，去掉计时断言。`config_test.cpp`、`test_adapter_generator.py`、`test_layout_ablation.py`、`audit_schedule_graph.py` 核对配置、生成结果和离线审计。服务器 CUDA 编译、53 项 CPU 检查和 CUDA 连续图数值核验通过，记录在 `results/server5090/static-dag-profiling-cleanup/`；原始 CUDA 核验采集为 `infllm-port-check-static-dag.xJDxnQf8/nsys/static-dag-native.nsys-rep`。
 
+20. **Naive 的整批通信边界**
+
+   `prefetch.hpp`、`prefetch.cpp` 增加 `wait_reads()`，收齐当前批次全部预测读取后返回。`ggml_prefetch.cpp` 的 Naive 预取工作在原有协调线程执行，依次完成整批 SSD 读取、整批 H2D 提交与上传等待；CUDA 使用独立复制 backend，保留与模型 Q/KV 投影的粗粒度并行。同层、同位置的启动入口沿用已准备的预取，避免重复投递任务。
+
+   `ggml_prefetch.hpp`、`llama_adapter.cpp` 增加 Naive 专用的预取完成入口与主机图节点。图沿用现有 query-token 算子建立阶段依赖，整批预取上传完成后才回传当前 FP16 KV。正式选块后的缺失 KV 继续通过整批 `resolve()` 读完，再交给设备工作区上传。
+
+   Naive 的 `next_layer_prefetch` 前驱改为本层 attention 完成，下一层预取从完成回执入口启动。当前 KV 进入每层写缓冲后，通过原有 `store_full_layer()` 提交满缓冲的异步写回，并收取真实写入完成回执。写缓冲仍按每层 32 KiB 合并。`schedule_ablation.py`、`test_schedule_tools.py` 对齐新的 Naive 依赖；`prefetch_test.cpp` 检查整批读完成边界，`prefetch_graph_test.cpp` 检查下一层读取启动位置、当前 KV 图依赖、连续解码输出与异步写入字节数。
+
+   服务器独立构建目录 `build/naive-serial-check/` 完成 17 项 CPU 图、预取、生命周期及调度记录检查，InfLLM 三种调度的连续输出对照通过；10 项 Python 调度工具检查通过。三个修改的 C++ 文件使用现有 CUDA 配置单独编译通过，产物保存在 `build/naive-cuda-objects/`；检查日志位于 `results/server5090/naive-serial-fix/`。
+
 ## 五、论文系统的工程接入
 
 对应论文 §7。

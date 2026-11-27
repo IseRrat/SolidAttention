@@ -19,11 +19,11 @@ def trace(mode):
              "kv_d2h_ready", "miss_read_and_reconcile", "history_h2d", "append_and_selection" if serial else "append_current_kv",
              "current_h2d", "attention_until_boundary", "buffered_ssd_store", "next_layer_prefetch"]
     deps = [[], [0], [7, 1] if serial else [1], [] if serial else [0], [3], [2], [5] if serial else [2],
-            [4] if serial else [4, 5, 6], [7, 6] if serial else [7], [8], [7], [8]]
+            [4] if serial else [4, 5, 6], [7, 6] if serial else [7], [8], [7], [9] if serial else [8]]
     rows = [dict(event="define", frame=1, task=i, layer=0, position=3, mode=mode, name=name, resource="host",
                  predecessors=deps[i], estimate_ns=1, origin_ns=0, clock="steady_clock_ns") for i, name in enumerate(names)]
     # Use a topological serial trace for deterministic audit arithmetic.
-    order = [0, 1, 3, 4, 7, 2, 5, 6, 8, 10, 11, 9] if serial else [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 9]
+    order = [0, 1, 3, 4, 7, 2, 5, 6, 8, 10, 9, 11] if serial else [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 11, 9]
     for time, task in enumerate(order):
         rows.append(dict(event="start", frame=1, task=task, timestamp_ns=2*time, fence=""))
         proof = ("query_dependency_reuse" if mode == "overlap+sync_reuse" else "attention_backend_complete") if task == 9 else ""
