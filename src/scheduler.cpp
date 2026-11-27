@@ -46,7 +46,7 @@ const char * schedule_mode_name(ScheduleMode mode) {
     throw std::invalid_argument("unknown schedule mode");
 }
 // 初始化日志时间原点；传入路径时创建逐行 JSON 日志，空路径表示关闭记录。
-ScheduleTrace::ScheduleTrace(const std::filesystem::path & path) : origin_(timestamp()) {
+ScheduleTrace::ScheduleTrace(const std::filesystem::path & path) : origin_(path.empty()?0:timestamp()) {
     if (!path.empty()) {
         if (std::filesystem::exists(path)) throw std::runtime_error("schedule trace already exists");
         stream_.open(path, std::ios::binary);
@@ -55,16 +55,16 @@ ScheduleTrace::ScheduleTrace(const std::filesystem::path & path) : origin_(times
 }
 // 销毁记录器，由文件流成员自动关闭日志文件。
 ScheduleTrace::~ScheduleTrace() = default;
-// 返回当前单调时钟时间，与任务日志中的纳秒时间戳使用同一时钟。
-std::uint64_t ScheduleTrace::now() const { return timestamp(); }
-// 写入任务定义：所属层和 token、使用资源、前驱任务及估计耗时，供离线还原 DAG。
+// 详细调度日志开启时读取单调时钟；关闭时返回 0，省去推理中的计时查询。
+std::uint64_t ScheduleTrace::now() const { return enabled()?timestamp():0; }
+// 写入任务定义：所属层和 token、使用资源、前驱任务及固定排序单位，供离线还原 DAG。
 void ScheduleTrace::define(std::uint64_t frame, std::uint32_t layer, std::uint64_t position, ScheduleMode mode,
                            std::uint32_t task, const TaskSpec & spec) {
     std::lock_guard<std::mutex> lock(mutex_);
     if (!stream_.is_open()) return;
     stream_ << nlohmann::json({{"event", "define"}, {"frame", frame}, {"layer", layer}, {"position", position},
         {"mode", schedule_mode_name(mode)}, {"task", task}, {"name", spec.name}, {"resource", resource_name(spec.resource)},
-        {"predecessors", spec.predecessors}, {"estimate_ns", spec.estimate_ns}, {"origin_ns", origin_}, {"clock", "steady_clock_ns"}}).dump() << '\n';
+        {"predecessors", spec.predecessors}, {"cost_units", spec.cost_units}, {"origin_ns", origin_}, {"clock", "steady_clock_ns"}}).dump() << '\n';
     if (!stream_) throw std::runtime_error("schedule trace write failed");
 }
 // 写入任务开始、完成或失败事件；可附完成证明和设备实际耗时。
@@ -81,8 +81,8 @@ void ScheduleTrace::flush() {
     std::lock_guard<std::mutex> lock(mutex_);
     if (stream_.is_open()) { stream_.flush(); if (!stream_) throw std::runtime_error("schedule trace flush failed"); }
 }
-// 建立任务依赖图并生成拓扑顺序；根据估计耗时计算关键路径及最晚开始时间（LST）。
-// LST 是相对整张图起点的时间；与最早开始时间相等的任务属于关键路径。
+// 建立任务依赖图并生成拓扑顺序；按固定任务单位计算关键路径及最晚开始序位（LST）。
+// 推理路径每个微任务使用一个单位；与最早开始序位相等的任务属于关键路径。
 TaskDag::TaskDag(std::vector<TaskSpec> specs, ScheduleTrace * trace, std::uint64_t frame, std::uint32_t layer,
                  std::uint64_t position, ScheduleMode mode) : trace_(trace && trace->enabled() ? trace : nullptr), frame_(frame), layer_(layer), position_(position) {
     if (specs.empty() || specs.size() > UINT32_MAX) throw std::invalid_argument("invalid DAG size");
@@ -98,7 +98,7 @@ TaskDag::TaskDag(std::vector<TaskSpec> specs, ScheduleTrace * trace, std::uint64
     std::vector<std::uint32_t> seen(tasks_.size(), UINT32_MAX);
     for (std::uint32_t id = 0; id < tasks_.size(); ++id) {
         const auto & spec = tasks_[id].spec;
-        if (spec.name.empty() || !spec.estimate_ns) throw std::invalid_argument("invalid task specification");
+        if (spec.name.empty() || !spec.cost_units) throw std::invalid_argument("invalid task specification");
         for (const auto before : spec.predecessors) {
             if (before >= tasks_.size() || before == id || seen[before] == id) throw std::invalid_argument("invalid DAG edge");
             seen[before] = id;
@@ -117,14 +117,14 @@ TaskDag::TaskDag(std::vector<TaskSpec> specs, ScheduleTrace * trace, std::uint64
     std::vector<std::uint64_t> earliest(tasks_.size()), tail(tasks_.size());
     std::uint64_t makespan = 0;
     for (const auto id : order_) {
-        for (const auto before : tasks_[id].spec.predecessors) earliest[id] = std::max(earliest[id], add(earliest[before], tasks_[before].spec.estimate_ns));
-        makespan = std::max(makespan, add(earliest[id], tasks_[id].spec.estimate_ns));
+        for (const auto before : tasks_[id].spec.predecessors) earliest[id] = std::max(earliest[id], add(earliest[before], tasks_[before].spec.cost_units));
+        makespan = std::max(makespan, add(earliest[id], tasks_[id].spec.cost_units));
     }
     // 反向求后续最长耗时，倒推出各任务最晚何时开始才不推迟整张图。
     for (auto it = order_.rbegin(); it != order_.rend(); ++it) {
         const auto id = *it;
-        for (const auto after : successors[id]) tail[id] = std::max(tail[id], add(tasks_[after].spec.estimate_ns, tail[after]));
-        tasks_[id].latest_start = makespan - add(tasks_[id].spec.estimate_ns, tail[id]);
+        for (const auto after : successors[id]) tail[id] = std::max(tail[id], add(tasks_[after].spec.cost_units, tail[after]));
+        tasks_[id].latest_start = makespan - add(tasks_[id].spec.cost_units, tail[id]);
         tasks_[id].critical = tasks_[id].latest_start == earliest[id];
     }
     if (trace_) for (std::uint32_t id = 0; id < tasks_.size(); ++id) trace_->define(frame, layer, position, mode, id, tasks_[id].spec);
@@ -227,26 +227,6 @@ TaskSnapshot TaskDag::snapshot(std::uint32_t id) const {
 bool TaskDag::finished() const {
     std::lock_guard<std::recursive_mutex> lock(mutex_);
     return std::all_of(tasks_.begin(), tasks_.end(), [](const auto & task) { return task.state == TaskState::complete; });
-}
-// 图完成后，沿依赖累加实际任务耗时，求最长依赖链；任务有设备计时时优先使用它。
-std::uint64_t TaskDag::critical_path_ns() const {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    if (!finished()) throw std::logic_error("critical path requires completed tasks");
-    std::vector<std::uint64_t> costs(tasks_.size());
-    std::uint64_t maximum = 0;
-    for (const auto id : order_) {
-        for (const auto before : tasks_[id].spec.predecessors) costs[id] = std::max(costs[id], costs[before]);
-        costs[id] = add(costs[id], tasks_[id].duration_ns()); maximum = std::max(maximum, costs[id]);
-    }
-    return maximum;
-}
-// 求两个已完成任务的主机起止区间交集，返回重叠纳秒数。
-std::uint64_t TaskDag::overlap_ns(std::uint32_t a, std::uint32_t b) const {
-    std::lock_guard<std::recursive_mutex> lock(mutex_);
-    const auto & x = tasks_.at(a); const auto & y = tasks_.at(b);
-    if (x.state != TaskState::complete || y.state != TaskState::complete) throw std::logic_error("overlap requires completed tasks");
-    const auto begin = std::max(x.start_ns, y.start_ns), end = std::min(x.end_ns, y.end_ns);
-    return end > begin ? end - begin : 0;
 }
 // 创建并命名常驻工作线程，按 cpu 参数设置亲和性，等线程初始化完成后返回。
 TaskWorker::TaskWorker(int cpu, const char * name) {

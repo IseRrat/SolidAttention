@@ -19,7 +19,7 @@ public:
     bool copy_ready(ggml_backend_event *) const override { return true; }
     const char * name() const override { return "cpu_protocol"; }
 protected:
-    std::uint64_t elapsed_ns(std::uint32_t) const override { if (error) throw std::runtime_error("event timing failure"); return 42; }
+    void on_receipt(std::uint32_t) const override { if (error) throw std::runtime_error("event receipt failure"); }
 };
 void publish(solid::StreamCompletionToken * token) { token->notify(token->userdata); }
 void binding() {
@@ -56,7 +56,7 @@ void receipts() {
 #endif
     events.acknowledge();
     const auto first=events.poll(0,1);
-    require(first && first->proof==solid::AttentionProof::device_signal && first->device_ns==42,"device event proof or timing lost");
+    require(first && first->proof==solid::AttentionProof::device_signal,"device event proof lost");
     events.boundary(solid::AttentionProof::attention_boundary,1);
     require(events.boundary_seen(1) && !events.handoff_seen(1),"attention receipt stopped next-layer prefetch");
     events.boundary(solid::AttentionProof::query_boundary,1);
@@ -65,7 +65,7 @@ void receipts() {
     rejects([&] { events.arm(0,1); });
     events.arm(1,2); events.boundary(solid::AttentionProof::query_boundary);
     const auto query=events.poll(1,2);
-    require(query && query->proof==solid::AttentionProof::query_boundary && query->device_ns==0,"query boundary forged device timing");
+    require(query && query->proof==solid::AttentionProof::query_boundary,"query boundary proof lost");
     events.arm(0,3); publish(events.token(1)); require(!events.poll(0,3),"other layer's old callback ended current attention");
     events.boundary(solid::AttentionProof::process_boundary);
     require(events.poll(0,3)->proof==solid::AttentionProof::process_boundary,"process boundary proof");

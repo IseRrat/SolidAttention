@@ -23,7 +23,8 @@ with tempfile.TemporaryDirectory(prefix="solid-schedule-audit-") as temporary:
             schedule=folder / "schedule.jsonl"
             observed = audit_schedule(schedule, mode)
             expected = json.loads((folder / "stats.json").read_text())
-            if observed != expected:
+            observed_counts = {key: value for key, value in observed.items() if not key.endswith("_ns")}
+            if observed_counts != expected:
                 raise ValueError(f"schedule trace differs from C++ metrics: {name}/{folder.name}: {observed} != {expected}")
             archives=sum(json.loads(line).get("fence")=="kv_archive_copy_complete" for line in schedule.read_text().splitlines())
             if archives != (observed["frames"] if name in ("device-input","shared-buffer") else 0):
@@ -32,6 +33,7 @@ with tempfile.TemporaryDirectory(prefix="solid-schedule-audit-") as temporary:
             for key,value in json.loads((folder/"device-stats.json").read_text()).items():
                 if residency.get(key,0)!=value: raise ValueError(f"device row transfer metrics differ: {name}/{folder.name}/{key}")
             blocks=audit_block_schedule(folder/"schedule.blocks.jsonl",mode,folder/"schedule.jsonl")
-            if blocks != json.loads((folder/"block-stats.json").read_text()):
+            block_counts = {key: value for key, value in blocks.items() if not key.endswith("_ns")}
+            if block_counts != json.loads((folder/"block-stats.json").read_text()):
                 raise ValueError(f"block schedule trace differs from C++ metrics: {name}/{folder.name}")
 print("three modes and completion protocol: CPU GGML traces and metrics audited")

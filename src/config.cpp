@@ -154,9 +154,9 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
     }
     if (j.contains("attention")) {
         const auto & a = j.at("attention");
-        const std::set<std::string> allowed = {"storage", "sparse", "infllm_attention", "gpu_decode", "layout", "fuse_kv_projection", "profile", "block_tokens", "context_budget_tokens",
+        const std::set<std::string> allowed = {"storage", "sparse", "infllm_attention", "gpu_decode", "layout", "fuse_kv_projection", "block_tokens", "context_budget_tokens",
             "init_tokens", "local_tokens", "representative_count", "write_buffer_bytes_per_layer", "session_file", "keep_session_file", "direct_decode_reads", "selection_replay",
-            "prefetch", "prefetch_ahead", "coalesce_uploads", "per_completion_uploads", "measure_upload_ready_time", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head", "schedule", "schedule_trace", "selection_trace", "selection_backend", "prefill_backend", "prefill_tile_tokens", "io_cpu", "coordinator_cpu"};
+            "prefetch", "prefetch_ahead", "coalesce_uploads", "per_completion_uploads", "prefetch_trace", "prefetch_queue_depth", "prefetch_slots_per_head", "schedule", "schedule_trace", "selection_trace", "selection_backend", "prefill_backend", "prefill_tile_tokens", "io_cpu", "coordinator_cpu"};
         if (!a.is_object()) throw std::invalid_argument("attention must be an object");
         for (const auto & item : a.items()) if (allowed.count(item.key()) == 0) throw std::invalid_argument("unknown attention key: " + item.key());
         auto & target = result.attention;
@@ -175,7 +175,6 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
             target.interleaved = layout == "interleaved";
         }
         if (a.contains("fuse_kv_projection")) target.fuse_kv_projection = a.at("fuse_kv_projection").get<bool>();
-        if (a.contains("profile")) target.profile = a.at("profile").get<bool>();
         if (a.contains("selection_replay")) {
             if (!target.sparse) throw std::invalid_argument("selection replay requires sparse attention");
             target.selection_replay = resolve(base, a.at("selection_replay").get<std::string>());
@@ -204,7 +203,6 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         if (a.contains("prefetch_ahead")) target.prefetch_ahead = a.at("prefetch_ahead").get<bool>();
         if (a.contains("coalesce_uploads")) target.coalesce_uploads = a.at("coalesce_uploads").get<bool>();
         if (a.contains("per_completion_uploads")) target.per_completion_uploads = a.at("per_completion_uploads").get<bool>();
-        if (a.contains("measure_upload_ready_time")) target.measure_upload_ready_time = a.at("measure_upload_ready_time").get<bool>();
         if (a.contains("prefetch_trace")) target.prefetch_trace = a.at("prefetch_trace").get<bool>();
         if (a.contains("schedule")) target.schedule = a.at("schedule").get<std::string>();
         if (target.schedule != "naive" && target.schedule != "overlap" && target.schedule != "overlap+sync_reuse") throw std::invalid_argument("unknown schedule");
@@ -220,7 +218,7 @@ RunConfig RunConfig::load(const std::filesystem::path & path) {
         if (!target.prefetch && (a.contains("prefetch_ahead") || a.contains("prefetch_queue_depth") || a.contains("prefetch_slots_per_head") || a.contains("prefetch_trace"))) throw std::invalid_argument("prefetch options require prefetch=true");
         if (!target.prefetch && (a.contains("schedule") || a.contains("schedule_trace"))) throw std::invalid_argument("schedule requires prefetch=true");
         if (!target.prefetch && a.contains("coalesce_uploads")) throw std::invalid_argument("coalesce_uploads requires prefetch=true");
-        if (!target.prefetch && (a.contains("per_completion_uploads") || a.contains("measure_upload_ready_time"))) throw std::invalid_argument("upload dispatch options require prefetch=true");
+        if (!target.prefetch && a.contains("per_completion_uploads")) throw std::invalid_argument("upload dispatch options require prefetch=true");
         if (target.per_completion_uploads && (target.coalesce_uploads || target.schedule=="naive")) throw std::invalid_argument("per-completion uploads require coalescing disabled and an overlapped schedule");
         for (const auto key:{"io_cpu","coordinator_cpu"}) {
             if (!a.contains(key)) continue;

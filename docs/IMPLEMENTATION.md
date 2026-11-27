@@ -36,7 +36,7 @@
 
    `experiments.py` 增加上述单开关变体，`cuda-paper.json` 增加 16K、1K 预算的交织对照套件。`config_test.cpp` 与 `test_experiments.py` 检查分离布局保留融合投影和预取；`prefetch_graph_test.cpp` 覆盖分离布局的内存、SSD 及三种调度模式；`cuda_device_input_test.cu` 对照标量参考核对分离布局的真实 CUDA 输出、连续图复用及完成通知。服务器编译、54 项 CPU 检查、18 项实验脚本检查及 CUDA 数值核验通过，记录位于 `results/server5090/figure17-interleaving-check/`，CUDA 原始采集位于 `results/server5090/infllm-port-check-figure17.N1VYwkeX/nsys/figure17-layout-native.nsys-rep`。
 
-   `scheduler.hpp`、`ggml_prefetch.cpp` 累计本层 Q 就绪到 attention 完成回执的主机观察时长，包含该区间内的 KV 投影、评分及未隐藏的读盘、搬运等待；结束点位于本层归档处理前。`baseline.cpp` 输出 `attention_layer_span_ms` 与 `attention_layer_span_layers`，按实际 Decode 步数计算每步所有层的 attention 总时长。计时复用已有时间戳，不插入同步；上述 CPU 图及 CUDA 核验分别检查 12、16 次层调用全部计入。
+   `ggml_prefetch.cpp` 用 Nsight 的 `Attention module` 区间标记统一 KV 适配器入口到 attention 完成回执，按层号与 token 位置关联。区间覆盖该入口后的读取、上传等待及 attention；耗时从 Nsight 导出数据提取。
 
    `1cd52d7` 完成三个模型、六组 CUDA 交织对照，16K WikiText-2 输入、512 输出、每组一次，开启 Nsight、8 GiB 显存限制、16 GiB 内存限制和 Decode O_DIRECT。Llama-3.2-3B、Llama-3.1-8B、Qwen2.5-7B 的关闭／开启交织 attention 延迟分别为 145.91／69.02、160.18／86.49、57.75／29.70 ms/步，归一化值为 0.473、0.540、0.514。六组使用同一提交与二进制，同模型的评分次数、候选块数、选中 token 数与层调用数相同；完成通知全部来自设备回执。数据、逐组配置、论文样式柱状图及六份原始采集保存在 `results/server5090/figure17a-cuda-three-models-1cd52d7.gtnrrhbp/`，其中 `capture/nsys/INDEX.tsv` 标明方法与文件对应关系。
 
@@ -238,9 +238,9 @@
 
    `b7c0d85` 的 CUDA 图复用核验通过严格的 16 次设备通知、零次 CPU 替代检查。8K、512 输出的 Qwen 单点记录 14,308 次设备通知、零次 CPU 替代；修复前为零次设备通知、14,308 次 CPU 替代。Prefill 从 1.345 秒变为 1.314 秒，Decode 从 25.33 变为 25.10 token/s。结果位于 `results/server5090/attention-completion-8k-b7c0d85.415j2qhz/`。固定 88 个 Decode 输入的补充对照中，旧通知路径重复运行也在第 88 个输出发生贪心结果分歧；旧路径重复、新路径重复、跨路径对照的 logits 平均绝对差分别为 0.05337、0.06011、0.05443，逐步比较保存在 `results/server5090/completion-notification-replay-VfjhDvIK/verified-comparison.json`。
 
-   `scheduler.hpp`、`ggml_prefetch.cpp` 累计当前层 K/V 投影就绪后，计算线程等待正式读取协调任务完成的耗时和次数；`baseline.cpp` 输出 `history_consumer_wait_ms`、`history_consumer_wait_calls`。Nsight 对应条为 `CPU Wait KV`。计时包住原有等待，不增加设备同步；此项包括协调任务剩余工作，GPU 后续等待上传完成仍由实际 CUDA 时间线查看。`cuda_device_input_test.cu` 检查连续 16 次解码层调用均计入。
+   当前层 KV 入口的主机等待保留 `CPU Wait KV` 阶段标记。计算流上的上传依赖由原有完成事件建立；CPU 等待、GPU 搬运与计算的实际区间分别从 Nsight 的 NVTX、CUDA API、memory 和 kernel 行读取。
 
-   图 16 的缓存加载阻塞计时分为主机与设备两段。主机段在当前 KV 消费前沿和正式选块完成两者中取较晚者，到所需历史读取完成、上传提交结束为止；已被投影隐藏的读取以及评分等待不计入。设备段在原计算流的上传依赖前后各记录 CUDA 事件，等原有 attention 回执到达后读取耗时。两段顺序相接，事件复用且计时不新增设备等待。`baseline.cpp` 输出 `cache_loading_host_block_ms`、`cache_loading_device_block_ms`、两段之和 `cache_loading_blocking_ms`，以及主机与设备段覆盖的层数。模型每步阻塞延迟由所有层累计，最后按实际 Decode 步数取平均。`scheduler_test.cpp` 检查选块等待、投影隐藏及全命中三种边界；`cuda_device_input_test.cu` 检查复用图每层都有两段统计。对应文件为 `scheduler.hpp`、`ggml_prefetch.cpp`、`baseline.cpp` 和上述两个检查文件。
+   缓存加载阻塞分析使用 Nsight 的消费者等待、选块、SSD 读取、H2D 与计算流依赖记录。程序内部的逐层加载时钟、额外 CUDA 起止计时事件及缓存加载毫秒汇总字段已移除。
 
    服务器完成 54 项 CPU 检查及 CUDA 图复用核验，包含开启和关闭提前预取两种设置，分别要求 16 次主机统计、16 次设备统计、16 次设备完成通知及零次 CPU 通知替代。记录位于 `results/server5090/figure16-cache-blocking-check/`，原始 Nsight 位于 `results/server5090/infllm-port-check-10d694c.uyfXf9xR/nsys/figure16-cache-blocking-v1.nsys-rep`。
 
@@ -278,17 +278,17 @@
 
    [ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[copy_queue.cpp](../src/sycl/copy_queue.cpp)、[sycl_backend.hpp](../include/solid/sycl_backend.hpp)。
 
-6. **设备任务计时**
+6. **Nsight 设备阶段与完成通知**
 
-   已写 Q/KV 投影区间、历史块上传及 KV 归档区间回执，DAG 使用设备时长更新成本，调度轨迹核查采用同一口径。CUDA 用原生事件记录，SYCL 使用设备支持的时间戳或复制队列 profiling。复制票据完成时收集区间，后继层使用更新后的成本。
+   GPU 计算、H2D、D2H 及事件依赖使用 Nsight Systems 采集。CUDA attention 保留关闭计时的结束事件和 stream 通知；SYNC 复用继续依靠该通知确认计算与当前 KV 归档完成。投影、逐块搬运、归档和消费者等待的独立计时事件已删除，设备完成回执只携带完成证明。
 
-   [device_timing.hpp](../include/solid/device_timing.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[scheduler.cpp](../src/scheduler.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)。
+   [attention_events.cu](../src/cuda/attention_events.cu)、[cuda_completion.cuh](../include/solid/cuda_completion.cuh)、[attention_events.hpp](../include/solid/attention_events.hpp)、[attention_events.cpp](../src/attention_events.cpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[generate_adapter.py](../scripts/generate_adapter.py)。
 
 7. **CUDA 调度消融的公共搬运与计时**
 
    三种调度均保留 KV 交织、融合投影、GPU 评分、提前预取和相邻块合并。`ggml_prefetch.cpp` 为 CUDA `naive` 分配与其余模式相同的页锁定主机槽位，上传仍使用模型队列并等待完成；`overlap` 和 `overlap+sync_reuse` 保留独立复制队列。`device_cache.cpp` 在串行准备路径中也将缺失的历史块交给已有批量上传函数，沿用两端地址同时连续才合并的规则。三组通过调度模式控制提前选块、补读重叠和同步复用。
 
-   `scheduler.hpp`、`ggml_prefetch.cpp` 从各路径进入 `decode_impl` 的共同 KV 适配器入口记录主机时间，到 attention 完成回执为止；`baseline.cpp` 输出 `attention_consumer_span_ms` 和 `attention_consumer_span_layers`。计时复用原有调用与回执，不插入同步，另保留 Q 就绪口径供既有记录使用。`prefetch_graph_test.cpp`、`cuda_device_input_test.cu` 检查连续 12、16 次层调用的覆盖；CUDA 检查另外要求三种模式都有页锁定缓冲及历史批量上传。服务器编译、54 项 CPU 检查、19 项实验脚本检查和 CUDA 数值核验通过，记录位于 `results/server5090/figure17b-scheduler-check/`，原始核验采集为 `results/server5090/infllm-port-check-figure17b.c2lom9JJ/nsys/figure17b-native-schedules.nsys-rep`。
+   三种调度模式在共同的 KV 适配器入口开启 `Attention module` Nsight 区间，收到本层 attention 完成回执时结束。`ggml_prefetch.cpp` 保留同一计量边界，程序内部的消费者毫秒计数已移除。
 
    `cuda-paper.json` 增加 16K、1K 预算的调度套件，使用已有 `prefetch`、`overlap`、`solid` 变体，分别对应 `naive`、`overlap`、`overlap+sync_reuse`。`test_experiments.py` 检查三组配置除 `attention.schedule` 外完全相同。
 
@@ -382,9 +382,23 @@
 
 18. **固定块依赖的紧凑状态与预取优先级计算**
 
-   `block_stage.hpp`、`block_stage.cpp` 为固定的并行 `READ→H2D→join` 依赖直接计算关键路径和最晚开始时间，使用连续数组保存读盘、上传状态及完成时刻。块身份通过排序索引查询，上传优先级预先排序，读盘完成时只更新就绪状态。完整通用 DAG 在开启详细调度记录时建立。`prefetch.cpp` 的预测阶段直接取得读盘和上传优先级，省去单独建立预测状态图。`io_worker.cpp` 用现有就绪索引和完成回执计数判断待提交请求与排空条件。
+   `block_stage.hpp`、`block_stage.cpp` 为固定的并行 `READ→H2D→join` 依赖直接计算关键路径和最晚开始时间，使用连续数组保存读盘与上传状态。块身份通过排序索引查询，上传优先级预先排序，读盘完成时只更新就绪状态。完整通用 DAG 在开启详细调度记录时建立。`prefetch.cpp` 的预测阶段直接取得读盘和上传优先级，省去单独建立预测状态图。`io_worker.cpp` 用现有就绪索引和完成回执计数判断待提交请求与排空条件。
 
-   `block_stage_test.cpp` 的 48 组对照覆盖不同块数、耗时、同分、乱序完成和分批上传，核对与通用 DAG 相同的关键路径、LST、读盘与上传顺序。服务器编译和 54 项 CPU 检查通过，记录位于 `results/server5090/flat-block-dispatch-check/`。同目录 CPU 调度测量的 128 块样例中，预测阶段中位耗时从 25.894 降至 0.633 微秒，正式阶段从 54.194 降至 16.076 微秒；每次动态分配分别从 528／817 次降至 1／139 次。测量对象为 CPU 调度代码，GPU 核验等待服务器空闲。
+   `block_stage_test.cpp` 的 48 组对照覆盖不同块数、耗时、同分、乱序完成和分批上传，核对与通用 DAG 相同的关键路径、LST、读盘与上传顺序。服务器编译和 54 项 CPU 检查通过，记录位于 `results/server5090/flat-block-dispatch-check/`。同目录 CPU 调度测量的 128 块样例中，预测阶段中位耗时从 25.894 降至 0.633 微秒，正式阶段从 54.194 降至 16.076 微秒；每次动态分配分别从 528／817 次降至 1／139 次。测量对象为 CPU 调度代码，当前 CUDA 核验见本节第 19 项。
+
+19. **静态 DAG 优先级与推理计时清理**
+
+   `scheduler.hpp`、`scheduler.cpp` 将排序成本命名为 `cost_units`，推理层图每个微任务固定取 1。先按依赖求关键路径，再反向计算 LST；执行时从前驱已满足的任务中优先取关键路径任务，其次 I/O，各自取 LST 最小者。固定 1 是本次讨论确定的 ComputeLST 计算口径。`ggml_prefetch.cpp` 删除逐层和逐块实测耗时的滑动更新，`prefetch.hpp`、`prefetch.cpp`、`session.hpp`、`session.cpp` 删除预测耗时参数，正式块计划沿用固定排序单位。`async_reader.hpp` 的请求类别仅在关键路径与 LST 均相同时用于选择，I/O 所有者沿用该比较顺序。`block_stage.hpp`、`block_stage.cpp` 的紧凑状态去掉逐块时刻和设备耗时存储，仅保留依赖状态。
+
+   `session.cpp`、`dense_offload.cpp`、`llama_adapter.cpp`、`kv_store.cpp`、`async_reader.cpp`、`io_worker.cpp`、`prefetch.cpp`、`device_cache.cpp` 删除评分、聚集、归档、每笔读写、读完到上传等待等计时及相应缓冲。对应头文件移除耗时字段和计时选项，写回回执用完成标志表示结果。`baseline.cpp` 移除这些分项毫秒输出，保留请求及 Prefill/Decode 的基准测量、I/O 字节、资源与完成计数。关闭详细诊断记录时，调度时刻入口返回 0；Nsight 阶段标记和原有完成通知继续工作。
+
+   `ggml_prefetch.cpp` 删除投影、复制、归档和计算流等待的额外设备计时事件。`cuda/attention_events.cu` 的完成事件使用 `cudaEventDisableTiming`；`cuda_completion.cuh` 跳过空的开始事件。`attention_events.hpp`、`attention_events.cpp` 的回执只保存完成证明。`llama_adapter.hpp`、`llama_adapter.cpp`、`device_ops.hpp`、`device_ops.cuh`、`sycl_device_ops.hpp` 和 `generate_adapter.py` 移除投影计时绑定及执行钩子。SYCL 的 `attention_events.cpp`、`copy_queue.cpp`、`sycl_backend.hpp` 删除 profiling tag、复制计时与队列 profiling 开关，保留数据依赖事件。
+
+   删除 `include/solid/device_timing.hpp`、`include/solid/profile.hpp`、`src/profile.cpp` 和专用的 `tests/profile_test.cpp`。`CMakeLists.txt` 移除内部 profiler 目标，`config.hpp`、`config.cpp` 移除对应配置。`experiments.py`、`layout_ablation.py`、`schedule_ablation.py`、`experiment_common.py` 更新配置生成与汇总；离线审计继续核对依赖和完成计数，取消与已删除的在线计时字段比较。`projection.hpp`、`projection.cpp` 和适配器移除融合初始化的内部计时字段。
+
+   CUDA SR 在计算流提交历史上传等待后，登记历史与当前 KV 的依赖已建立，并将 attention 置为运行中；后续 attention 回执只完成本层计算、释放读者及归档。`llama_adapter.hpp`、`llama_adapter.cpp` 增加已初始化 CUDA 原生完成能力查询，`baseline.cpp` 用于旧 FlashAttention 观察器的启用判断。`ggml_prefetch.cpp` 保留 KV 消费入口的原有互斥保护，并通过 `Attention module` NVTX 区间表示统一入口到完成回执。
+
+   `scheduler_test.cpp` 核对算法 1 的关键路径优先、I/O 优先、最小 LST、前驱就绪及实测时长不影响静态排序。`block_stage_test.cpp`、`io_worker_test.cpp` 检查固定块图和实际 I/O 队列顺序；`attention_events_test.cpp`、`native_completion_test.cpp`、`prefetch_graph_test.cpp`、`cuda_device_input_test.cu`、`gather_test.cpp` 保留完成协议和数值检查，去掉计时断言。`config_test.cpp`、`test_adapter_generator.py`、`test_layout_ablation.py`、`audit_schedule_graph.py` 核对配置、生成结果和离线审计。服务器 CUDA 编译、53 项 CPU 检查和 CUDA 连续图数值核验通过，记录在 `results/server5090/static-dag-profiling-cleanup/`；原始 CUDA 核验采集为 `infllm-port-check-static-dag.xJDxnQf8/nsys/static-dag-native.nsys-rep`。
 
 ## 五、论文系统的工程接入
 
@@ -436,7 +450,7 @@
 
    `dense_offload.cpp` 用一份对齐的主机缓冲和一份显存缓冲逐层交换分离的 FP16 K/V。解码输入就绪时启动第 0 层读取，当前层 FlashAttention 完成时启动下一层读取。`kv_store.cpp` 一批提交该层各头的连续 K/V 读请求，直接读对齐区间并从待写缓冲补齐尚未落盘的行。
 
-   `llama_adapter.cpp` 将历史上传与当前 K/V 回传拆成两个图节点。Q 留在计算设备，K/V 投影完成后上传整层历史、回传本步 K/V，再用 GGML `SET_ROWS` 填入当前行，由 llama.cpp 的 FlashAttention 计算。当前层写缓冲达到容量时，后台线程在 attention 执行期间提交写回。`session.cpp` 记录历史等待与归档，`baseline.cpp` 记录逐阶段读取、等待和上传量。`gather_test.cpp` 检查两个连续解码步的输出，`uring_test.cpp` 核对批读后的 K/V 和待写尾部。
+   `llama_adapter.cpp` 将历史上传与当前 K/V 回传拆成两个图节点。Q 留在计算设备，K/V 投影完成后上传整层历史、回传本步 K/V，再用 GGML `SET_ROWS` 填入当前行，由 llama.cpp 的 FlashAttention 计算。当前层写缓冲达到容量时，后台线程在 attention 执行期间提交写回。`session.cpp` 管理历史读取与归档，`baseline.cpp` 记录读取和上传量，等待耗时从 Nsight 提取。`gather_test.cpp` 检查两个连续解码步的输出，`uring_test.cpp` 核对批读后的 K/V 和待写尾部。
 
 6. **运行与结果记录**
 
@@ -444,7 +458,7 @@
 
    所有层共用一份显存工作缓冲，每次切换层或解码步时重新从 SSD 读取所需的历史 KV。正式选块后再批量补读、上传剩余历史 KV。本步 K/V 直接取自回传的投影结果，已满的写缓冲在选块期间后台落盘。GGML 按逻辑位置聚集分离的 K、V 并计算原有 InfLLM attention。解码回归检查连续两步均读取历史 KV，并与参考 attention 对照。 [llama_adapter.hpp](../include/solid/llama_adapter.hpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
 
-   `kv_store.hpp`、`kv_store.cpp` 的分离 KV 区间批读按队列深度提交 `io_uring`，从待写缓冲补齐尚未落盘的行。`session.hpp`、`session.cpp` 提供读取及等待计时，`llama_adapter.hpp` 将预取及缓存绑定到解码节点，`baseline.cpp` 记录固定窗口等待、上传、命中和淘汰。`gather_test.cpp` 对照连续解码两步的输出和读请求计数。
+   `kv_store.hpp`、`kv_store.cpp` 的分离 KV 区间批读按队列深度提交 `io_uring`，从待写缓冲补齐尚未落盘的行。`session.hpp`、`session.cpp` 提供读取入口，`llama_adapter.hpp` 将预取及缓存绑定到解码节点，`baseline.cpp` 记录上传、命中和淘汰计数。`gather_test.cpp` 对照连续解码两步的输出和读请求计数。
 
    Offload 和 Offload＋Sparse 同步读入 ggml 的目标缓冲区，纯卸载取当前层完整历史，稀疏卸载取相邻选中行组成的区间。两者分别填充每个 query head 的有效 mask。SolidAttention 的交织、推测性预取及 SSD 调度由对应模块执行。[session.hpp](../include/solid/session.hpp)、[session.cpp](../src/session.cpp)、[llama_adapter.cpp](../src/llama_adapter.cpp)、[gather_test.cpp](../tests/gather_test.cpp)。
 

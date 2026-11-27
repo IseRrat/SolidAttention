@@ -116,7 +116,7 @@ std::unique_ptr<solid::AsyncReader> worker(const std::shared_ptr<Control> & cont
 }
 void completion_notification(bool immediate) {
     auto control=std::make_shared<Control>(); control->block_second_poll=true;
-    auto io=solid::make_io_worker([control] { return std::make_unique<Reader>(control); },2,-1,immediate,immediate);
+    auto io=solid::make_io_worker([control] { return std::make_unique<Reader>(control); },2,-1,immediate);
     Release release{control}; std::array<unsigned char,8> a{},b{};
     require(io->submit(1,0,a.data(),a.size(),0) && io->submit(2,0,b.data(),b.size(),0),"notification reads rejected");
     require(control->wait([&] { return control->submissions.size()==2; }),"notification reads not submitted");
@@ -128,7 +128,6 @@ void completion_notification(bool immediate) {
     require((notified>0)==immediate,"per-CQE notification waited for the completion drain");
     solid::ReadCompletion result{};
     require(io->poll(result,false) && result.id==1 && a[0]==1 && b[0]==0,"notification did not publish completed data");
-    require((result.observed_ns>0)==immediate,"optional completion timing was ignored");
     control->release();
     require(io->poll(result,true) && result.id==2 && b[0]==2,"second notification lost");
 }
@@ -238,7 +237,7 @@ void queued_updates_and_cancel() {
         if (result.id==5) { require(result.result<0 && bytes[4]==0,"queued canceled read reached the engine"); ++canceled; }
     }
     { std::lock_guard<std::mutex> lock(control->mutex);
-      require(control->submissions==std::vector<std::uint64_t>{1,4,2,3,6},"promotion/cancellation left a stale ready entry or changed FIFO order"); }
+      require(control->submissions==std::vector<std::uint64_t>{1,2,4,3,6},"critical/LST priority or same-priority FIFO changed after promotion/cancellation"); }
     require(canceled==1 && io->stats().queued_cancellations==1,"duplicate cancellation changed queue accounting");
 }
 void placement() {

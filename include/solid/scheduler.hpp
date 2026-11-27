@@ -19,20 +19,14 @@ enum class ScheduleMode { naive, overlap, sync_reuse };
 ScheduleMode parse_schedule_mode(const std::string & name);
 const char * schedule_mode_name(ScheduleMode mode);
 
-// CPU is at the KV consumer frontier. Exclude selection and any loading
-// already hidden before that frontier; GPU upload waits are timed separately.
-inline std::uint64_t cache_load_host_block_ns(std::uint64_t consumer_ready,
-        std::uint64_t selection_ready,std::uint64_t uploads_submitted) {
-    const auto start=consumer_ready>selection_ready?consumer_ready:selection_ready;
-    return uploads_submitted>start?uploads_submitted-start:0;
-}
 enum class TaskResource { host, ssd, h2d, d2h, gpu };
 enum class TaskState { pending, running, complete, failed };
 struct TaskSpec {
     std::string name;
     TaskResource resource = TaskResource::host;
     std::vector<std::uint32_t> predecessors;
-    std::uint64_t estimate_ns = 1;
+    // 静态排序单位；推理路径各微任务固定为 1，运行中保持不变。
+    std::uint64_t cost_units = 1;
 };
 struct TaskRecord {
     TaskSpec spec;
@@ -78,8 +72,6 @@ public:
     // 用一份实际同步完成证明，同时确认它覆盖的多个任务。
     void fence(const std::vector<std::uint32_t> & covered, std::uint64_t now, const std::string & proof);
     void abort(std::uint64_t now);
-    std::uint64_t critical_path_ns() const;
-    std::uint64_t overlap_ns(std::uint32_t a, std::uint32_t b) const;
     bool finished() const;
     TaskRecord task(std::uint32_t id) const;
     TaskSnapshot snapshot(std::uint32_t id) const;
@@ -122,9 +114,9 @@ struct ScheduleStats {
     std::string completion_backend="graph_boundaries";
     int coordinator_cpu=-1;
     std::uint64_t frames = 0, tasks = 0, worker_jobs = 0;
-    std::uint64_t block_frames=0,block_tasks=0,block_critical_path_ns=0;
-    std::uint64_t device_event_completions=0,device_attention_ns=0,device_boundary_fallbacks=0,uploads_before_boundary=0,copy_event_queries=0;
-    std::uint64_t critical_path_ns = 0, miss_projection_overlap_ns = 0;
+    std::uint64_t block_frames=0,block_tasks=0;
+    std::uint64_t device_event_completions=0,device_boundary_fallbacks=0,uploads_before_boundary=0,copy_event_queries=0;
+
     std::uint64_t query_reused_fences = 0, process_reused_fences = 0, attention_fences = 0;
     std::uint64_t attention_receipt_reuses = 0;
     std::uint64_t fallback_fences = 0, event_waits = 0, batch_waits = 0, stream_waits = 0;
@@ -132,11 +124,5 @@ struct ScheduleStats {
     std::uint64_t backend_drains = 0, backend_compute_waits = 0, batch_groups = 0, events_coalesced = 0;
     std::uint64_t historical_upload_batches = 0, historical_upload_blocks = 0, historical_upload_ranges = 0;
     std::uint64_t archive_attention_reuses = 0, archive_separate_completions = 0;
-    std::uint64_t history_consumer_wait_ns = 0, history_consumer_wait_calls = 0;
-    std::uint64_t cache_load_host_block_ns = 0, cache_load_host_block_layers = 0;
-    std::uint64_t cache_load_device_block_ns = 0, cache_load_device_block_layers = 0;
-    // Host-observed Q frontier to attention completion, including exposed I/O.
-    std::uint64_t attention_layer_span_ns = 0, attention_layer_span_layers = 0;
-    std::uint64_t attention_consumer_span_ns = 0, attention_consumer_span_layers = 0;
 };
 } // namespace solid

@@ -19,7 +19,6 @@ public:
     virtual bool ready() const = 0;
     virtual void wait() = 0;
     virtual void wait_on_compute() = 0;
-    virtual std::optional<std::uint64_t> duration() const = 0;
 };
 class SyclCopyQueue {
 public:

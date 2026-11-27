@@ -9,10 +9,11 @@ namespace solid {
 struct BlockWork {
     BlockIdentity identity;
     ReadPriority priority=ReadPriority::correction_deterministic;
-    std::uint64_t read_ns=1,copy_ns=1;
+    // 推理任务固定各占一个排序单位，数值不随实测时间变化。
+    std::uint64_t read_units=1,copy_units=1;
 };
 struct BlockStageStats {
-    std::uint64_t tasks=0,read_ns=0,copy_ns=0,read_samples=0,copy_samples=0,critical_path_ns=0;
+    std::uint64_t tasks=0;
 };
 struct BlockDispatch { ReadDispatch read,copy; };
 // Algorithm 1 for the fixed parallel READ -> H2D -> join graph.
@@ -37,15 +38,14 @@ public:
     void copy_complete(const BlockIdentity & identity,const std::string & proof={},std::optional<std::uint64_t> device_ns={});
     bool finished() const;
     void abort();
+    std::uint64_t task_count() const { return 2*blocks_.size()+1; }
     BlockStageStats stats() const;
     TaskRecord read_task(const BlockIdentity & identity) const;
     TaskRecord copy_task(const BlockIdentity & identity) const;
 private:
     struct Progress {
         TaskState read_state=TaskState::pending,copy_state=TaskState::pending;
-        std::uint64_t read_start=0,read_end=0,copy_start=0,copy_end=0;
-        std::optional<std::uint64_t> copy_device_ns;
-        bool observed_read=false,resident_copy=false,copy_ready=false;
+        bool copy_ready=false;
     };
     void start_read(std::uint32_t index,std::uint64_t time,const std::string & proof);
     TaskRecord record(std::uint32_t index,bool copy) const;

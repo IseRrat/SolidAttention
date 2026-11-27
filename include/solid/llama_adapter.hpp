@@ -21,7 +21,6 @@ struct llama_layer;
 struct llm_graph_qkv;
 
 namespace solid {
-struct ProjectionIntervals;
 class InfllmSelectedCache;
 class DenseOffload;
 std::shared_ptr<InfllmSelectedCache> make_infllm_selected_cache(AttentionSession & session, ggml_backend * backend);
@@ -62,7 +61,7 @@ class AttentionNode {
 public:
     AttentionNode(AttentionSession & session, std::shared_ptr<AttentionFrame> frame, std::uint32_t layer,
                   float scale, std::shared_ptr<AttentionFailure> failure = {}, bool gathered = false, class GgmlPrefetch * prefetch = nullptr,
-                  ProjectionIntervals * timing = nullptr, InfllmSelectedCache * selected_cache = nullptr,
+                  InfllmSelectedCache * selected_cache = nullptr,
                   DenseOffload * dense = nullptr, SparseBaselineLookahead * sparse_lookahead = nullptr);
     ~AttentionNode();
     ggml_tensor * build(ggml_context * context, ggml_tensor * query, ggml_tensor * key, ggml_tensor * value,
@@ -105,14 +104,13 @@ public:
     bool gathered_decode(std::uint64_t position) const;
     bool fused_projection() const;
     const class KvProjection & projection(std::uint32_t layer) const;
-    ProjectionIntervals * projection_intervals(std::uint32_t layer, ggml_backend * backend);
     std::uint64_t projection_buffer_bytes() const;
     std::uint64_t projection_source_bytes() const;
     std::uint64_t projection_source_host_bytes() const;
-    std::uint64_t projection_initialization_ns() const;
     std::vector<std::string> projection_weight_types() const;
     bool prefetch_enabled() const;
     bool dense_offload_enabled() const;
+    bool cuda_native_completion() const;
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);
     bool observe(ggml_tensor * tensor, bool ask) noexcept;
     void quiesce();
@@ -127,7 +125,6 @@ private:
 bool adapter_active(const llama_model * model);
 bool graph_depends_on(const ggml_tensor * tensor, const ggml_tensor * ancestor);
 bool adapter_fused_projection(const llama_model * model);
-void adapter_mark_projection(const llm_graph_context & graph, ggml_tensor * projection, int layer, bool query);
 // 上游 Q/K/V 构图接入口；按配置使用原投影或融合 K/V 投影。
 llm_graph_qkv adapter_qkv(const llm_graph_context & graph, const llama_layer & layer, ggml_tensor * input,
                          std::int64_t dimension_q, std::int64_t heads_q, std::int64_t dimension_k,

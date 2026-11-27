@@ -5,7 +5,6 @@
 #include <algorithm>
 #include <cerrno>
 #include <climits>
-#include <chrono>
 #include <condition_variable>
 #include <deque>
 #include <map>
@@ -48,8 +47,8 @@ class IoWorker final:public AsyncReader {
         }
     }
 public:
-    IoWorker(std::function<std::unique_ptr<AsyncReader>()> factory,std::uint32_t depth,int cpu,bool notify_each,bool measure_ready):
-        factory_(std::move(factory)),depth_(depth),cpu_(cpu),notify_each_(notify_each),measure_ready_(measure_ready) {
+    IoWorker(std::function<std::unique_ptr<AsyncReader>()> factory,std::uint32_t depth,int cpu,bool notify_each):
+        factory_(std::move(factory)),depth_(depth),cpu_(cpu),notify_each_(notify_each) {
         if (!factory_ || depth<2 || depth>16384 || cpu < -1) throw std::invalid_argument("invalid I/O worker settings");
         wake_=eventfd(0,EFD_NONBLOCK|EFD_CLOEXEC);
         if (wake_<0) throw std::system_error(errno,std::generic_category(),"create I/O worker wakeup");
@@ -169,7 +168,6 @@ private:
         value.queued_cancellations=queued_cancellations_; value.worker_submissions=submissions_;
         value.worker_cpu=cpu_; value.dedicated_worker=true; stats_=value;
         stats_.worker_capacity=depth_;
-        stats_.ready_time_measured=measure_ready_;
     }
     void run() noexcept {
         trace::name_thread("sa.ssd-io");
@@ -229,8 +227,6 @@ private:
                 reader->flush();
                 ReadCompletion completion{};
                 while (reader->poll(completion,false)) {
-                    if (measure_ready_) completion.observed_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
-                        std::chrono::steady_clock::now().time_since_epoch()).count();
                     {
                         std::lock_guard<std::mutex> lock(mutex_);
                         const auto found=requests_.find(completion.id);
@@ -290,19 +286,19 @@ private:
     std::exception_ptr error_;
     bool ready_=false,ended_=false,safe_=false,stopping_=false,draining_=false;
     bool writes_supported_=false;
-    const bool notify_each_,measure_ready_;
+    const bool notify_each_;
     std::uint64_t sequence_=0,drain_requested_=0,drain_completed_=0,queued_cancellations_=0,submissions_=0;
     AsyncIoStats stats_;
 };
 } // namespace
-std::unique_ptr<AsyncReader> make_io_worker(std::function<std::unique_ptr<AsyncReader>()> factory,std::uint32_t depth,int cpu,bool notify_each,bool measure_ready) {
-    return std::make_unique<IoWorker>(std::move(factory),depth,cpu,notify_each,measure_ready);
+std::unique_ptr<AsyncReader> make_io_worker(std::function<std::unique_ptr<AsyncReader>()> factory,std::uint32_t depth,int cpu,bool notify_each) {
+    return std::make_unique<IoWorker>(std::move(factory),depth,cpu,notify_each);
 }
-std::unique_ptr<AsyncReader> make_threaded_uring_reader(std::uint32_t depth,int cpu,std::uint32_t capacity,bool notify_each,bool measure_ready) {
-    return make_io_worker([depth] { return make_uring_reader(depth); },std::max(depth,capacity),cpu,notify_each,measure_ready);
+std::unique_ptr<AsyncReader> make_threaded_uring_reader(std::uint32_t depth,int cpu,std::uint32_t capacity,bool notify_each) {
+    return make_io_worker([depth] { return make_uring_reader(depth); },std::max(depth,capacity),cpu,notify_each);
 }
 #else
-std::unique_ptr<AsyncReader> make_io_worker(std::function<std::unique_ptr<AsyncReader>()>,std::uint32_t,int,bool,bool) { throw std::runtime_error("I/O worker requires Linux"); }
-std::unique_ptr<AsyncReader> make_threaded_uring_reader(std::uint32_t,int,std::uint32_t,bool,bool) { throw std::runtime_error("I/O worker requires Linux"); }
+std::unique_ptr<AsyncReader> make_io_worker(std::function<std::unique_ptr<AsyncReader>()>,std::uint32_t,int,bool) { throw std::runtime_error("I/O worker requires Linux"); }
+std::unique_ptr<AsyncReader> make_threaded_uring_reader(std::uint32_t,int,std::uint32_t,bool) { throw std::runtime_error("I/O worker requires Linux"); }
 #endif
 } // namespace solid

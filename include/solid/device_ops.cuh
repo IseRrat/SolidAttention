@@ -43,7 +43,7 @@ inline cudaError_t cuda_device_op(ggml_tensor * output, cudaStream_t stream) {
         }
         case DeviceOp::query_token:
         case DeviceOp::kv_token:
-            if (auto * interval=device_timing(output)) interval->record(stream,true);
+
             device_ops_detail::query_token<<<1,1,0,stream>>>(static_cast<float *>(output->data));
             break;
         case DeviceOp::consolidate_kv:

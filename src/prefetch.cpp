@@ -194,8 +194,7 @@ bool Prefetcher::complete_store(const ReadCompletion & completion) {
     }
     if (!failed_ && batch.next == batch.segments.size() && batch.inflight.empty()) {
         disk_->complete_write(layer, true);
-        store_receipts_[layer]->completed_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(
-            std::chrono::steady_clock::now().time_since_epoch()).count();
+        store_receipts_[layer]->complete = true;
         store_receipts_[layer].reset();
         write_queue_.pop_front();
         write_batch_.reset();
@@ -247,7 +246,6 @@ void Prefetcher::issue(const SlotLease & lease, std::uint32_t prefix, ReadDispat
     const auto segments = store_.plan_read(id.layer, id.head, id.block, blocks_[lease.slot], prefix);
     if (blocks_[lease.slot].version != id.version) throw std::logic_error("read plan version changed before submission");
     pending_[lease.slot] = segments.size();
-    if (!read_observed_ns_.empty()) read_observed_ns_[lease.slot]=0;
     for (const auto & segment : segments) queued_.push_back({lease, segment, dispatch, phase ? phase : read_phase_});
     if (segments.empty()) { slots_.complete(lease); read_complete(lease,"host_forwarded"); event("ready", lease); }
     if (dispatch_now) pump();
@@ -329,7 +327,6 @@ void Prefetcher::retire(const SlotLease & lease) {
     reader_->flush();
 }
 void Prefetcher::poll(bool wait,const ReadyBlock & ready) {
-    const auto start = std::chrono::steady_clock::now();
     reader_->acknowledge_notifications();
     pump();
     ReadCompletion completion{};
@@ -346,11 +343,6 @@ void Prefetcher::poll(bool wait,const ReadyBlock & ready) {
         if (!retiring) completion.result=job.read.finish(completion.result);
         if (pending_[job.lease.slot] == 0) throw std::logic_error("duplicate read completion");
         --pending_[job.lease.slot];
-        if (completion.observed_ns && !retiring) {
-            if (read_observed_ns_.empty()) read_observed_ns_.resize(blocks_.size());
-            auto & observed=read_observed_ns_[job.lease.slot];
-            observed=std::max(observed,completion.observed_ns);
-        }
         if (!retiring && (completion.result < 0 || static_cast<std::uint64_t>(completion.result) != job.segment.bytes)) {
             slots_.retire(job.lease);
             if (pending_[job.lease.slot] == 0) slots_.complete(job.lease);
@@ -374,10 +366,9 @@ void Prefetcher::poll(bool wait,const ReadyBlock & ready) {
         }
         pump();
     }
-    if (wait) stats_.wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
 }
 // 根据该层历史选择准备预测请求；主机槽位与请求数量受工作区容量限制。
-void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs) {
+void Prefetcher::begin(std::uint32_t layer, std::uint64_t position) {
     check();
     const auto & g = store_.geometry();
     if (layer >= g.layers || position >= g.capacity_tokens || store_.length(layer) != position) throw std::invalid_argument("prefetch begin position mismatch");
@@ -413,16 +404,9 @@ void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCo
         const auto & history=history_[layer][id.head];
         return selected(id.block) && std::find(history.begin(),history.end(),id.block)!=history.end() ? ReadPriority::selected : ReadPriority::deterministic;
     };
-    const auto read_cost = [&](const BlockIdentity & id) {
-        const auto lease = slots_.find(id);
-        if (lease && !slots_.entry(lease->slot).producer) return std::uint64_t{1};
-        const auto full = costs.full_read_ns;
-        return std::max<std::uint64_t>(1, full / g.block_tokens * id.version +
-            full % g.block_tokens * id.version / g.block_tokens);
-    };
     std::vector<BlockWork> tasks;
     tasks.reserve(predicted.size());
-    for (const auto & id : predicted) tasks.push_back({id, priority(id), read_cost(id), costs.full_upload_ns});
+    for (const auto & id : predicted) tasks.push_back({id, priority(id)});
     const auto plan=plan_block_dispatch(tasks);
     std::vector<Prediction> ordered;
     ordered.reserve(predicted.size());
@@ -463,7 +447,6 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
                                             const std::vector<HeadSelection> & actual, bool historical,
                                             const StagePlan & plan, const ReadyBlock & ready,const StageFactory & factory,
                                             const ReadyBatch & batch, bool admit_before_stage, bool per_completion) {
-    const auto start = std::chrono::steady_clock::now();
     check();
     const auto & g = store_.geometry();
     if (per_completion && (!ready || batch)) throw std::invalid_argument("per-completion resolve requires an individual ready callback");
@@ -630,7 +613,6 @@ std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64
     if (!historical) remember_selection(layer,position,actual);
     for (const auto & lease : result) slots_.pin(lease);
     if (historical) ++stats_.history_resolutions;
-    stats_.resolve_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
     return result;
 }
 void Prefetcher::remember_selection(std::uint32_t layer,std::uint64_t position,const std::vector<HeadSelection> & actual) {
@@ -645,10 +627,6 @@ void Prefetcher::remember_selection(std::uint32_t layer,std::uint64_t position,c
         }
     }
     ++stats_.formal_resolutions;
-}
-std::uint64_t Prefetcher::read_observed_ns(const SlotLease & lease) const {
-    if (!slots_.matches(lease)) throw std::logic_error("read timing for stale slot");
-    return read_observed_ns_.empty()?0:read_observed_ns_.at(lease.slot);
 }
 const KvBlock & Prefetcher::block(const SlotLease & lease) const {
     if (!slots_.matches(lease) || (slots_.entry(lease.slot).state != SlotState::ready && slots_.entry(lease.slot).state != SlotState::pinned)) {

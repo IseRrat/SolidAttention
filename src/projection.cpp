@@ -5,7 +5,6 @@
 #include "ggml-alloc.h"
 
 #include <algorithm>
-#include <chrono>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -45,7 +44,6 @@ KvProjection::KvProjection(const ggml_tensor * key, const ggml_tensor * value,
                            const ggml_tensor * key_bias, const ggml_tensor * value_bias,
                            std::uint32_t heads, std::uint32_t dimension, ggml_backend_buffer_type * buffer_type) :
     impl_(std::make_unique<Impl>()) {
-    const auto start = std::chrono::steady_clock::now();
     const auto rows = static_cast<std::uint64_t>(heads) * dimension;
     if (!buffer_type || !heads || !dimension || rows > std::numeric_limits<std::int32_t>::max() / 2) {
         throw std::invalid_argument("invalid fused KV projection geometry");
@@ -113,7 +111,6 @@ KvProjection::KvProjection(const ggml_tensor * key, const ggml_tensor * value,
         if (source && ggml_backend_buffer_is_host(source->buffer)) impl_->stats.source_host_bytes += ggml_nbytes(source);
     }
     impl_->stats.weight_type = ggml_type_name(type);
-    impl_->stats.initialization_ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
 }
 KvProjection::~KvProjection() = default;
 ggml_tensor * KvProjection::project(ggml_context * context, ggml_tensor * input) const {

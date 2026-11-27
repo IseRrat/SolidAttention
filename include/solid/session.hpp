@@ -23,14 +23,9 @@ struct SessionStats {
     PrefillStats prefill;
     std::uint64_t prefill_host_bytes = 0, prefill_host_peak_bytes = 0;
     IoStats io;
-    std::uint64_t append_ns = 0;
-    std::uint64_t selection_ns = 0;
-    std::uint64_t gather_ns = 0;
     std::uint64_t gather_copy_bytes = 0;
-    std::uint64_t streaming_attention_ns = 0;
-    std::uint64_t tiled_prefill_ns = 0;
-    std::uint64_t dense_prefetch_layers = 0, dense_prefetch_wait_ns = 0;
-    std::uint64_t sparse_prefetch_layers = 0, sparse_prefetch_wait_ns = 0;
+    std::uint64_t dense_prefetch_layers = 0;
+    std::uint64_t sparse_prefetch_layers = 0;
     std::uint64_t direct_decode_queries = 0, decode_kv_download_bytes = 0;
     std::uint64_t direct_prefill_queries = 0, prefill_kv_download_bytes = 0;
     std::uint32_t infllm_prefill_group_token_limit = 0;
@@ -59,18 +54,15 @@ public:
     std::uint64_t gather_elements() const;
     // 读取 Decode 需要的 KV 行区间，交由存储层组织文件读取。
     void read_decode_rows(std::uint32_t layer, const std::vector<KvRowRange> & ranges, AsyncReader * reader, std::size_t depth);
-    void account_cached_gather(std::uint64_t ns) { stats_.gather_ns += ns; }
     void read_dense_history(std::uint32_t layer, std::uint32_t position, Half * destination, AsyncReader * reader);
     void append_dense_decode(std::uint32_t layer, std::uint64_t position, const float * keys, const float * values);
     bool layer_write_ready(std::uint32_t layer) const;
     void flush_ready_layer(std::uint32_t layer) { store_->flush_full_layer(layer); }
-    void account_dense_prefetch(std::uint64_t wait_ns) {
+    void account_dense_prefetch() {
         ++stats_.dense_prefetch_layers;
-        stats_.dense_prefetch_wait_ns += wait_ns;
     }
-    void account_sparse_prefetch(std::uint64_t wait_ns) {
+    void account_sparse_prefetch() {
         ++stats_.sparse_prefetch_layers;
-        stats_.sparse_prefetch_wait_ns += wait_ns;
     }
     void flush();
     // 切换 Decode 的 KV 文件读取到 O_DIRECT，绕过 Linux 文件缓存。
@@ -99,7 +91,7 @@ public:
     void release_prefill_graph_output(std::uint64_t bytes) noexcept;
     bool prefetch_enabled() const { return prefetch_ != nullptr; }
     Prefetcher & prefetcher();
-    void begin_prefetch(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
+    void begin_prefetch(std::uint32_t layer, std::uint64_t position);
     std::vector<HeadSelection> select_decode(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                             const std::vector<float> & keys, const std::vector<float> & values,
                                             bool interleaved_inputs = false, const std::function<void()> & after_append = {});

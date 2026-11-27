@@ -4,12 +4,10 @@
 import argparse
 from pathlib import Path
 
-
 def replace_once(text, before, after):
     if text.count(before) != 1:
         raise ValueError(f"upstream adapter anchor changed: {before[:90]!r}")
     return text.replace(before, after, 1)
-
 
 # 按固定上游锚点生成适配源码，接入自定义算子、完成通知和 attention 入口。
 def generate(source, destination):
@@ -26,9 +24,6 @@ def generate(source, destination):
                                   n_embd_head_v, n_head_v, il, reshape);
     }
 ''' + anchor)
-    for label, matrix, is_query in (("Qcur", "wq", "true"), ("Kcur", "wk", "false")):
-        anchor = f"        {label} = build_lora_mm(layer.{matrix}, cur, layer.{matrix}_s);\n"
-        graph = replace_once(graph, anchor, anchor + f"        solid::adapter_mark_projection(*this, {label}, il, {is_query});\n")
     signature = "ggml_tensor * llm_graph_context::build_attn(\n        llm_graph_input_attn_kv * inp,"
     start = graph.index(signature)
     body = graph.index(") const {", start) + len(") const {")
@@ -55,57 +50,7 @@ def generate(source, destination):
 
 ''' + anchor)
     backend = (source.parent / "ggml/src/ggml-backend.cpp").read_text(encoding="utf-8")
-    backend = '#include "solid/profile.hpp"\n#include "solid/trace.hpp"\n#include <cstdlib>\n#include <cstdio>\n' + backend
-    # Copy scopes synchronize only during profiling. Prefetched reads have their own
-    # scope; the consuming split returns before opening a second scope.
-    helper = '''
-namespace {
-solid_transfer_callback solid_transfer_observer = nullptr;
-void * solid_transfer_userdata = nullptr;
-struct solid_copy_scope {
-    const ggml_tensor * tensor;
-    ggml_backend_t source;
-    ggml_backend_t target;
-    std::chrono::steady_clock::time_point start;
-    solid::trace::Scope audit;
-    solid_copy_scope(const ggml_tensor * t, ggml_backend_t s, ggml_backend_t d) : tensor(t), source(s), target(d) {
-        static const bool audit_enabled = [] {
-            const char * value = std::getenv("SOLID_SYNC_AUDIT_TRACE");
-            return value && value[0] == '1' && value[1] == 0;
-        }();
-        if (audit_enabled && solid::trace::enabled()) {
-            char detail[384];
-            std::snprintf(detail, sizeof(detail), "%s %s->%s bytes=%zu", ggml_get_name(tensor),
-                ggml_backend_name(source), ggml_backend_name(target), ggml_nbytes(tensor));
-            audit.start("Diagnostic backend copy", UINT32_MAX, UINT64_MAX, detail);
-        }
-        if (solid_transfer_observer) {
-            ggml_backend_synchronize(source);
-            ggml_backend_synchronize(target);
-            start = std::chrono::steady_clock::now();
-        }
-    }
-    ~solid_copy_scope() {
-        if (solid_transfer_observer) {
-            ggml_backend_synchronize(target);
-            ggml_backend_synchronize(source);
-            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
-            solid_transfer_observer(tensor, source, target, ns, solid_transfer_userdata);
-        }
-    }
-};
-}
-extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, void * userdata) {
-    solid_transfer_observer = callback;
-    solid_transfer_userdata = userdata;
-}
-'''
-    anchor = "static void ggml_backend_sched_copy_input(ggml_backend_sched_t sched,"
-    backend = replace_once(backend, anchor, helper + "\n" + anchor)
-    anchor = "    if (input->flags & GGML_TENSOR_FLAG_INPUT) {\n"
-    backend = replace_once(backend, anchor, "    solid_copy_scope solid_copy(input, input_backend, split_backend);\n\n" + anchor)
-    anchor = "        ggml_backend_tensor_get_async(backend, input, input_cpy->data, 0, ggml_nbytes(input));\n"
-    backend = replace_once(backend, anchor, "        solid_copy_scope solid_copy(input, backend, sched->backends[next->backend_id]);\n" + anchor)
+    backend = '#include "solid/trace.hpp"\n' + backend
     cuda = (source.parent / "ggml/src/ggml-cuda/ggml-cuda.cu").read_text(encoding="utf-8")
     cuda = '#include "solid/cuda_completion.cuh"\n#include "solid/device_ops.cuh"\n#include "solid/trace.hpp"\n#include <cstdio>\n' + cuda
     anchor = 'static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct ggml_tensor * dst) {\n'
@@ -153,10 +98,7 @@ extern "C" void solid_set_transfer_callback(solid_transfer_callback callback, vo
         }'''
         cuda = replace_once(cuda, anchor, boundary)
     anchor = '                int nodes_to_skip = ggml_cuda_try_fuse(cuda_ctx, cgraph, i);'
-    cuda = replace_once(cuda, anchor, '''                if (node->op == GGML_OP_MUL_MAT) {
-                    if (auto * interval = solid::device_timing(node)) interval->record(cuda_ctx->stream(), false);
-                }
-                const bool solid_attention_boundary =
+    cuda = replace_once(cuda, anchor, '''                const bool solid_attention_boundary =
                     solid::stream_completion(node->op_params, sizeof(node->op_params));
                 int nodes_to_skip = solid_attention_boundary ? 0 : ggml_cuda_try_fuse(cuda_ctx, cgraph, i);''')
     anchor = 'int ggml_backend_cuda_get_device_count() {\n'
@@ -239,15 +181,9 @@ extern "C" ggml_backend_buffer_t solid_sycl_alloc_shared_kv(ggml_backend_t backe
     sycl = replace_once(sycl, anchor, '''        const ggml_op node_op = node->op;
 
         // SolidAttention publishes a fresh host notification for every launch.
-        if (solid::sycl_masked_decode_supported(node) || solid::device_op(node) != solid::DeviceOp::none ||
-            (node_op == GGML_OP_MUL_MAT && solid::device_timing(node))) return false;
+        if (solid::sycl_masked_decode_supported(node) || solid::device_op(node) != solid::DeviceOp::none) return false;
 
         if (!graph_node_is_in_local_device(device_buft, node))''')
-    anchor = '        const int nodes_to_skip = ggml_sycl_fuse(*sycl_ctx, cgraph, i);'
-    sycl = replace_once(sycl, anchor, '''        if (node->op == GGML_OP_MUL_MAT) {
-            if (auto * interval = solid::device_timing(node)) interval->record(sycl_ctx->stream(), false);
-        }
-''' + anchor)
     cpu = (source.parent / "ggml/src/ggml-cpu/ggml-cpu.c").read_text(encoding="utf-8")
     cpu = 'extern void solid_trace_name_cpu_worker(int index);\n' + cpu
     anchor = '''static thread_ret_t ggml_graph_compute_secondary_thread(void* data) {
@@ -260,7 +196,6 @@ extern "C" ggml_backend_buffer_t solid_sycl_alloc_shared_kv(ggml_backend_t backe
         target = destination / name
         if not target.exists() or target.read_text(encoding="utf-8") != text:
             target.write_text(text, encoding="utf-8", newline="\n")
-
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)

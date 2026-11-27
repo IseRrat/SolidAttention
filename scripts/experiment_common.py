@@ -8,7 +8,6 @@ import statistics
 
 from run_baseline import digest, atomic_json
 
-
 def load(path):
     def nonfinite(value):
         raise ValueError(f"nonfinite JSON: {value}")
@@ -20,12 +19,10 @@ def load(path):
         return value
     return json.loads(Path(path).read_text(encoding="utf-8"), object_pairs_hook=unique,parse_constant=nonfinite)
 
-
 def number(value, minimum=0, integer=False):
     if type(value) not in ((int,) if integer else (int, float)) or not math.isfinite(value) or value < minimum:
         raise ValueError(f"expected finite {'integer' if integer else 'number'} >= {minimum}")
     return value
-
 
 def token_ids(values):
     if not isinstance(values, list) or not values: raise ValueError("token list must be nonempty")
@@ -33,7 +30,6 @@ def token_ids(values):
         number(value, integer=True)
         if value > 2147483647: raise ValueError("token ID exceeds int32")
     return values
-
 
 def absolute_config(path):
     path = Path(path).resolve(strict=True)
@@ -47,17 +43,14 @@ def absolute_config(path):
             config["attention"][key] = str((path.parent / config["attention"][key]).resolve())
     return config
 
-
 def model_hashes(config):
     values = [config["model_sha256"]] + [part["sha256"] for part in config.get("additional_model_files", [])]
     if any(not isinstance(v, str) or len(v) != 64 or any(c not in "0123456789abcdef" for c in v) for v in values):
         raise ValueError("model hashes must be lowercase SHA256")
     return values
 
-
 def check_hash(path, expected):
     if digest(Path(path)) != expected: raise ValueError(f"checksum differs: {path}")
-
 
 # 核对一次结果的配置、运行身份与测量条件，供执行恢复和汇总使用。
 def audit_run(result_path, source_config=None, source_sha=None):
@@ -101,8 +94,6 @@ def audit_run(result_path, source_config=None, source_sha=None):
             if key in configured and actual[key] != configured[key]: raise ValueError("result context budget differs")
         if configured.get("prefetch") and result.get("prefetch", {}).get("ahead_enabled", True) != configured.get("prefetch_ahead", True):
             raise ValueError("result prefetch-ahead setting differs")
-        if configured.get("prefetch") and result.get("prefetch", {}).get("ready_time_measured", False) != configured.get("measure_upload_ready_time", False):
-            raise ValueError("result upload readiness timing differs from configuration")
         if configured.get("prefetch") and result.get("schedule", {}).get("per_completion_uploads", False) != configured.get("per_completion_uploads", False):
             raise ValueError("result upload dispatch differs from configuration")
         if configured.get("prefetch") and result.get("schedule", {}).get("coalesce_uploads", True) != configured.get("coalesce_uploads", True):
@@ -120,7 +111,6 @@ def audit_run(result_path, source_config=None, source_sha=None):
         raise ValueError("result build provenance differs")
     return result, run, effective
 
-
 def distribution(values):
     if not values: return None
     values = sorted(number(value) for value in values)
@@ -131,7 +121,6 @@ def distribution(values):
     return {"count": len(values), "mean": statistics.fmean(values), "median": statistics.median(values),
             "min": values[0], "max": values[-1], "p50": percentile(.5), "p90": percentile(.9),
             "p99": percentile(.99), "p999": percentile(.999)}
-
 
 # 从运行结果提取统一的吞吐、时间和内存指标。
 def run_metrics(result):

@@ -1,6 +1,5 @@
 // SolidAttention 的图执行接入口：协调评分、SSD→CPU→GPU、当前 KV 归档和下一层预取。
 #include "solid/ggml_prefetch.hpp"
-#include "solid/device_timing.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"
 #include "ggml-alloc.h"
@@ -59,7 +58,6 @@ class GgmlTransport final : public DeviceTransport {
     struct CopyRecord {
         ggml_backend_event_t event=nullptr;
         std::unique_ptr<std::array<RowCopy,2>> row;
-        DeviceInterval * interval=nullptr;
 #ifdef SOLID_HAVE_SYCL
         std::unique_ptr<SyclCopyEvent> sycl;
 #endif
@@ -149,7 +147,6 @@ public:
                 cuda_device_=static_cast<int>(ordinal);
                 solid::trace::name_cuda_stream(solid_cuda_queue(backend_), "model.compute");
                 if (copy_backend_ != backend_) solid::trace::name_cuda_stream(solid_cuda_queue(copy_backend_), "kv.H2D");
-                copy_intervals_.resize(static_cast<std::size_t>(geometry_.heads)*per_head_);
                 break;
             }
         }
@@ -206,11 +203,10 @@ public:
             auto & record=events_.try_emplace(id).first->second;
             record.event=event;
             const auto * source=stage_host(slot,0,block.storage(),bytes);
-            begin_copy_interval(record,slot);
             for (std::size_t plane=0;plane<planes();++plane)
                 ggml_backend_tensor_set_async(copy_backend_, tensor_, static_cast<const unsigned char *>(source)+plane*bytes/planes(),
                     slot_offset(slot,plane), bytes/planes());
-            record_copy_interval(record.interval,true);
+
             if (event) ggml_backend_event_record(event, copy_backend_);
             else ggml_backend_synchronize(copy_backend_);
         } catch (...) {
@@ -253,7 +249,6 @@ public:
             auto * device=ggml_backend_get_device(copy_backend_);
             record.event=ggml_backend_event_new(device);
             if (!record.event) throw std::runtime_error("CUDA KV batch completion event allocation failed");
-            if (blocks.size()==1) begin_copy_interval(record,blocks.front().slot);
             for (std::size_t i=0;i<ranges.size();) {
                 auto range=ranges[i++];
                 while (stats_.coalesce_uploads && i<ranges.size() && range.offset+range.bytes==ranges[i].offset &&
@@ -263,7 +258,7 @@ public:
                 ggml_backend_tensor_set_async(copy_backend_,tensor_,reinterpret_cast<const void *>(range.source),range.offset,range.bytes);
                 ++submitted;
             }
-            record_copy_interval(record.interval,true);
+
             ggml_backend_event_record(record.event,copy_backend_);
         } catch (...) {
             ggml_backend_synchronize(copy_backend_);
@@ -357,14 +352,13 @@ public:
             auto & record=events_.try_emplace(id).first->second;
             record.event=event;
             record.row=std::move(rows);
-            begin_copy_interval(record,slot);
             for (std::size_t plane=0;plane<planes();++plane) {
                 if (prefix_bytes)
                     ggml_backend_tensor_set_async(copy_backend_,tensor_,prefix_source(plane),slot_offset(slot,plane)+prefix_offset,prefix_bytes);
                 // Separate K/V use two views covered by the same completion.
                 ggml_backend_tensor_copy_async(copy_backend_,copy_backend_,&(*record.row)[plane].source,&(*record.row)[plane].target);
             }
-            record_copy_interval(record.interval,true);
+
             if (event) ggml_backend_event_record(event,copy_backend_);
             else ggml_backend_synchronize(copy_backend_);
         } catch (...) {
@@ -377,7 +371,6 @@ public:
     bool complete(std::uint64_t ticket, bool wait) override {
         const auto found = events_.find(ticket);
         if (found == events_.end()) throw std::logic_error("unknown upload ticket");
-        copy_interval_.reset();
 #ifdef SOLID_HAVE_SYCL
         if (found->second.sycl && ticket>completed_through_) {
             if (!wait) {
@@ -398,20 +391,10 @@ public:
         if (found->second.event) {
             if (ticket > completed_through_) { ggml_backend_event_synchronize(found->second.event); ++stats_.event_waits; }
         }
-        try {
-            if (found->second.interval) copy_interval_=found->second.interval->duration();
-#ifdef SOLID_HAVE_SYCL
-            if (found->second.sycl) copy_interval_=found->second.sycl->duration();
-#endif
-        } catch (...) {
-            // Transfer completion is established independently of profiling.
-            copy_interval_.reset();
-        }
         if (found->second.event) ggml_backend_event_free(found->second.event);
         events_.erase(found);
         return true;
     }
-    std::optional<std::uint64_t> copy_interval() const override { return copy_interval_; }
     void drain() override {
 #ifdef SOLID_HAVE_SYCL
         if (sycl_copy_) sycl_copy_->drain();
@@ -455,20 +438,7 @@ public:
 #endif
         if (!events_.empty() && events_.rbegin()->second.event) {
             const auto & last=*events_.rbegin();
-#ifdef SOLID_HAVE_CUDA_SELECTION
-            if (cuda_device_>=0) {
-                if (load_wait_pending_) throw std::logic_error("previous KV wait measurement has not been collected");
-                if (!load_wait_) load_wait_=make_cuda_device_interval(cuda_device_);
-                record_copy_interval(load_wait_.get(),false,backend_);
-            }
-#endif
             ggml_backend_event_wait(backend_,last.second.event);
-#ifdef SOLID_HAVE_CUDA_SELECTION
-            if (cuda_device_>=0) {
-                record_copy_interval(load_wait_.get(),true,backend_);
-                load_wait_pending_=true;
-            }
-#endif
             compute_dependency_ticket_=last.first;
             ++stats_.stream_waits;
         }
@@ -476,14 +446,6 @@ public:
     void acknowledge_compute_dependency() {
         completed_through_=std::max(completed_through_,compute_dependency_ticket_);
         compute_dependency_ticket_=0;
-    }
-    std::optional<std::uint64_t> collect_cache_load_wait() {
-        if (!load_wait_pending_) return {};
-        // The existing attention receipt proves both timestamps are complete.
-        const auto elapsed=load_wait_->duration();
-        if (!elapsed) throw std::logic_error("missing CUDA KV wait timestamps");
-        load_wait_pending_=false;
-        return elapsed;
     }
     bool can_archive_on_attention_stream() const {
 #ifdef SOLID_HAVE_CUDA_SELECTION
@@ -517,16 +479,13 @@ public:
         archive_on_compute_=source!=nullptr;
         archive_shares_attention_=reuse_attention;
         try {
-#ifdef SOLID_HAVE_CUDA_SELECTION
-            if (cuda_device_>=0 && !archive_interval_) archive_interval_=make_cuda_device_interval(cuda_device_);
-#endif
-            record_copy_interval(archive_interval_.get(),false,archive_backend);
+
             auto * output=static_cast<unsigned char *>(ggml_backend_buffer_get_base(archive_buffer_.get()));
             if (source) {
                 // The packed projection is already ready and contiguous across heads.
                 // Queue one download before the compute stream waits for the KV bank.
                 ggml_backend_tensor_get_async(backend_,source,output,0,bytes);
-                record_copy_interval(archive_interval_.get(),true,archive_backend);
+
                 if (archive_event_) ggml_backend_event_record(archive_event_,archive_backend);
                 else if (!reuse_attention) ggml_backend_synchronize(archive_backend);
                 return;
@@ -544,7 +503,7 @@ public:
                         ggml_backend_tensor_get_async(copy_backend_,tensor_,output+h*row_bytes+plane*bytes,offset,bytes);
                 }
             }
-            record_copy_interval(archive_interval_.get(),true);
+
 #ifdef SOLID_HAVE_SYCL
             if (sycl_copy_) archive_sycl_=sycl_copy_->fence();
             else
@@ -559,7 +518,7 @@ public:
         }
     }
     // 确认 D2H 已完成并收取新 KV，随后由会话追加到逐层写缓冲。
-    std::vector<Half> finish_archive(std::optional<std::uint64_t> & device_ns,bool compute_complete) {
+    std::vector<Half> finish_archive(bool compute_complete) {
         if (!archive_pending_ || archive_shares_attention_!=compute_complete) throw std::logic_error("missing KV archive completion proof");
         if (compute_complete) ++stats_.archive_attention_reuses;
         else ++stats_.archive_separate_completions;
@@ -567,12 +526,6 @@ public:
         if (archive_sycl_) archive_sycl_->wait();
 #endif
         if (archive_event_) ggml_backend_event_synchronize(archive_event_);
-        try {
-            if (archive_interval_) device_ns=archive_interval_->duration();
-#ifdef SOLID_HAVE_SYCL
-            if (archive_sycl_) device_ns=archive_sycl_->duration();
-#endif
-        } catch (...) { device_ns.reset(); }
         const auto * data=static_cast<const Half *>(ggml_backend_buffer_get_base(archive_buffer_.get()));
         clear_archive();
         return {data,data+static_cast<std::size_t>(geometry_.heads)*2*geometry_.dimension};
@@ -625,24 +578,6 @@ private:
     std::size_t slot_offset(std::uint32_t slot,std::size_t plane) const {
         return (slot/per_head_)*tensor_->nb[2]+(slot%per_head_)*geometry_.block_tokens*tensor_->nb[1]+plane*tensor_->nb[3];
     }
-    void begin_copy_interval(CopyRecord & record,std::uint32_t slot) {
-#ifdef SOLID_HAVE_CUDA_SELECTION
-        if (cuda_device_<0) return;
-        auto & interval=copy_intervals_[slot];
-        if (!interval) interval=make_cuda_device_interval(cuda_device_);
-        record.interval=interval.get();
-        record_copy_interval(record.interval,false);
-#else
-        (void) record; (void) slot;
-#endif
-    }
-    void record_copy_interval(DeviceInterval * interval,bool end,ggml_backend_t backend=nullptr) {
-#ifdef SOLID_HAVE_CUDA_SELECTION
-        if (interval) interval->record(solid_cuda_queue(backend?backend:copy_backend_),end);
-#else
-        (void) interval; (void) end; (void) backend;
-#endif
-    }
     const void * stage_host(std::uint32_t,std::size_t,const void * source,std::size_t bytes) {
         if (!staging_) return source;
         const auto begin=reinterpret_cast<std::uintptr_t>(ggml_backend_buffer_get_base(staging_.get()));
@@ -669,12 +604,7 @@ private:
     ggml_backend_t copy_backend_ = nullptr;
 #ifdef SOLID_HAVE_CUDA_SELECTION
     int cuda_device_=-1;
-    std::vector<std::unique_ptr<DeviceInterval>> copy_intervals_;
 #endif
-    std::unique_ptr<DeviceInterval> archive_interval_;
-    std::optional<std::uint64_t> copy_interval_;
-    std::unique_ptr<DeviceInterval> load_wait_;
-    bool load_wait_pending_=false;
 #ifdef SOLID_HAVE_SYCL
     std::unique_ptr<SyclCopyQueue> sycl_copy_;
     std::unique_ptr<SyclCopyEvent> archive_sycl_;
@@ -709,6 +639,8 @@ struct LayerWork {
     std::vector<HeadSelection> selection;
     std::vector<SlotLease> history;
     TaskDag dag;
+    // Nsight 记录统一 KV 入口到 attention 完成的区间，代码自身不读取时钟。
+    trace::Range attention_span;
     std::shared_ptr<BlockStage> blocks;
     std::shared_ptr<const StoreReceipt> store;
     bool consumed = false;
@@ -716,9 +648,8 @@ struct LayerWork {
     bool deferred_archive;
     bool archive_at_attention;
     bool archive_from_projection;
-    std::optional<std::uint64_t> consumer_entry_ns;
     LayerWork(std::uint32_t layer, std::uint64_t position, ScheduleMode mode, ScheduleTrace & trace,
-                std::uint64_t id, const std::array<std::uint64_t, task_count> & estimates, bool archive, bool single_layer,
+                std::uint64_t id, bool archive, bool single_layer,
                 bool shared_archive,bool projected_archive) :
         layer(layer), position(position), dag([&] {
             const bool serial = mode == ScheduleMode::naive;
@@ -751,7 +682,6 @@ struct LayerWork {
                 }
                 if (single_layer) specs[next_prefetch].predecessors.push_back(append);
             }
-            for (std::size_t i = 0; i < specs.size(); ++i) specs[i].estimate_ns = estimates[i];
             return specs;
         }(), &trace, id, layer, position, mode), deferred_archive(archive), archive_at_attention(shared_archive),archive_from_projection(projected_archive) {}
 };
@@ -769,8 +699,6 @@ struct GgmlPrefetch::Impl {
     GgmlTransport transport;
     DeviceCache device;
     ScheduleStats totals;
-    std::array<std::uint64_t, task_count> estimates;
-    std::uint64_t block_read_estimate=1,block_copy_estimate=1;
     std::shared_ptr<LayerWork> work;
     std::deque<std::shared_ptr<LayerWork>> storing;
     std::uint64_t sequence = 0;
@@ -785,52 +713,31 @@ struct GgmlPrefetch::Impl {
         device(s.prefetcher(), s.geometry(), s.query_heads(), transport, residency) {
         if (per_completion && (coalesce_uploads || mode==ScheduleMode::naive)) throw std::invalid_argument("invalid per-completion upload schedule");
         totals.per_completion_uploads=per_completion;
-        estimates.fill(1); totals.coordinator_cpu=cpu; totals.completion_backend=events?events->name():"graph_boundaries";
+        totals.coordinator_cpu=cpu; totals.completion_backend=events?events->name():"graph_boundaries";
     }
     std::shared_ptr<LayerWork> new_work(std::uint32_t layer, std::uint64_t position,bool direct=false,
-                                        std::optional<std::uint64_t> projection_ns={},bool deferred_archive=true) {
+                                        bool deferred_archive=true) {
         if (work && work->dag.snapshot(attention).state != TaskState::complete) throw std::logic_error("new layer started before previous attention completion");
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
         const bool archive=direct && deferred_archive && mode!=ScheduleMode::naive;
-        work = std::make_shared<LayerWork>(layer, position, mode, trace, ++sequence, estimates, archive,
+        work = std::make_shared<LayerWork>(layer, position, mode, trace, ++sequence, archive,
             session.geometry().layers==1, archive && mode==ScheduleMode::sync_reuse && transport.can_archive_on_attention_stream(),
             archive && transport.can_archive_on_attention_stream());
         const auto time=trace.now();
-        if (projection_ns) {
-            work->dag.start(q_ready,time);
-            work->dag.complete(q_ready,time,"query_device_projection",projection_ns);
-            work->dag.fence({q_d2h},time,"query_device_input_ready");
-        } else work->dag.fence({q_ready,q_d2h},time,direct?"query_device_input_ready":"query_download_complete");
+        work->dag.fence({q_ready,q_d2h},time,direct?"query_device_input_ready":"query_download_complete");
         return work;
     }
     void finish_frame(const std::shared_ptr<LayerWork> & finished) {
         const auto & work = finished;
         if (!work->dag.finished()) throw std::logic_error("layer completed with unfinished microtasks");
         ++totals.frames; totals.tasks += work->dag.size();
-        totals.critical_path_ns += work->dag.critical_path_ns();
-        totals.miss_projection_overlap_ns += work->dag.overlap_ns(miss_read, kv_projection);
-        if (work->blocks) {
-            const auto stats=work->blocks->stats();
-            ++totals.block_frames; totals.block_tasks+=stats.tasks; totals.block_critical_path_ns+=stats.critical_path_ns;
-            const auto update=[](std::uint64_t & estimate,std::uint64_t total,std::uint64_t count) {
-                if (!count) return;
-                const auto measured=std::max<std::uint64_t>(1,total/count);
-                estimate=measured>=estimate?estimate+(measured-estimate)/8:estimate-(estimate-measured)/8;
-            };
-            update(block_read_estimate,stats.read_ns,stats.read_samples);
-            update(block_copy_estimate,stats.copy_ns,stats.copy_samples);
-        }
-        for (std::uint32_t id = 0; id < task_count; ++id) {
-            const auto task = work->dag.snapshot(id);
-            const auto duration = task.duration_ns();
-            if (duration) estimates[id] = duration >= estimates[id] ? estimates[id] + (duration - estimates[id]) / 8 : estimates[id] - (estimates[id] - duration) / 8;
-        }
+        if (work->blocks) { ++totals.block_frames; totals.block_tasks+=work->blocks->task_count(); }
     }
     void observe_stores() {
         for (auto it = storing.begin(); it != storing.end();) {
             auto & frame = *it;
-            if (!frame->store->completed_ns) { ++it; continue; }
-            frame->dag.complete(store_task, *frame->store->completed_ns, "original_write_complete");
+            if (!frame->store->complete) { ++it; continue; }
+            frame->dag.complete(store_task, trace.now(), "original_write_complete");
             if (frame->dag.finished()) finish_frame(frame);
             it = storing.erase(it);
         }
@@ -852,15 +759,14 @@ struct GgmlPrefetch::Impl {
     }
     // 启动下一层推测性 SSD 读取，读好的块随后按可用槽位推进上传。
     void begin_prediction(std::uint32_t layer, std::uint64_t position) {
-        session.begin_prefetch(layer, position, {block_read_estimate, block_copy_estimate});
+        session.begin_prefetch(layer, position);
         observe_stores();
     }
     void finish_archive(const std::shared_ptr<LayerWork> & frame) {
-        std::optional<std::uint64_t> archive_ns;
-        const auto kv=transport.finish_archive(archive_ns,frame->archive_at_attention);
+        const auto kv=transport.finish_archive(frame->archive_at_attention);
         frame->dag.complete(kv_d2h,trace.now(),
             frame->archive_at_attention?"kv_archive_attention_complete":frame->archive_from_projection?
-                "kv_projection_archive_complete":"kv_archive_copy_complete",archive_ns);
+                "kv_projection_archive_complete":"kv_archive_copy_complete");
         frame->dag.start(append,trace.now());
         session.archive_device_kv(frame->layer,frame->position,kv);
         frame->dag.complete(append,trace.now());
@@ -884,31 +790,20 @@ struct GgmlPrefetch::Impl {
             if (finished->dag.finished()) finish_frame(finished);
         }
     }
-    void release_attention(const char * proof,std::optional<std::uint64_t> device_ns={},const std::function<void()> & before_upload={},
+    void release_attention(const char * proof,const std::function<void()> & before_upload={},
                            bool defer_followup=false) {
         if (!device.attention_pending()) return;
         if (work->archive_at_attention) {
-            // No successor upload may be submitted until the attention reader retires.
-            // This receipt also covers the last upload event waited on by compute.
+            // The pre-attention compute wait already joined every copy ticket.
+            // Retire their host records only after the attention reader releases
+            // the device slots; this receipt adds no second upload wait.
             transport.acknowledge_compute_dependency();
-            if (const auto wait=transport.collect_cache_load_wait()) {
-                totals.cache_load_device_block_ns+=*wait;
-                ++totals.cache_load_device_block_layers;
-            }
             device.reap_transfers();
-            const auto now=trace.now();
-            work->dag.complete(history_h2d,now,"attention_upload_dependency");
-            work->dag.complete(current_h2d,now,"attention_upload_dependency");
-            work->dag.start(attention,now);
         }
         if (device.attention_complete(device.attention_epoch())) {
             const auto completed=trace.now();
-            work->dag.complete(attention, completed, proof, device_ns);
-            totals.attention_layer_span_ns+=completed-work->dag.snapshot(q_ready).end_ns;
-            ++totals.attention_layer_span_layers;
-            if (!work->consumer_entry_ns) throw std::logic_error("attention completed without its KV adapter entry");
-            totals.attention_consumer_span_ns+=completed-*work->consumer_entry_ns;
-            ++totals.attention_consumer_span_layers;
+            work->dag.complete(attention, completed, proof);
+            work->attention_span.finish();
             if (work->archive_at_attention) {
                 finish_archive(work);
                 if (work->dag.snapshot(next_prefetch).state==TaskState::pending) next_layer(work);
@@ -945,15 +840,15 @@ struct GgmlPrefetch::Impl {
             if (!released) if (const auto receipt=events->poll(current->layer,epoch)) {
                 const char * proof;
                 if (receipt->proof==AttentionProof::device_signal) {
-                    ++totals.device_event_completions; totals.device_attention_ns+=receipt->device_ns;
-                    proof=receipt->device_ns?"attention_device_event":"attention_device_event_untimed";
+                    ++totals.device_event_completions;
+                    proof="attention_device_event_untimed";
                 } else {
                     ++totals.device_boundary_fallbacks;
                     if (receipt->proof==AttentionProof::query_boundary) { ++totals.query_reused_fences; proof="query_dependency_reuse"; }
                     else if (receipt->proof==AttentionProof::process_boundary) { ++totals.process_reused_fences; proof="process_synchronize_reuse"; }
                     else { ++totals.attention_receipt_reuses; proof="attention_dependency_reuse"; }
                 }
-                release_attention(proof, receipt->device_ns ? std::optional<std::uint64_t>{receipt->device_ns} : std::nullopt,before_upload);
+                release_attention(proof,before_upload);
                 device.reap_transfers();
                 released=true;
             }
@@ -1023,16 +918,16 @@ std::optional<DeviceMemory> GgmlPrefetch::direct_memory() const {
     return {};
 }
 void GgmlPrefetch::select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool covers,
-                                       std::optional<std::uint64_t> projection_ns,bool deferred_archive) {
-    select_impl(layer,position,{},&query,covers,projection_ns,false,deferred_archive);
+                                       bool deferred_archive) {
+    select_impl(layer,position,{},&query,covers,false,deferred_archive);
 }
 void GgmlPrefetch::select_early_device_async(std::uint32_t layer,std::uint64_t position,DeviceQuery query,bool covers,
-                                            std::optional<std::uint64_t> projection_ns,bool deferred_archive) {
-    select_impl(layer, position, {}, &query, covers,projection_ns,true,deferred_archive);
+                                            bool deferred_archive) {
+    select_impl(layer, position, {}, &query, covers,true,deferred_archive);
 }
 // Q 前沿入口：启动选块，再把正式缺失块的读盘与上传交给常驻工作线程。
 void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device,
-                                bool covers,std::optional<std::uint64_t> projection_ns,bool asynchronous,bool deferred_archive) {
+                                bool covers,bool asynchronous,bool deferred_archive) {
     if (!early_enabled()) throw std::logic_error("early selection is disabled");
     if (device) {
         const auto memory=direct_memory();
@@ -1054,7 +949,7 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
         }
     }
     impl_->begin_prediction(layer, position);
-    const auto work = impl_->new_work(layer, position,device!=nullptr,projection_ns,deferred_archive);
+    const auto work = impl_->new_work(layer, position,device!=nullptr,deferred_archive);
     work->query = query;
     work->direct = device != nullptr;
     // Queue score/top-k while the graph is at its Q frontier. Waking an I/O
@@ -1096,13 +991,7 @@ void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, cons
                 if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
                 impl_->device.stage_ready_completion(lease,work->blocks);
             }} : Prefetcher::ReadyBlock{},[&](const std::vector<BlockWork> & plan) {
-                auto blocks=plan;
-                const auto ready=host.ready();
-                for (auto & block:blocks) {
-                    block.read_ns=std::any_of(ready.begin(),ready.end(),[&](const SlotLease & lease) { return lease.identity==block.identity; })?1:impl_->block_read_estimate;
-                    block.copy_ns=impl_->device.find(block.identity)?1:impl_->block_copy_estimate;
-                }
-                work->blocks=std::make_shared<BlockStage>(std::move(blocks),&impl_->block_trace,impl_->sequence,work->layer,work->position,impl_->mode);
+                work->blocks=std::make_shared<BlockStage>(plan,&impl_->block_trace,impl_->sequence,work->layer,work->position,impl_->mode);
                 return work->blocks;
             }, work->deferred_archive,impl_->per_completion_uploads ? Prefetcher::ReadyBatch{} : Prefetcher::ReadyBatch{[&](const std::vector<SlotLease> & ready) {
                 if (!copying) { work->dag.start(history_h2d,impl_->trace.now()); copying=true; }
@@ -1122,17 +1011,15 @@ std::vector<Half> GgmlPrefetch::decode_half(std::uint32_t layer, std::uint64_t p
                                           std::optional<DeviceQuery> serial_query,ggml_tensor * source) {
     return decode_impl(layer, position, {}, {}, {}, true, &kv, &keys, serial_query?&*serial_query:nullptr,source);
 }
-std::vector<Half> GgmlPrefetch::decode_device(std::uint32_t layer,std::uint64_t position,DeviceKeys keys,ggml_tensor * source,
-                                            std::optional<std::uint64_t> projection_ns) {
+std::vector<Half> GgmlPrefetch::decode_device(std::uint32_t layer,std::uint64_t position,DeviceKeys keys,ggml_tensor * source) {
     if (!source || !early_enabled()) throw std::invalid_argument("deferred KV requires a device source and an early query");
-    return decode_impl(layer, position, {}, {}, {}, true, nullptr, &keys, nullptr, source,projection_ns);
+    return decode_impl(layer, position, {}, {}, {}, true, nullptr, &keys, nullptr, source);
 }
 // 当前 KV 汇合点：收取历史工作、安装数据，并按 Naive/OL/SR 模式处理归档与等待。
 std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                           const std::vector<float> & keys, const std::vector<float> & values, bool packed,
-                                          const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * source,
-                                          std::optional<std::uint64_t> projection_ns) {
-    const auto consumer_entry=impl_->trace.now();
+                                          const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * source) {
+    trace::Range attention_span("Attention module",layer,position);
     const auto current = impl_->work;
     const bool deferred = device && !half;
     if ((half && !device) || (device && (early_enabled() == (serial_query!=nullptr)))) {
@@ -1141,10 +1028,9 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
     if (early_enabled()) {
         if (!current || current->layer != layer || current->position != position || current->consumed) throw std::logic_error("KV arrived without its early query");
         if (current->direct != (device != nullptr) || current->deferred_archive!=deferred) throw std::logic_error("KV memory does not match early query");
-        if (deferred) current->dag.complete(kv_projection, impl_->trace.now(), "kv_device_ready",projection_ns);
+        if (deferred) current->dag.complete(kv_projection, impl_->trace.now(), "kv_device_ready");
         else current->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), "kv_download_complete");
     }
-    const auto consumer_ready=impl_->trace.now();
     if (early_enabled() && deferred && current->archive_from_projection) {
         // Figure 11(c): current KV download depends on KV projection,
         // independently of the selected historical blocks still loading.
@@ -1153,23 +1039,11 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         current->dag.start(kv_d2h,impl_->trace.now());
         impl_->transport.start_archive({},position,source,current->archive_at_attention);
     }
-    const auto wait_begin = std::chrono::steady_clock::now();
     {
         trace::Scope wait("CPU Wait KV", layer, position);
         impl_->worker.join();
     }
-    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now()-wait_begin).count();
     std::lock_guard<std::mutex> lock(impl_->mutex);
-    impl_->totals.history_consumer_wait_ns += static_cast<std::uint64_t>(waited);
-    ++impl_->totals.history_consumer_wait_calls;
-    if (early_enabled()) {
-        const auto selection=current->dag.snapshot(select_task);
-        const auto loading=current->dag.snapshot(miss_read);
-        if (selection.state!=TaskState::complete || loading.state!=TaskState::complete)
-            throw std::logic_error("KV load blocking measurement requires completed selection and loading");
-        impl_->totals.cache_load_host_block_ns+=cache_load_host_block_ns(consumer_ready,selection.end_ns,loading.end_ns);
-        ++impl_->totals.cache_load_host_block_layers;
-    }
     impl_->quiesced = false;
     auto work = current;
     if (!early_enabled()) {
@@ -1198,7 +1072,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
             work->dag.complete(append, impl_->trace.now());
         }
     }
-    work->consumer_entry_ns=consumer_entry;
+    work->attention_span=std::move(attention_span);
     auto & host = impl_->session.prefetcher();
     if (!deferred) work->history = host.resolve(layer, position, work->selection);
     if (!early_enabled()) {
@@ -1228,8 +1102,19 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         work->dag.fence({store_task}, impl_->trace.now(), "serial_buffered_store");
         impl_->next_layer(work);
     } else {
-        if (reuses_sync()) impl_->transport.wait_on_compute();
-        else {
+        if (reuses_sync()) {
+            impl_->transport.wait_on_compute();
+            if (work->archive_at_attention) {
+                // Figure 11(c)'s second Sync is the shared load/upload frontier.
+                // The compute stream waits on the last copy event, so attention
+                // can be dispatched without a host wait. Record that boundary
+                // here rather than when its later completion receipt arrives.
+                const auto now=impl_->trace.now();
+                work->dag.complete(history_h2d,now,"attention_upload_dependency");
+                work->dag.complete(current_h2d,now,"attention_upload_dependency");
+                work->dag.start(attention,now);
+            }
+        } else {
             work->dag.complete(current_h2d, impl_->trace.now(), "upload_complete");
             work->dag.start(attention, impl_->trace.now());
         }
@@ -1286,7 +1171,7 @@ void GgmlPrefetch::completed(std::uint64_t epoch) {
     impl_->worker.join();
     std::lock_guard<std::mutex> lock(impl_->mutex);
     if (impl_->device.attention_pending() && epoch == impl_->device.attention_epoch()) {
-        ++impl_->totals.attention_fences; impl_->release_attention("attention_backend_complete",{}, {},early_enabled());
+        ++impl_->totals.attention_fences; impl_->release_attention("attention_backend_complete",{},early_enabled());
     }
 }
 void GgmlPrefetch::process_complete() {

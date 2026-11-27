@@ -56,7 +56,7 @@ void run(solid::KvLayout layout, bool on_disk, bool packed_inputs, bool sparse, 
         const auto cache = cached ? solid::make_infllm_selected_cache(gathered, backend.get()) : nullptr;
         auto lookahead = cached ? std::make_unique<solid::SparseBaselineLookahead>(gathered, *cache, false) : nullptr;
         auto dense = dense_offload ? std::make_unique<solid::DenseOffload>(gathered, backend.get()) : nullptr;
-        solid::AttentionNode operation(gathered, frame, 0, scale, {}, true, nullptr, nullptr, cache.get(), dense.get(), lookahead.get());
+        solid::AttentionNode operation(gathered, frame, 0, scale, {}, true, nullptr, cache.get(), dense.get(), lookahead.get());
         std::unique_ptr<ggml_context, decltype(&ggml_free)> context(ggml_init({2 * 1024 * 1024, nullptr, true}), ggml_free);
         if (!context) throw std::runtime_error("ggml context");
         auto * qt = ggml_new_tensor_3d(context.get(), GGML_TYPE_F32, dimension, queries, 1);

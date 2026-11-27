@@ -22,12 +22,10 @@ from process_lifetime import stop_process, termination_signals
 ROOT = Path(__file__).resolve().parents[1]
 VARIANTS = {"origin", "quant", "indram", "indram-sparse", "offload", "offload-sparse", "interleaved", "prefetch", "overlap", "solid", "solid-no-prefetch", "solid-no-interleaved", "solid-no-coalescing", "solid-per-completion"}
 
-
 def name(value):
     if not isinstance(value,str) or not re.fullmatch(r"[a-zA-Z0-9][a-zA-Z0-9_.-]*",value):
         raise ValueError("experiment names must be path-safe identifiers")
     return value
-
 
 # 从统一模板生成某一种方法的配置，集中设置布局、预算、预取及调度开关。
 def variant_config(template, variant, block, budget):
@@ -53,7 +51,7 @@ def variant_config(template, variant, block, budget):
     attention = {"storage": "memory" if variant == "indram-sparse" else "ssd", "sparse": sparse,
                  "layout": "interleaved" if interleaved else "separate", "fuse_kv_projection": interleaved,
                  "block_tokens": block, "representative_count": 1, "write_buffer_bytes_per_layer": 32768,
-                 "selection_trace": False, "profile": False, "keep_session_file": False, "prefetch": prefetch}
+                 "selection_trace": False, "keep_session_file": False, "prefetch": prefetch}
     if infllm:
         attention["infllm_attention"] = True
         attention["representative_count"] = number(template["attention"].get("representative_count", 4), 1, True)
@@ -86,7 +84,6 @@ def variant_config(template, variant, block, budget):
         attention.update(context_budget_tokens=budget, init_tokens=initial, local_tokens=deterministic-initial)
     config["attention"] = attention
     return config
-
 
 # 展开模型、输入长度、方法与重复次数，保存逐任务配置和实验计划。
 def create(spec_path, destination):
@@ -184,7 +181,6 @@ def create(spec_path, destination):
                       "conditions":conditions,"jobs":rows,"input_policy":"exact-prefix-free-generation-fixed-output-length"})
     return path
 
-
 def read_plan(path):
     path = Path(path).resolve(strict=True)
     plan = load(path)
@@ -201,7 +197,6 @@ def read_plan(path):
         if config["output"] != row["result"]: raise ValueError("configuration output differs from job")
         condition(plan["conditions"][row["group"]["condition"]])
     return path,plan
-
 
 def audited_job(row, settings, attempt, runner_sha=None):
     result,run,config = audit_run(Path(row["result"]),row["config"],row["config_sha256"])
@@ -230,7 +225,6 @@ def audited_job(row, settings, attempt, runner_sha=None):
             raise ValueError("fio report is missing, contains errors or has no completed reads")
         reads = [job["read"] for job in jobs]
     return result,run,config,metrics,group,reads
-
 
 # 依计划执行尚未完成的任务，并记录每次尝试的状态与运行身份。
 def execute(plan_path, runner, limit=None):
@@ -305,7 +299,6 @@ def execute(plan_path, runner, limit=None):
             completed += 1
     return state
 
-
 # 读取各任务结果，保留失败或缺失项，汇总每组的实际测量值。
 def collect(plan_path, destination):
     plan_path,plan = read_plan(plan_path)
@@ -373,7 +366,6 @@ def collect(plan_path, destination):
     (destination/"REPORT.md").write_text("\n".join(lines)+"\n",encoding="utf-8")
     return output
 
-
 def main():
     from process_lifetime import name_thread
     name_thread("sa.matrix")
@@ -390,7 +382,6 @@ def main():
         return 1 if any(job["status"] != "complete" for job in state["jobs"].values()) else 0
     else: collect(args.plan,args.destination); print(args.destination)
     return 0
-
 
 if __name__ == "__main__":
     try: sys.exit(main())

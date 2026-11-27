@@ -36,8 +36,8 @@ void early_half_frontier(solid::ScheduleMode mode,bool asynchronous) {
     for (std::uint64_t p=2;p<4;++p) {
         prefetch.begin_prefetch(0,p);
         const solid::DeviceQuery q{query.data(),query.size(),solid::DeviceMemory::host_emulator};
-        if (asynchronous) prefetch.select_early_device_async(0,p,q,true,{},false);
-        else prefetch.select_early_device(0,p,q,true,{},false);
+        if (asynchronous) prefetch.select_early_device_async(0,p,q,true,false);
+        else prefetch.select_early_device(0,p,q,true,false);
         std::vector<solid::Half> kv(16,solid::to_half(0.5f));
         std::fill(kv.begin()+8,kv.end(),solid::to_half(0.75f));
         const auto mask=prefetch.decode_half(0,p,kv,{kv.data(),kv.size(),16,solid::DeviceMemory::host_emulator});
@@ -64,9 +64,8 @@ public:
     const char * name() const override { return "cpu_protocol"; }
     std::function<void()> first_receipt;
 protected:
-    std::uint64_t elapsed_ns(std::uint32_t) const override {
+    void on_receipt(std::uint32_t) const override {
         if (!checked_) { checked_=true; if (first_receipt) first_receipt(); }
-        return 7;
     }
 private:
     mutable bool checked_=false;
@@ -323,19 +322,14 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
     }
     const auto stats = device.schedule_stats();
     require(stats.frames == 12 && stats.tasks == 144, "microtask frames not fully completed");
-    require(stats.attention_layer_span_layers==12 && stats.attention_layer_span_ns>0,
-        "attention latency did not cover every replayed layer");
-    require(stats.attention_consumer_span_layers==12 && stats.attention_consumer_span_ns>0,
-        "common KV adapter entry latency did not cover every replayed layer");
     require(mode==solid::ScheduleMode::naive ? stats.block_frames==0 : stats.block_frames==12 && stats.block_tasks>12,
             "historical block DAG not completed through actual copy receipts");
     if (infllm && !native) require(stats.attention_fences == 12 && observer.completions == 0, "InfLLM probability receipts did not complete attention");
-    else if (native) require(stats.device_event_completions==12 && stats.device_attention_ns==84 && stats.device_boundary_fallbacks==0 &&
+    else if (native) require(stats.device_event_completions==12 && stats.device_boundary_fallbacks==0 &&
         stats.query_reused_fences==0 && stats.process_reused_fences==0 && observer.completions==0,"native completion did not replace graph boundary fences");
     else if (mode == solid::ScheduleMode::sync_reuse) require(stats.query_reused_fences == 6 && stats.process_reused_fences == 6 && stats.attention_fences == 0,
         "sync reuse did not remove per-attention host fences");
     else require(observer.completions == 12, "scheduler failed to confirm each layer's attention completion");
-    if (controlled) require(stats.miss_projection_overlap_ns > 0, "missing I/O and KV projection did not overlap");
     if (disk) require(session.stats().prefetch.io.completed_reads > 0, "GGML path did not complete liburing reads");
     if (disk && mode != solid::ScheduleMode::naive) {
         require(session.stats().prefetch.io.write_bytes == 12ull*kv_heads*dimension*2*sizeof(solid::Half),
@@ -354,16 +348,16 @@ void run(bool disk, solid::ScheduleMode mode, const std::filesystem::path & trac
         device.stats().current_device_bytes==12ull*kv_heads*dimension*2*sizeof(solid::Half),"current KV did not use device row transfers");
     if (!directory.empty()) {
         std::ofstream output(directory / "stats.json");
-        output << nlohmann::json({{"frames", stats.frames}, {"tasks", stats.tasks}, {"critical_path_ns", stats.critical_path_ns},
-            {"miss_projection_overlap_ns", stats.miss_projection_overlap_ns}, {"query_reused_fences", stats.query_reused_fences},
+        output << nlohmann::json({{"frames", stats.frames}, {"tasks", stats.tasks},
+            {"query_reused_fences", stats.query_reused_fences},
             {"process_reused_fences", stats.process_reused_fences}, {"attention_fences", stats.attention_fences},
             {"attention_receipt_reuses",stats.attention_receipt_reuses},
             {"fallback_fences", stats.fallback_fences},{"device_event_completions",stats.device_event_completions},
-            {"device_attention_ns",stats.device_attention_ns}}).dump();
+            }).dump();
         require(output.good(), "graph trace stats write failed");
         std::ofstream blocks(directory/"block-stats.json");
         blocks<<nlohmann::json({{"block_frames",stats.block_frames},{"block_tasks",stats.block_tasks},
-            {"block_critical_path_ns",stats.block_critical_path_ns}}).dump();
+            }).dump();
         require(blocks.good(),"block trace stats write failed");
         const auto copies=device.stats();
         std::ofstream transfers(directory/"device-stats.json");

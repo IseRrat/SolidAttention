@@ -59,9 +59,9 @@ int main() {
         reject(quantized + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"context_budget_tokens\":4,\"init_tokens\":4,\"local_tokens\":1}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"unexpected\":1}}");
-        write(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"interleaved\",\"fuse_kv_projection\":true,\"profile\":true}}");
+        write(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"layout\":\"interleaved\",\"fuse_kv_projection\":true}}");
         const auto interleaved = solid::RunConfig::load(config).attention;
-        if (!interleaved.interleaved || !interleaved.fuse_kv_projection || !interleaved.profile) throw std::runtime_error("layout configuration parsing");
+        if (!interleaved.interleaved || !interleaved.fuse_kv_projection) throw std::runtime_error("layout configuration parsing");
         write(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"selection_trace\":false}}");
         if (solid::RunConfig::load(config).attention.selection_trace) throw std::runtime_error("selection trace switch parsing");
         for (const auto mode : {"cpu", "cuda", "auto"}) {
@@ -98,9 +98,9 @@ int main() {
         reject(prefix + async_mode + ",\"prefetch_queue_depth\":1}}");
         write(prefix + async_mode + ",\"coalesce_uploads\":false}}");
         if (solid::RunConfig::load(config).attention.coalesce_uploads) throw std::runtime_error("upload coalescing flag ignored");
-        write(prefix+async_mode+",\"coalesce_uploads\":false,\"per_completion_uploads\":true,\"measure_upload_ready_time\":true,\"schedule\":\"overlap+sync_reuse\"}}");
+        write(prefix+async_mode+",\"coalesce_uploads\":false,\"per_completion_uploads\":true,\"schedule\":\"overlap+sync_reuse\"}}");
         const auto dispatch=solid::RunConfig::load(config).attention;
-        if (!dispatch.per_completion_uploads || !dispatch.measure_upload_ready_time) throw std::runtime_error("upload dispatch diagnostics ignored");
+        if (!dispatch.per_completion_uploads) throw std::runtime_error("upload dispatch diagnostics ignored");
         reject(prefix+async_mode+",\"per_completion_uploads\":true}}");
         reject(prefix+async_mode+",\"coalesce_uploads\":false,\"per_completion_uploads\":true}}");
         reject(prefix + ",\"attention\":{\"storage\":\"ssd\",\"sparse\":true,\"coalesce_uploads\":false}}");

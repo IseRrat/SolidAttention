@@ -100,12 +100,12 @@ std::optional<AttentionReceipt> AttentionEvents::poll(std::uint32_t layer,std::u
     if (!epoch || slot.armed.load(std::memory_order_acquire)!=epoch || active_.load(std::memory_order_acquire)!=epoch) throw std::logic_error("attention receipt epoch mismatch");
     if (consumed_.load(std::memory_order_acquire)==epoch) return {};
     if (slot.done.load(std::memory_order_acquire)==epoch) {
-        const auto duration=elapsed_ns(layer); consumed_.store(epoch,std::memory_order_release);
-        return AttentionReceipt{AttentionProof::device_signal,duration};
+        on_receipt(layer); consumed_.store(epoch,std::memory_order_release);
+        return AttentionReceipt{AttentionProof::device_signal};
     }
     if (boundary_seen(epoch)) {
         const auto proof=static_cast<AttentionProof>(boundary_proof_.load(std::memory_order_acquire));
-        consumed_.store(epoch,std::memory_order_release); return AttentionReceipt{proof,0};
+        consumed_.store(epoch,std::memory_order_release); return AttentionReceipt{proof};
     }
     return {};
 }

@@ -3,7 +3,6 @@
 #include "solid/trace.hpp"
 #include "solid/filehash.hpp"
 #include "solid/llama_adapter.hpp"
-#include "solid/profile.hpp"
 #include "solid_build_info.hpp"
 #include "llama.h"
 #include "llama-memory.h"
@@ -98,9 +97,9 @@ Json metadata(const llama_model * model) {
 Json counters(const solid::SessionStats & s, const solid::DeviceCacheStats & d) {
     return {{"read_requests", s.io.read_requests + s.prefetch.io.read_requests},
         {"read_bytes", s.io.read_bytes + s.prefetch.io.read_bytes}, {"write_requests", s.io.write_requests},
-        {"write_bytes", s.io.write_bytes}, {"io_read_ms", s.io.read_ns / 1e6}, {"io_write_ms", s.io.write_ns / 1e6},
+        {"write_bytes", s.io.write_bytes},
         {"attention_queries", s.attention_queries}, {"selected_tokens", s.selected_tokens},
-        {"append_ms", s.append_ns / 1e6}, {"selection_ms", s.selection_ns / 1e6},
+
         {"selection_rank_calls", s.ranking.calls}, {"selection_scored_blocks", s.ranking.scored_blocks},
         {"selection_published_blocks", s.ranking.published_blocks},
         {"representative_builder_queries", s.ranking.builder_queries}, {"representative_builder_appends", s.ranking.builder_appends},
@@ -116,12 +115,11 @@ Json counters(const solid::SessionStats & s, const solid::DeviceCacheStats & d) 
         {"prefill_probability_download_bytes",s.prefill.probability_download_bytes},
         {"prefill_tiled_batches", s.prefill.batches}, {"prefill_tiled_queries", s.prefill.query_tokens},
         {"prefill_tiles", s.prefill.tiles}, {"prefill_kv_tokens", s.prefill.kv_tokens},
-        {"prefill_upload_bytes", s.prefill.upload_bytes}, {"tiled_prefill_inclusive_ms", s.tiled_prefill_ns/1e6},
-        {"gather_inclusive_ms", s.gather_ns / 1e6}, {"gather_copy_bytes", s.gather_copy_bytes},
-        {"dense_prefetch_layers", s.dense_prefetch_layers}, {"dense_prefetch_wait_ms", s.dense_prefetch_wait_ns / 1e6},
-        {"sparse_prefetch_layers", s.sparse_prefetch_layers}, {"sparse_prefetch_wait_ms", s.sparse_prefetch_wait_ns / 1e6},
-        {"streaming_attention_inclusive_ms", s.streaming_attention_ns / 1e6},
-        {"prefetch_wait_ms", s.prefetch.wait_ns / 1e6}, {"prefetch_resolve_ms", s.prefetch.resolve_ns / 1e6},
+        {"prefill_upload_bytes", s.prefill.upload_bytes},
+        {"gather_copy_bytes", s.gather_copy_bytes},
+        {"dense_prefetch_layers", s.dense_prefetch_layers},
+        {"sparse_prefetch_layers", s.sparse_prefetch_layers},
+
         {"device_uploads", d.uploads}, {"device_upload_bytes", d.upload_bytes},
         {"device_reused_blocks", d.reused_blocks}, {"device_overwritten_blocks", d.overwritten_blocks},
         {"device_shared_host_copy_bytes", d.shared_host_copy_bytes},
@@ -142,7 +140,6 @@ struct BackendLifetime {
 };
 struct EvaluationBridge {
     solid::AttentionAdapter * adapter;
-    solid::ExecutionProfile * profile;
     std::filesystem::path diagnostic;
     std::size_t diagnostic_layers = 0, captured = 0;
     bool diagnostic_prefill = false;
@@ -202,8 +199,7 @@ struct EvaluationBridge {
             catch (...) { self.diagnostic_error = std::current_exception(); return false; }
         }
         const bool a = self.adapter ? self.adapter->observe(tensor, ask) : !ask;
-        const bool p = self.profile ? solid::ExecutionProfile::evaluate(tensor, ask, self.profile) : !ask;
-        return ask ? a || p || diagnostic : a && p;
+        return ask ? a || diagnostic : a;
     }
 };
 struct AdapterContextLifetime {
@@ -249,7 +245,6 @@ int main(int argc, char ** argv) {
         }
         const auto request_start = Clock::now();
         BackendLifetime backend;
-        solid::ExecutionProfile profile(config.attention.profile);
         if (!tokenize_only && config.gpu_layers > 0 && !ggml_backend_dev_by_type(GGML_BACKEND_DEVICE_TYPE_GPU)) {
             throw std::runtime_error("GPU layers requested but no GPU backend is available");
         }
@@ -335,7 +330,7 @@ int main(int argc, char ** argv) {
                        tokens.size(), config.output.parent_path() / "selection.jsonl",config.microbatch_tokens);
         }
         const double adapter_ms = milliseconds(adapter_start);
-        EvaluationBridge evaluation{adapter.get(), config.attention.profile ? &profile : nullptr};
+        EvaluationBridge evaluation{adapter.get()};
         if (const auto * directory = std::getenv("SOLID_DIAGNOSTIC_ATTENTION")) {
             evaluation.diagnostic_prefill = config.attention.infllm_attention;
             if (const auto * phase = std::getenv("SOLID_DIAGNOSTIC_PHASE")) {
@@ -356,9 +351,11 @@ int main(int argc, char ** argv) {
         }
         // InfLLM completes through its graph receipt. An unused eval observer
         // still makes GGML synchronize every GPU split, so retain it only for
-        // the legacy FlashAttention completion or explicit diagnostics.
-        const bool legacy_prefetch_completion = config.attention.prefetch && !config.attention.infllm_attention;
-        if (config.attention.profile || legacy_prefetch_completion || (adapter && adapter->dense_offload_enabled()) || !evaluation.diagnostic.empty()) {
+        // legacy FlashAttention completion or explicit diagnostics. Native
+        // CUDA completion already publishes the attention receipt.
+        const bool legacy_prefetch_completion = config.attention.prefetch && !config.attention.infllm_attention &&
+            (!adapter || !adapter->cuda_native_completion());
+        if (legacy_prefetch_completion || (adapter && adapter->dense_offload_enabled()) || !evaluation.diagnostic.empty()) {
             cp.cb_eval = EvaluationBridge::evaluate;
             cp.cb_eval_user_data = &evaluation;
         }
@@ -374,7 +371,7 @@ int main(int argc, char ** argv) {
         for (std::size_t first = 0; first < tokens.size();) {
             const auto count = std::min<std::size_t>(config.batch_tokens, tokens.size() - first);
             submit(ctx.get(), batch.get(), tokens.data() + first, count, static_cast<llama_pos>(first), first + count == tokens.size(), adapter.get());
-            profile.check(); evaluation.check();
+            evaluation.check();
             first += count;
         }
         if (adapter) adapter->flush();
@@ -382,7 +379,6 @@ int main(int argc, char ** argv) {
         const double prefill_ms = milliseconds(prefill_start);
         const auto prefill_counters = adapter ? counters(adapter->stats(), adapter->device_stats()) : Json::object();
         if (adapter && config.attention.direct_decode_reads) adapter->enable_direct_reads();
-        profile.set_decode();
         std::ofstream logits_file;
         const auto logits_path = config.output.parent_path() / "logits.f32";
         if (config.dump_logits) {
@@ -408,7 +404,7 @@ int main(int argc, char ** argv) {
                 decode_inputs.push_back(input);
                 submit(ctx.get(), batch.get(), &input, 1,
                        static_cast<llama_pos>(tokens.size() + i - 1), true, adapter.get());
-                profile.check(); evaluation.check();
+                evaluation.check();
                 process_ms = milliseconds(processing);
             }
             const auto sample_start = Clock::now();
@@ -509,7 +505,7 @@ int main(int argc, char ** argv) {
                 {"projection_extra_weight_bytes", adapter->projection_buffer_bytes()},
                 {"projection_source_bytes", adapter->projection_source_bytes()},
                 {"projection_source_host_bytes", adapter->projection_source_host_bytes()},
-                {"projection_initialization_ms", adapter->projection_initialization_ns() / 1e6},
+
                 {"projection_weight_types", adapter->projection_weight_types()},
                 {"selection_source", config.attention.selection_replay.empty() ? "dynamic" : "replay"},
                 {"selection_backend", stats.selection_backend}, {"selection_backend_requested", config.attention.selection_backend},
@@ -551,10 +547,9 @@ int main(int argc, char ** argv) {
                 {"read_requests", stats.io.read_requests + stats.prefetch.io.read_requests},
                 {"read_bytes", stats.io.read_bytes + stats.prefetch.io.read_bytes},
                 {"write_requests", stats.io.write_requests}, {"write_bytes", stats.io.write_bytes},
-                {"io_read_ms", stats.io.read_ns / 1e6}, {"io_write_ms", stats.io.write_ns / 1e6},
-                {"append_ms", stats.append_ns / 1e6}, {"selection_ms", stats.selection_ns / 1e6},
-                {"gather_inclusive_ms", stats.gather_ns / 1e6}, {"gather_copy_bytes", stats.gather_copy_bytes},
-                {"streaming_attention_inclusive_ms", stats.streaming_attention_ns / 1e6}
+
+                {"gather_copy_bytes", stats.gather_copy_bytes},
+
             };
             if (config.attention.prefetch) {
                 result["prefetch"] = {
@@ -571,17 +566,14 @@ int main(int argc, char ** argv) {
                     {"inflight_hits", stats.prefetch.inflight_hits}, {"missing_blocks", stats.prefetch.missing_blocks},
                     {"unused_blocks", stats.prefetch.unused_blocks}, {"refreshed_blocks", stats.prefetch.refreshed_blocks},
                     {"stale_completions", stats.prefetch.stale_completions}, {"host_buffer_bytes", stats.prefetch.host_bytes},
-                    {"wait_ms", stats.prefetch.wait_ns / 1e6}, {"resolve_inclusive_ms", stats.prefetch.resolve_ns / 1e6},
+
                     {"async_read_requests", stats.prefetch.io.read_requests}, {"async_read_bytes", stats.prefetch.io.read_bytes},
                     {"async_write_requests", stats.prefetch.io.write_requests}, {"async_write_bytes", stats.prefetch.io.write_bytes},
                     {"completed_reads", stats.prefetch.io.completed_reads}, {"cancel_requests", stats.prefetch.io.cancel_requests},
-                    {"cancel_completions", stats.prefetch.io.cancel_completions}, {"read_completion_latency_sum_ms", stats.prefetch.io.completion_ns / 1e6},
+                    {"cancel_completions", stats.prefetch.io.cancel_completions},
                     {"cancel_successes", stats.prefetch.io.cancel_successes}, {"cancel_not_found", stats.prefetch.io.cancel_not_found},
                     {"cancel_busy", stats.prefetch.io.cancel_busy}, {"cancel_errors", stats.prefetch.io.cancel_errors},
-                    {"ready_time_measured",stats.prefetch.io.ready_time_measured},
-                    {"ready_upload_samples",device.ready_upload_samples},
-                    {"ready_upload_delay_sum_ms",device.ready_upload_delay_ns/1e6},
-                    {"ready_upload_delay_max_ms",device.ready_upload_delay_max_ns/1e6},
+
                     {"device_uploads", device.uploads}, {"device_upload_bytes", device.upload_bytes},
                     {"device_shared_host_copy_bytes", device.shared_host_copy_bytes}, {"device_shared_buffer_bytes", device.shared_resident_bytes},
                     {"current_device_rows",device.current_device_rows},{"current_device_bytes",device.current_device_bytes},
@@ -601,17 +593,13 @@ int main(int argc, char ** argv) {
                     {"mode", config.attention.schedule}, {"trace_enabled", config.attention.schedule_trace},
                     {"frames", schedule.frames}, {"tasks", schedule.tasks}, {"worker_jobs", schedule.worker_jobs},
                     {"block_frames",schedule.block_frames},{"block_tasks",schedule.block_tasks},
-                    {"block_observed_critical_path_sum_ms",schedule.block_critical_path_ns/1e6},
+
                     {"completion_backend",schedule.completion_backend},{"device_event_completions",schedule.device_event_completions},
-                    {"device_attention_event_ms",schedule.device_attention_ns/1e6},{"device_boundary_fallbacks",schedule.device_boundary_fallbacks},
-                    {"attention_layer_span_ms",schedule.attention_layer_span_ns/1e6},
-                    {"attention_layer_span_layers",schedule.attention_layer_span_layers},
-                    {"attention_consumer_span_ms",schedule.attention_consumer_span_ns/1e6},
-                    {"attention_consumer_span_layers",schedule.attention_consumer_span_layers},
+                    {"device_boundary_fallbacks",schedule.device_boundary_fallbacks},
+
                     {"uploads_before_boundary",schedule.uploads_before_boundary},{"copy_event_queries",schedule.copy_event_queries},
                     {"coordinator_cpu",schedule.coordinator_cpu},
-                    {"observed_critical_path_sum_ms", schedule.critical_path_ns / 1e6},
-                    {"miss_projection_overlap_sum_ms", schedule.miss_projection_overlap_ns / 1e6},
+
                     {"query_reused_fences", schedule.query_reused_fences}, {"process_reused_fences", schedule.process_reused_fences},
                     {"attention_receipt_reuses", schedule.attention_receipt_reuses},
                     {"attention_fences", schedule.attention_fences}, {"fallback_fences", schedule.fallback_fences},
@@ -625,13 +613,7 @@ int main(int argc, char ** argv) {
                     {"historical_upload_ranges",schedule.historical_upload_ranges},
                     {"archive_attention_reuses",schedule.archive_attention_reuses},
                     {"archive_separate_completions",schedule.archive_separate_completions},
-                    {"history_consumer_wait_ms",schedule.history_consumer_wait_ns/1e6},
-                    {"history_consumer_wait_calls",schedule.history_consumer_wait_calls},
-                    {"cache_loading_host_block_ms",schedule.cache_load_host_block_ns/1e6},
-                    {"cache_loading_device_block_ms",schedule.cache_load_device_block_ns/1e6},
-                    {"cache_loading_blocking_ms",(schedule.cache_load_host_block_ns+schedule.cache_load_device_block_ns)/1e6},
-                    {"cache_loading_host_block_layers",schedule.cache_load_host_block_layers},
-                    {"cache_loading_device_block_layers",schedule.cache_load_device_block_layers},
+
                     {"backend_compute_waits", schedule.backend_compute_waits}, {"staging_buffer_bytes", schedule.staging_bytes}
                 };
                 const auto schedule_trace = config.output.parent_path() / "schedule.jsonl";
@@ -641,15 +623,6 @@ int main(int argc, char ** argv) {
             }
             if (config.attention.selection_trace) result["selection_trace_sha256"] = solid::sha256_file(config.output.parent_path() / "selection.jsonl");
             if (!config.attention.selection_replay.empty()) result["selection_replay_sha256"] = solid::sha256_file(config.attention.selection_replay);
-        }
-        if (config.attention.profile) {
-            const auto serialize = [](const std::map<std::string, solid::ProfileTotal> & totals) {
-                Json entries = Json::object();
-                for (const auto & pair : totals) entries[pair.first] = {{"calls", pair.second.calls}, {"bytes", pair.second.bytes}, {"ms", pair.second.ns / 1e6}};
-                return entries;
-            };
-            result["profile"] = {{"mode", "serialized_nodes_and_transfers"}, {"nodes", serialize(profile.nodes())},
-                                 {"transfers", serialize(profile.transfers())}};
         }
         std::filesystem::create_directories(config.output.parent_path());
         const auto temporary = config.output.string() + ".tmp";

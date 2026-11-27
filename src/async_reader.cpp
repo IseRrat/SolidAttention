@@ -1,7 +1,6 @@
 // liburing 读写引擎：提交 SSD 请求、收取完成结果，并通过 eventfd 通知等待线程。
 #include "solid/async_reader.hpp"
 #include <cerrno>
-#include <chrono>
 #include <climits>
 #include <map>
 #include <set>
@@ -45,7 +44,7 @@ public:
             throw std::invalid_argument("invalid async KV I/O request");
         }
         if (reads_.size() >= limit_ || (write && active_writes_ >= limit_ / 2)) return false;
-        Request request{fd, static_cast<const unsigned char *>(data), bytes, 0, offset, write, false, 0, std::chrono::steady_clock::now()};
+        Request request{fd, static_cast<const unsigned char *>(data), bytes, 0, offset, write, false, 0};
         auto inserted = reads_.emplace(id, request);
         try { stage(id, inserted.first->second); }
         catch (...) { reads_.erase(inserted.first); throw; }
@@ -110,9 +109,8 @@ public:
                 final_result = request.done == request.bytes ? static_cast<std::int64_t>(request.done) : -ECANCELED;
             } else if (result == 0) final_result = request.write ? -EIO : -ENODATA;
             else if (result > 0) final_result = -EOVERFLOW;
-            const auto ns = std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - request.start).count();
-            if (request.write) { stats_.write_ns += ns; --active_writes_; }
-            else { stats_.completion_ns += ns; ++stats_.completed_reads; }
+            if (request.write) --active_writes_;
+            else ++stats_.completed_reads;
             completion = {tag, final_result};
             reads_.erase(found);
             return true;
@@ -147,7 +145,6 @@ private:
         std::uint64_t offset;
         bool write, cancelled;
         std::uint32_t retries;
-        std::chrono::steady_clock::time_point start;
     };
     static constexpr std::uint64_t cancel_bit = std::uint64_t{1} << 63;
     io_uring ring_{};

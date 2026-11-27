@@ -30,19 +30,18 @@ public:
     void select_early(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, bool query_covers_attention);
     std::optional<DeviceMemory> direct_memory() const;
     void select_early_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query, bool query_covers_attention,
-                             std::optional<std::uint64_t> projection_ns = {},bool deferred_archive = true);
+                             bool deferred_archive = true);
     // The graph retains Q until the KV frontier or quiesce() has joined the
     // selection worker. The synchronous entry above consumes Q before return.
     // Q 到达后把正式选块和补读交给工作线程；调用方保留 Q 到后续汇合点。
     void select_early_device_async(std::uint32_t layer,std::uint64_t position,DeviceQuery query,bool query_covers_attention,
-                                   std::optional<std::uint64_t> projection_ns = {},bool deferred_archive = true);
+                                   bool deferred_archive = true);
     // Use deferred_archive=false when the later frontier is decode_half().
     // The device-only decode_device() frontier retains the default DAG.
     std::vector<Half> decode_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys,
                                   std::optional<DeviceQuery> serial_query = {},ggml_tensor * device_source = nullptr);
     // 当前设备 KV 到达后的汇合入口，安装本层 attention 所需数据并安排归档。
-    std::vector<Half> decode_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys, ggml_tensor * source,
-                                   std::optional<std::uint64_t> projection_ns = {});
+    std::vector<Half> decode_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys, ggml_tensor * source);
     void begin_prefetch(std::uint32_t layer, std::uint64_t position);
     ScheduleStats schedule_stats() const;
     // The caller keeps the context/backend alive until this has returned.
@@ -53,10 +52,9 @@ private:
     struct Impl;
     std::unique_ptr<Impl> impl_;
     void select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device,
-                     bool covers,std::optional<std::uint64_t> projection_ns = {},bool asynchronous = true,bool deferred_archive = true);
+                     bool covers,bool asynchronous = true,bool deferred_archive = true);
     std::vector<Half> decode_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                   const std::vector<float> & keys, const std::vector<float> & values, bool packed,
-                                  const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * device_source,
-                                  std::optional<std::uint64_t> projection_ns = {});
+                                  const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * device_source);
 };
 } // namespace solid

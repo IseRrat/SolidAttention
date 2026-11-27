@@ -5,17 +5,12 @@
 
 #include <algorithm>
 #include <cmath>
-#include <chrono>
 #include <limits>
 #include <numeric>
 #include <stdexcept>
 
 namespace solid {
 namespace {
-using Clock = std::chrono::steady_clock;
-std::uint64_t elapsed(Clock::time_point start) {
-    return std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count();
-}
 void pack_token(const KvGeometry & g, const float * keys, const float * values, Half * kv) {
     const auto width = g.dimension;
     for (std::uint32_t head = 0; head < g.heads; ++head) {
@@ -107,18 +102,18 @@ std::vector<float> AttentionSession::process(std::uint32_t layer, std::uint64_t 
             std::vector<HeadSelection> selection;
             const bool use_sparse = sparse_ && (rope_ || position >= prefill_tokens_);
             if (use_sparse) {
-                const auto start = Clock::now();
+
                 selection = position < prefill_tokens_ ? select_blocks(g, budget_, *representatives_, layer, position, q) :
                     select(layer, position, q);
-                stats_.selection_ns += elapsed(start);
+
                 if (position >= prefill_tokens_) record(layer, position, selection);
                 for (const auto & head : selection) stats_.selected_tokens += head.positions.size();
             }
-            const auto attention_start = Clock::now();
+
             auto attended = streamed_attention(*store_, layer, position, query_heads_, q, scale, use_sparse ? &selection : nullptr,
                 rope_ ? &*rope_ : nullptr, budget_.local, rope_ ? &probabilities : nullptr);
             if (rope_) observe_probabilities(layer, position, probabilities);
-            stats_.streaming_attention_ns += elapsed(attention_start);
+
             std::copy(attended.begin(), attended.end(), output.begin() + token * query_elements);
             ++stats_.attention_queries;
             std::uint64_t workspace = (output.capacity() + q.capacity() + attended.capacity()) * sizeof(float) +
@@ -165,7 +160,7 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
                 prefill_->begin_sparse_local({position, count, scale, budget_.local, *rope_, chunk_query,
                     chunk_kv, representatives_->probability_key_window(layer)});
             }
-            const auto selection_start = Clock::now();
+
             const auto context = [&] {
                 if (archived) {
                     const auto mean_query = position >= budget_.total ? prefill_->mean_sparse_query_async(chunk_query, count) : DeviceQueryWithEvent{};
@@ -177,9 +172,9 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
                 return select_prefill_context(g, budget_, *representatives_, layer, position, count, mean);
             }();
             const auto & positions = context.positions;
-            stats_.selection_ns += elapsed(selection_start);
+
             if (!device_probabilities()) current.resize(count * 2 * kwidth);
-            const auto append_start = Clock::now();
+
             for (std::uint32_t i = 0; i < count; ++i) {
                 const auto offset = (start + i) * kwidth;
                 if (archived) std::copy_n(archived->data() + offset * 2, row.size(), row.data());
@@ -187,9 +182,7 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
                 store_->append_interleaved(layer, position + i, row);
                 if (!device_probabilities()) std::copy(row.begin(), row.end(), current.data() + i * 2 * kwidth);
             }
-            stats_.append_ns += elapsed(append_start);
 
-            const auto attention_start = Clock::now();
             SparsePrefillOutput device;
             if (prefill_) {
                 const auto rows = positions.size();
@@ -246,8 +239,7 @@ std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::ui
                 }
                 stats_.selected_tokens += ((local_only - positions.begin()) + (visible - local_begin)) * g.heads;
             }
-            if (prefill_) stats_.tiled_prefill_ns += elapsed(attention_start);
-            else stats_.streaming_attention_ns += elapsed(attention_start);
+
             stats_.attention_queries += count;
             const auto workspace = (output.capacity() + mean.capacity() + q.capacity() + probabilities.capacity() +
                                     device.attention.capacity() + device.key_scores.capacity()) * sizeof(float) +
@@ -293,7 +285,7 @@ std::vector<float> AttentionSession::tiled_prefill(std::uint32_t layer, std::uin
                 std::copy_n(batch.data()+i*qwidth,qwidth,query.data());
                 append_token(layer,first+start+i,query,keys.data()+(start+i)*kwidth*(packed?2:1),packed?nullptr:values.data()+(start+i)*kwidth);
             }
-            const auto attention_start=Clock::now();
+
             prefill_->begin(first+start,count,scale,batch);
             const auto end=first+start+count;
             std::vector<Half> planes;
@@ -312,8 +304,7 @@ std::vector<float> AttentionSession::tiled_prefill(std::uint32_t layer, std::uin
             stats_.attention_queries+=count;
             stats_.workspace_peak_bytes=std::max(stats_.workspace_peak_bytes,static_cast<std::uint64_t>(
                 (output.capacity()+batch.capacity()+query.capacity()+attended.capacity())*sizeof(float)+planes.capacity()*sizeof(Half)));
-            // Inclusive host interval covers storage reads and the device frame.
-            stats_.tiled_prefill_ns+=elapsed(attention_start);
+
             start+=count;
         }
     } catch (...) {
@@ -327,7 +318,7 @@ std::vector<float> AttentionSession::tiled_prefill(std::uint32_t layer, std::uin
 void AttentionSession::append_token(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                     const float * keys, const float * values, bool query_observed) {
     const auto elements = static_cast<std::size_t>(geometry().heads) * geometry().dimension;
-    const auto start = Clock::now();
+
     for (const auto value : query) if (!std::isfinite(value)) throw std::invalid_argument("non-finite query");
     std::vector<Half> kv(elements * 2);
     pack_token(geometry(), keys, values, kv.data());
@@ -339,7 +330,7 @@ void AttentionSession::append_token(std::uint32_t layer, std::uint64_t position,
         if (query_observed) representatives_->append_keys(layer, position, k);
         else representatives_->observe(layer, position, query, k);
     }
-    stats_.append_ns += elapsed(start);
+
 }
 std::optional<DeviceMemory> AttentionSession::prefill_direct_memory() const {
     if (!prefill_) return {};
@@ -384,14 +375,13 @@ void AttentionSession::process_prefill_device(std::uint32_t layer,std::uint64_t 
             const auto count=std::min(prefill_->query_capacity(),tokens-start);
             const DeviceQuery query{queries.data+start*qwidth,count*qwidth,*memory};
             const DeviceKvBatch kv{device_kv.data+start*kwidth,count*kwidth,*memory};
-            const auto append_start=Clock::now();
+
             if (representatives_) representatives_->observe_batch_device(layer,first+start,count,query,kv);
             for (std::uint32_t i=0;i<count;++i) {
                 std::copy_n(host_kv.data()+(start+i)*kwidth,kwidth,row.data());
                 store_->append_interleaved(layer,first+start+i,row);
             }
-            stats_.append_ns+=elapsed(append_start);
-            const auto attention_start=Clock::now();
+
             prefill_->begin_device(first+start,count,scale,query);
             const auto end=first+start+count;
             std::vector<Half> planes;
@@ -413,7 +403,7 @@ void AttentionSession::process_prefill_device(std::uint32_t layer,std::uint64_t 
             stats_.attention_queries+=count; stats_.direct_prefill_queries+=count;
             stats_.prefill_kv_download_bytes+=count*kwidth*sizeof(Half);
             stats_.workspace_peak_bytes=std::max(stats_.workspace_peak_bytes,static_cast<std::uint64_t>((host_kv.capacity()+row.capacity()+planes.capacity())*sizeof(Half)));
-            stats_.tiled_prefill_ns+=elapsed(attention_start);
+
             start+=count;
         }
     } catch (...) {
@@ -450,11 +440,11 @@ void AttentionSession::read_dense_history(std::uint32_t layer, std::uint32_t pos
 void AttentionSession::append_dense_decode(std::uint32_t layer, std::uint64_t position, const float * keys, const float * values) {
     if (failed_ || sparse_ || position < prefill_tokens_ || !keys || !values) throw std::logic_error("invalid dense decode archive");
     try {
-        const auto start = Clock::now();
+
         std::vector<Half> kv(static_cast<std::size_t>(geometry().heads) * 2 * geometry().dimension);
         pack_token(geometry(), keys, values, kv.data());
         store_->append_interleaved(layer, position, kv);
-        stats_.append_ns += elapsed(start);
+
         if (trace_.is_open()) {
             std::vector<HeadSelection> selection(geometry().heads);
             for (auto & head : selection) {
@@ -493,7 +483,7 @@ void AttentionSession::gather_into(std::uint32_t layer, std::uint64_t position, 
     try {
         append_token(layer, position, query, keys.data(), interleaved_inputs ? nullptr : values.data());
         std::vector<HeadSelection> selection;
-        const auto selection_start = Clock::now();
+
         if (sparse_) selection = select(layer, position, query);
         else if (trace_.is_open()) {
             selection.resize(g.heads);
@@ -502,9 +492,9 @@ void AttentionSession::gather_into(std::uint32_t layer, std::uint64_t position, 
                 std::iota(head.positions.begin(), head.positions.end(), std::uint64_t{0});
             }
         }
-        stats_.selection_ns += elapsed(selection_start);
+
         record(layer, position, selection);
-        const auto gather_start = Clock::now();
+
         const auto slots = gather_slots();
         const auto head_elements=static_cast<std::size_t>(slots)*g.dimension;
         const auto plane_elements=head_elements*g.heads;
@@ -552,7 +542,7 @@ void AttentionSession::gather_into(std::uint32_t layer, std::uint64_t position, 
             stats_.gather_copy_bytes+=2ull*count*g.dimension*sizeof(Half);
             stats_.selected_tokens+=count;
         }
-        stats_.gather_ns += elapsed(gather_start);
+
         ++stats_.attention_queries;
         stats_.workspace_peak_bytes = std::max<std::uint64_t>(stats_.workspace_peak_bytes,
             range_scratch.capacity()*sizeof(Half));
@@ -562,10 +552,10 @@ Prefetcher & AttentionSession::prefetcher() {
     if (!prefetch_) throw std::logic_error("prefetch is disabled");
     return *prefetch_;
 }
-void AttentionSession::begin_prefetch(std::uint32_t layer, std::uint64_t position, PredictionCosts costs) {
+void AttentionSession::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
     if (failed_) throw std::runtime_error("attention session failed");
     if (prefetch_ && position >= prefill_tokens_ && position < geometry().capacity_tokens) {
-        try { prefetch_->begin(layer, position, costs); } catch (...) { failed_ = true; throw; }
+        try { prefetch_->begin(layer, position); } catch (...) { failed_ = true; throw; }
     }
 }
 std::vector<HeadSelection> AttentionSession::select_decode(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
@@ -578,9 +568,9 @@ std::vector<HeadSelection> AttentionSession::select_decode(std::uint32_t layer, 
     try {
         append_token(layer, position, query, keys.data(), interleaved_inputs ? nullptr : values.data());
         if (after_append) after_append();
-        const auto start = Clock::now();
+
         auto selected = select(layer, position, query);
-        stats_.selection_ns += elapsed(start);
+
         record(layer, position, selected);
         for (const auto & head : selected) stats_.selected_tokens += head.positions.size();
         ++stats_.attention_queries;
@@ -600,9 +590,9 @@ std::vector<HeadSelection> AttentionSession::select_decode_device(std::uint32_t 
         representatives_->begin_probability_query(layer, position);
         append_token(layer, position, {}, keys.data(), values.data(), true);
         if (after_append) after_append();
-        const auto start = Clock::now();
+
         auto selected = select_blocks(geometry(), budget_, *representatives_, layer, position, query);
-        stats_.selection_ns += elapsed(start);
+
         record(layer, position, selected);
         for (const auto & head : selected) stats_.selected_tokens += head.positions.size();
         ++stats_.attention_queries;
@@ -614,10 +604,10 @@ std::vector<HeadSelection> AttentionSession::select_before_kv(std::uint32_t laye
         throw std::logic_error("early selection requires an uncommitted decode position");
     }
     try {
-        const auto start = Clock::now();
+
         representatives_->observe_query(layer, position, query);
         auto selected = select(layer, position, query);
-        stats_.selection_ns += elapsed(start);
+
         early_ = std::make_pair(layer, position);
         direct_early_ = false;
         record(layer, position, selected);
@@ -650,14 +640,14 @@ void AttentionSession::submit_before_kv_device(std::uint32_t layer, std::uint64_
         throw std::logic_error("device early selection requires an uncommitted decode position");
     }
     try {
-        const auto start = Clock::now();
+
         if (rope_) representatives_->begin_probability_query(layer, position);
         else representatives_->observe_query_device(layer, position, query,true);
         auto pending = submit_select_blocks(geometry(), budget_, *representatives_, layer, position, query);
-        pending_device_selection_ = [this, layer, position, start, pending = std::move(pending)]() mutable {
+        pending_device_selection_ = [this, layer, position, pending = std::move(pending)]() mutable {
             auto selected = pending();
             if (!rope_) representatives_->finish_query_for_rank_device();
-            stats_.selection_ns += elapsed(start);
+
             early_ = std::make_pair(layer, position);
             direct_early_ = true;
             record(layer, position, selected);
@@ -690,10 +680,10 @@ void AttentionSession::stage_device_keys(std::uint32_t layer, std::uint64_t posi
         throw std::invalid_argument("device late KV does not match early selection");
     }
     try {
-        const auto start = Clock::now();
+
         if (rope_) validate_device_keys(keys, *direct_memory(), geometry().heads, geometry().dimension);
         else representatives_->append_keys_device(layer, position, keys,compute_stream);
-        stats_.append_ns += elapsed(start);
+
         device_keys_staged_ = true;
     } catch (...) { failed_ = true; throw; }
 }
@@ -704,7 +694,7 @@ void AttentionSession::archive_device_kv(std::uint32_t layer, std::uint64_t posi
     }
     try {
         for (const auto value : kv) if (!std::isfinite(from_half(value))) throw std::invalid_argument("non-finite device KV offload");
-        const auto start = Clock::now();
+
         prefetch_->wait_store(layer);
         store_->append_interleaved(layer, position, kv);
         if (rope_) {
@@ -712,7 +702,7 @@ void AttentionSession::archive_device_kv(std::uint32_t layer, std::uint64_t posi
             copy_keys(geometry(), kv.data(), keys);
             representatives_->append_keys(layer, position, keys);
         }
-        stats_.append_ns += elapsed(start);
+
         stats_.decode_kv_download_bytes += kv.size()*sizeof(Half);
         ++stats_.direct_decode_queries;
         ++stats_.attention_queries;
@@ -820,7 +810,6 @@ SessionStats AttentionSession::stats() const {
         result.prefetch = prefetch_->stats();
         result.io.write_requests += result.prefetch.io.write_requests;
         result.io.write_bytes += result.prefetch.io.write_bytes;
-        result.io.write_ns += result.prefetch.io.write_ns;
     }
     if (prefill_) result.prefill=prefill_->stats();
     result.prefill_host_bytes=prefill_tile_.capacity()*sizeof(Half);

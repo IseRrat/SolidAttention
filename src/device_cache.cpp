@@ -77,14 +77,13 @@ void DeviceCache::poll_transfers(bool wait,std::optional<std::uint64_t> through)
     std::exception_ptr error;
     for (auto it = transfers_.begin(); it != transfers_.end();) {
         if (!transport_.complete(it->ticket,wait && (!through || it->ticket<=*through))) { ++it; continue; }
-        const auto interval = it->slots.size()==1 ? transport_.copy_interval() : std::optional<std::uint64_t>{};
         for (const auto & slot : it->slots) {
             if (slot.host) host_.unpin(*slot.host);
             const bool current = slots_.complete(slot.device);
             if (!current) ++stats_.stale_events;
             try {
                 const auto & stage = slot.stage ? slot.stage : it->stage;
-                if (stage) stage->copy_complete(slot.device.identity,"copy_ticket_complete",interval);
+                if (stage) stage->copy_complete(slot.device.identity,"copy_ticket_complete");
                 if (current) event("upload_complete",slot.device);
             } catch (...) { if (!error) error=std::current_exception(); }
         }
@@ -105,17 +104,6 @@ void DeviceCache::retain(const std::vector<BlockIdentity> & identities) {
         slots_.retire(lease);
         ++stats_.overwritten_blocks;
     }
-}
-void DeviceCache::observe_upload_delay(const SlotLease & host,std::uint64_t & entry_ns) {
-    const auto observed=host_.read_observed_ns(host);
-    if (!observed) return;
-    if (!entry_ns) entry_ns=std::chrono::duration_cast<std::chrono::nanoseconds>(
-        std::chrono::steady_clock::now().time_since_epoch()).count();
-    if (entry_ns<observed) throw std::logic_error("upload precedes read observation");
-    const auto delay=entry_ns-observed;
-    ++stats_.ready_upload_samples;
-    stats_.ready_upload_delay_ns+=delay;
-    stats_.ready_upload_delay_max_ns=std::max(stats_.ready_upload_delay_max_ns,delay);
 }
 SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage,const std::function<void()> & before_upload) {
     auto existing = slots_.find(host.identity);
@@ -152,7 +140,6 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
         if (stage) stage->copy_started(host.identity);
         if (before_upload) before_upload();
         auto phase = upload_phase(host.identity.layer, !stage);
-        std::uint64_t entry_ns=0; observe_upload_delay(host,entry_ns);
         ticket = transport_.upload(device->slot, block);
         transfers_.push_back({ticket, {{host,*device}},stage,std::move(phase)});
         ++stats_.uploads;
@@ -207,8 +194,6 @@ void DeviceCache::upload_batch(const std::vector<SlotLease> & leases,const std::
         if (copies.empty()) return;
         if (before_upload) before_upload();
         transfer.phase = upload_phase(transfer.slots.front().device.identity.layer, !stage);
-        std::uint64_t entry_ns=0;
-        for (const auto & slot:transfer.slots) if (slot.host) observe_upload_delay(*slot.host,entry_ns);
         transfer.ticket=transport_.upload_batch(copies);
         for (const auto & slot : transfer.slots) event("upload",slot.device);
         transfers_.push_back(std::move(transfer));

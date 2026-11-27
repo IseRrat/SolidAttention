@@ -7,12 +7,10 @@
 #include "ggml-backend.h"
 #include "ggml-cpu.h"
 
-#include <chrono>
 #include <limits>
 
 namespace solid {
 struct DenseOffload::Impl {
-    using Clock = std::chrono::steady_clock;
     AttentionSession & session;
     ggml_backend_t copy_backend;
     const std::uint32_t slots;
@@ -84,11 +82,9 @@ void DenseOffload::begin(std::uint64_t position) {
 }
 void DenseOffload::upload_history(std::uint32_t layer, std::uint64_t position) {
     impl_->expect(layer, position, Impl::Phase::reading);
-    const auto start = Impl::Clock::now();
     impl_->worker.join();
     trace::Scope upload("CPU->GPU Load", layer, position);
-    const auto waited = std::chrono::duration_cast<std::chrono::nanoseconds>(Impl::Clock::now() - start).count();
-    impl_->session.account_dense_prefetch(waited);
+    impl_->session.account_dense_prefetch();
     const auto & geometry = impl_->session.geometry();
     const auto bytes = static_cast<std::size_t>(position) * geometry.dimension * sizeof(Half);
     // The bank retains its allocation, but only initialized historical rows

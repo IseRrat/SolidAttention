@@ -63,8 +63,6 @@ struct IoStats {
     std::uint64_t write_requests = 0;
     std::uint64_t read_bytes = 0;
     std::uint64_t write_bytes = 0;
-    std::uint64_t read_ns = 0;
-    std::uint64_t write_ns = 0;
 };
 
 struct KvReadSegment {

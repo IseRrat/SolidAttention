@@ -18,8 +18,8 @@ void fixed_graph_matches_generic_dag() {
         for (std::uint32_t i=0;i<count;++i) {
             blocks.push_back({{0,i%4,i/4,1},i%2?solid::ReadPriority::selected:solid::ReadPriority::deterministic,
                 1+random()%9,1+random()%9});
-            specs.push_back({"read",solid::TaskResource::ssd,{},blocks.back().read_ns});
-            specs.push_back({"copy",solid::TaskResource::h2d,{2*i},blocks.back().copy_ns});
+            specs.push_back({"read",solid::TaskResource::ssd,{},blocks.back().read_units});
+            specs.push_back({"copy",solid::TaskResource::h2d,{2*i},blocks.back().copy_units});
             reads.push_back(2*i); copies.push_back(2*i+1);
         }
         specs.push_back({"join",solid::TaskResource::host,copies,1});
@@ -57,17 +57,7 @@ void fixed_graph_matches_generic_dag() {
             reference.start(task,stamp++); reference.complete(task,stamp++,"copy_ticket_complete",3);
         }
         require(stage.finished() && stage.copy_order().empty(),"fixed DAG join did not wait for all copies");
-        solid::TaskDag measured(specs); std::uint64_t last=0;
-        for (const auto & block:blocks) {
-            const auto read=stage.read_task(block.identity),copy=stage.copy_task(block.identity);
-            const auto i=static_cast<std::uint32_t>(&block-blocks.data());
-            measured.start(2*i,read.start_ns); measured.complete(2*i,read.end_ns);
-            measured.start(2*i+1,copy.start_ns); measured.complete(2*i+1,copy.end_ns,"copy_ticket_complete",copy.device_ns);
-            last=std::max(last,copy.end_ns);
-        }
-        measured.fence({2*count},last,"complete");
-        require(stage.stats().critical_path_ns==measured.critical_path_ns() && stage.stats().read_samples==count &&
-                stage.stats().copy_samples==count,"fixed DAG timing differs from general dependency traversal");
+        require(stage.stats().tasks==2*count+1,"fixed DAG task count differs from its dependency shape");
     }
 }
 void trace_independent_priorities() {
@@ -112,7 +102,7 @@ void dependencies(bool prediction) {
     stage.copy_started(b); stage.copy_started(c);
     stage.copy_complete(c,"device_resident"); require(!stage.finished(),"copy submission satisfied the join");
     stage.copy_complete(b,"copy_ticket_complete");
-    require(stage.finished() && stage.stats().tasks==7 && stage.stats().read_samples==1 && stage.stats().copy_samples==2,"block receipts or observed-boundary costs");
+    require(stage.finished() && stage.stats().tasks==7,"block receipts or task count");
     rejects([&] { stage.copy_complete(a); }); rejects([&] { stage.read_complete(a); });
     solid::BlockStage empty({}); require(empty.finished() && empty.stats().tasks==1,"empty historical gate");
     rejects([&] { solid::BlockStage duplicate({{a},{a}}); });
@@ -136,7 +126,7 @@ void real_queue(bool fail, bool admit_before_stage = false) {
             },
             [&](const solid::SlotLease & lease) { transport.fail_upload=fail && ++callbacks==2; cache.stage_ready(lease,stage); },
             [&](std::vector<solid::BlockWork> plan) {
-                for (auto & block:plan) { block.read_ns=block.identity.block==3?100:2; block.copy_ns=2; }
+                for (auto & block:plan) { block.read_units=block.identity.block==3?100:2; block.copy_units=2; }
                 stage=std::make_shared<solid::BlockStage>(std::move(plan)); return stage;
             }, false, {}, admit_before_stage);
     };

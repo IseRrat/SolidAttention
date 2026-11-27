@@ -18,7 +18,7 @@ inline void CUDART_CB cuda_publish_completion(void * userdata) {
     token->notify(token->userdata);
 }
 inline cudaError_t cuda_attention_begin(StreamCompletionToken * token,cudaStream_t stream) {
-    return cuda_record_completion_event(token->begin_event,stream);
+    return token->begin_event?cuda_record_completion_event(token->begin_event,stream):cudaSuccess;
 }
 // 记录 GPU attention 结束事件，再排入主机通知回调。
 inline cudaError_t cuda_attention_end(StreamCompletionToken * token,cudaStream_t stream) {

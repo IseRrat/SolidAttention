@@ -2,7 +2,6 @@
 #pragma once
 
 #include "ggml.h"
-#include "solid/device_timing.hpp"
 #include "solid/device_input.hpp"
 #include "solid/stream_completion.hpp"
 #include <cstdint>

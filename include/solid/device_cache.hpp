@@ -37,7 +37,6 @@ public:
         throw std::logic_error("current device KV transfer is disabled");
     }
     virtual bool complete(std::uint64_t ticket, bool wait) = 0;
-    virtual std::optional<std::uint64_t> copy_interval() const { return {}; }
     // Wait for issued copies; ticket receipts remain valid for complete().
     virtual void drain() = 0;
     virtual void wait_batch() { drain(); }
@@ -60,7 +59,6 @@ struct DeviceCacheStats {
     std::uint64_t shared_resident_bytes = 0, shared_host_copy_bytes = 0;
     std::uint64_t current_device_rows=0,current_device_bytes=0,current_host_bytes=0;
     std::uint64_t refreshed_tails=0,retained_prefix_bytes=0;
-    std::uint64_t ready_upload_samples=0,ready_upload_delay_ns=0,ready_upload_delay_max_ns=0;
 };
 class DeviceCache {
 public:
@@ -123,7 +121,6 @@ private:
     std::uint64_t epoch_ = 0;
     void poll_transfers(bool wait,std::optional<std::uint64_t> through = {});
     void retain(const std::vector<BlockIdentity> & identities);
-    void observe_upload_delay(const SlotLease & host,std::uint64_t & entry_ns);
     SlotLease upload(const SlotLease & host,const std::shared_ptr<BlockStage> & stage = {},
                      const std::function<void()> & before_upload = {});
     void upload_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage,

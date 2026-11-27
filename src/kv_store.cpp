@@ -6,7 +6,6 @@
 #include <algorithm>
 #include <array>
 #include <cerrno>
-#include <chrono>
 #include <climits>
 #include <cstring>
 #include <fcntl.h>
@@ -394,9 +393,9 @@ void FileKvStore::read_exact(void * destination, std::size_t bytes, std::uint64_
     std::size_t done = 0;
     try {
         while (done < bytes) {
-            const auto start = std::chrono::steady_clock::now();
+
             const auto n = file_->read_at(data + done, bytes - done, offset + done);
-            stats_.read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+
             ++stats_.read_requests;
             if (n == 0 || n > bytes - done) throw std::runtime_error("incomplete KV read at " + std::to_string(offset + done));
             stats_.read_bytes += n;
@@ -409,9 +408,9 @@ void FileKvStore::write_exact(const void * source, std::size_t bytes, std::uint6
     std::size_t done = 0;
     try {
         while (done < bytes) {
-            const auto start = std::chrono::steady_clock::now();
+
             const auto n = file_->write_at(data + done, bytes - done, offset + done);
-            stats_.write_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+
             ++stats_.write_requests;
             if (n == 0 || n > bytes - done) throw std::runtime_error("incomplete KV write at " + std::to_string(offset + done));
             stats_.write_bytes += n;
@@ -568,7 +567,7 @@ void FileKvStore::read_separate_rows(std::uint32_t layer, const std::vector<KvRo
         return;
     }
     const auto committed = committed_[layer];
-    const auto start = std::chrono::steady_clock::now();
+
     std::vector<KvReadRequest> requests;
     requests.reserve(depth);
     const auto finish_batch = [&] {
@@ -613,7 +612,7 @@ void FileKvStore::read_separate_rows(std::uint32_t layer, const std::vector<KvRo
             }
         }
         finish_batch();
-        stats_.read_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
+
     } catch (...) {
         failed_ = true;
         // Keep the aligned buffers alive until the original read completions retire.

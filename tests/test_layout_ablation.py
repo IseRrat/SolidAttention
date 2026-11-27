@@ -14,7 +14,6 @@ spec = importlib.util.spec_from_file_location("ablation", SCRIPTS / "layout_abla
 ablation = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(ablation)
 
-
 class LayoutAblationTests(unittest.TestCase):
     def fixture(self, root):
         source = root / "source"
@@ -47,7 +46,7 @@ class LayoutAblationTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as temporary:
             root = Path(temporary)
             source, _ = self.fixture(root)
-            manifest_path = ablation.create(source / "result.json", root / "configs", root / "runs", True)
+            manifest_path = ablation.create(source / "result.json", root / "configs", root / "runs")
             manifest = json.loads(manifest_path.read_text())
             self.assertEqual(len(manifest["variants"]), 4)
             self.assertFalse((root / "runs").exists())
@@ -58,7 +57,7 @@ class LayoutAblationTests(unittest.TestCase):
                 self.assertEqual(config["context_tokens"], 32)
                 self.assertEqual(config["attention"]["context_budget_tokens"], 4)
                 self.assertEqual(config["attention"]["selection_replay"], str(source / "selection.jsonl"))
-                self.assertTrue(config["attention"]["profile"])
+                self.assertNotIn("profile", config["attention"])
                 modes.add((config["attention"]["layout"], config["attention"]["fuse_kv_projection"]))
             self.assertEqual(len(modes), 4)
 
@@ -135,7 +134,6 @@ class LayoutAblationTests(unittest.TestCase):
             manifest["variants"].pop()
             manifest_path.write_text(json.dumps(manifest))
             with self.assertRaises(ValueError): ablation.report(manifest_path)
-
 
 if __name__ == "__main__":
     unittest.main()

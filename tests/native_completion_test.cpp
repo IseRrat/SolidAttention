@@ -35,16 +35,16 @@ struct Flow {
 class Events final:public solid::AttentionEvents {
 public:
     Events(std::uint32_t layers,Flow * flow=nullptr):AttentionEvents(layers),flow(flow) {}
-    bool timing_error=false;
+    bool receipt_error=false;
     bool copy_ready(ggml_backend_event * event) const override {
         auto & record=*static_cast<DeferredCopies::Event *>(event->context); record.owner->flush(record.through); return true;
     }
     bool host_marker() const override { return true; }
     const char * name() const override { return "cpu_protocol"; }
 protected:
-    std::uint64_t elapsed_ns(std::uint32_t) const override {
-        if (timing_error) throw std::runtime_error("injected native timing failure");
-        if (flow) flow->received(); return 13;
+    void on_receipt(std::uint32_t) const override {
+        if (receipt_error) throw std::runtime_error("injected native receipt failure");
+        if (flow) flow->received();
     }
 private:
     Flow * flow;
@@ -102,18 +102,18 @@ void ffn_overlap() {
     cache.quiesce(); session.finish();
     require(copies.pending.empty() && copies.completed==copies.submitted,"native graph left live source copies");
 }
-void interrupted(bool timing_error) {
+void interrupted(bool receipt_error) {
     solid::AttentionSession session(std::make_unique<solid::MemoryKvStore>(geometry),1,budget,true,4,{}, {},std::make_unique<Reader>(),4); seed(session);
     std::unique_ptr<ggml_backend,decltype(&ggml_backend_free)> backend(ggml_backend_cpu_init(),ggml_backend_free);
     DeferredCopies copies; BackendDevice restore(backend.get(),&copies.device);
-    auto events=std::make_unique<Events>(geometry.layers); auto * observe=events.get(); observe->timing_error=timing_error;
+    auto events=std::make_unique<Events>(geometry.layers); auto * observe=events.get(); observe->receipt_error=receipt_error;
     solid::GgmlPrefetch cache(session,backend.get(),{},solid::ScheduleMode::sync_reuse,{},-1,std::move(events));
     std::vector<float> query(64,.125f),key(64,.25f),value(64,.75f);
     cache.select_early(0,4,query,false); (void) cache.decode(0,4,{},key,value,false);
-    if (timing_error) {
+    if (receipt_error) {
         auto * token=observe->token(0); token->notify(token->userdata);
         bool preserved=false;
-        try { cache.completed(cache.attention_epoch()); } catch (const std::exception & error) { preserved=std::string(error.what()).find("injected native timing failure")!=std::string::npos; }
+        try { cache.completed(cache.attention_epoch()); } catch (const std::exception & error) { preserved=std::string(error.what()).find("injected native receipt failure")!=std::string::npos; }
         require(preserved,"native worker error was lost");
     }
     // The stream marker was never executed in the canceled case. stop() must

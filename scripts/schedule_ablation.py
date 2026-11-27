@@ -24,12 +24,10 @@ DEVICE_PROOFS = {"attention_until_boundary": ("attention_device_event",), "q_gpu
                  "kv_projection_to_host": ("kv_device_ready",),
                  "kv_d2h_ready": ("kv_archive_copy_complete", SHARED_ARCHIVE_PROOF, PROJECTION_ARCHIVE_PROOF)}
 
-
 def integer(value, positive=False):
     if type(value) is not int or value < (1 if positive else 0):
         raise ValueError("schedule integers must be nonnegative; identifiers and estimates must be positive")
     return value
-
 
 # 检查层级调度记录中的依赖、状态转换和完成证明。
 def audit_schedule(path, mode, *, blocks=False):
@@ -54,7 +52,7 @@ def audit_schedule(path, mode, *, blocks=False):
             if item["clock"] != "steady_clock_ns" or item["resource"] not in ("host", "ssd", "h2d", "d2h", "gpu"):
                 raise ValueError("unknown schedule clock/resource")
             origins.add(integer(item["origin_ns"]))
-            integer(item["estimate_ns"], True)
+            integer(item.get("cost_units", item.get("estimate_ns")), True)
             deps = item["predecessors"]
             if not isinstance(deps, list) or len(deps) != len(set(deps)):
                 raise ValueError("duplicate or invalid dependencies")
@@ -174,7 +172,6 @@ def audit_schedule(path, mode, *, blocks=False):
         totals[proofs[proof]] += 1
     return totals
 
-
 # 逐块检查 SSD 读完后才上传、上传完成后才参与计算等依赖。
 def audit_block_frames(frames):
     totals = {"block_frames": len(frames), "block_tasks": 0, "block_critical_path_ns": 0}
@@ -213,7 +210,6 @@ def audit_block_frames(frames):
         totals["block_critical_path_ns"] += max(costs, default=0) + join["end"] - join["start"]
     return totals
 
-
 def audit_block_schedule(path, mode, parent=None):
     result = audit_schedule(path, mode, blocks=True)
     if parent is not None:
@@ -225,7 +221,6 @@ def audit_block_schedule(path, mode, parent=None):
             raise ValueError("block frames differ from the parent layer schedule")
     return result
 
-
 # 从同一参考运行准备三种调度模式，保持其余配置相同。
 def create(reference, destination, results, queue_depth=64, slots_per_head=None):
     reference = Path(reference).resolve(strict=True)
@@ -236,7 +231,7 @@ def create(reference, destination, results, queue_depth=64, slots_per_head=None)
         raise ValueError("scheduling comparisons require at least one decode step")
     destination, results = Path(destination).resolve(), Path(results).resolve()
     base = prepare_prefetch(reference, results / "unused/result.json", True, queue_depth, slots_per_head)
-    base["attention"].update(profile=False, schedule_trace=True)
+    base["attention"].update(schedule_trace=True)
     destination.mkdir(parents=True, exist_ok=False)
     manifest = {"schema_version": 1, "reference": str(reference), "reference_sha256": digest(reference),
                 "selection_sha256": digest(reference.parent / "selection.jsonl"), "variants": []}
@@ -251,7 +246,6 @@ def create(reference, destination, results, queue_depth=64, slots_per_head=None)
     path = destination / "schedule-ablation.json"
     path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return path
-
 
 # 汇总三组性能与完成记录，并比较选块和数值结果。
 def report(manifest_path, atol=1e-3, rtol=1e-4):
@@ -299,6 +293,8 @@ def report(manifest_path, atol=1e-3, rtol=1e-4):
         if recorded["mode"] != mode or recorded["trace_enabled"] is not True:
             raise ValueError("scheduling metrics mode/trace setting differs")
         for key, actual in audit.items():
+            if key.endswith("_ns"):
+                continue  # 诊断日志可离线计算时间，推理程序仅回报状态与计数。
             metric = {"critical_path_ns": "observed_critical_path_sum_ms",
                       "miss_projection_overlap_ns": "miss_projection_overlap_sum_ms",
                       "block_critical_path_ns": "block_observed_critical_path_sum_ms","device_attention_ns":"device_attention_event_ms"}.get(key, key)
@@ -311,7 +307,6 @@ def report(manifest_path, atol=1e-3, rtol=1e-4):
         rows.append({"name": variant["name"], "passed": comparison["passed"], "comparison": comparison,
                      "schedule_audit": audit, "schedule": recorded, "timing": value["timing"]})
     return {"passed": all(row["passed"] for row in rows), "variants": rows}
-
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -333,7 +328,6 @@ def main():
     result = report(args.manifest, args.atol, args.rtol)
     print(json.dumps(result, indent=2, allow_nan=False))
     return 0 if result["passed"] else 1
-
 
 if __name__ == "__main__":
     try:

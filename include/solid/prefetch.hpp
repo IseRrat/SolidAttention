@@ -55,17 +55,11 @@ struct PrefetchStats {
     std::uint64_t refreshed_blocks = 0;
     std::uint64_t stale_completions = 0;
     std::uint64_t host_bytes = 0;
-    std::uint64_t wait_ns = 0;
-    std::uint64_t resolve_ns = 0;
     std::uint32_t slots_per_head = 0;
     AsyncIoStats io;
 };
-struct PredictionCosts {
-    std::uint64_t full_read_ns = 1;
-    std::uint64_t full_upload_ns = 1;
-};
 struct StoreReceipt {
-    std::optional<std::uint64_t> completed_ns;
+    bool complete = false;
 };
 class Prefetcher {
 public:
@@ -78,7 +72,7 @@ public:
     ~Prefetcher();
     void bind_shared_blocks(const std::vector<Half *> & addresses, std::shared_ptr<void> owner,bool defer_prediction_slots=false);
     // 用上一轮选块历史预测本层需求，开始异步读盘。
-    void begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
+    void begin(std::uint32_t layer, std::uint64_t position);
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     // 核对正式历史选块；每批读完后通过 ready/batch 回调交给上传方。
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
@@ -88,7 +82,6 @@ public:
     void remember_selection(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
     // 收取 SSD 完成回执并推进队列；wait 决定没有结果时是否等待。
     void poll(bool wait = false, const ReadyBlock & ready = {});
-    std::uint64_t read_observed_ns(const SlotLease & lease) const;
     const KvBlock & block(const SlotLease & lease) const;
     void pin(const SlotLease & lease) { slots_.pin(lease); }
     void unpin(const SlotLease & lease) { slots_.unpin(lease); }
@@ -122,7 +115,6 @@ private:
     SlotTable slots_;
     std::vector<KvBlock> blocks_;
     std::vector<std::size_t> pending_;
-    std::vector<std::uint64_t> read_observed_ns_; // Allocated only when timing is enabled.
     std::vector<ReadStage> stages_;
     std::vector<ReadDispatch> upload_order_;
     std::vector<std::vector<std::vector<std::uint64_t>>> history_;

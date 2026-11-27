@@ -9,7 +9,6 @@ spec = importlib.util.spec_from_file_location("adapter_generator", ROOT / "scrip
 generator = importlib.util.module_from_spec(spec)
 spec.loader.exec_module(generator)
 
-
 class GeneratorTests(unittest.TestCase):
     def test_overlay_preserves_upstream_and_is_repeatable(self):
         source = ROOT / "third_party/llama.cpp/src"
@@ -57,7 +56,8 @@ class GeneratorTests(unittest.TestCase):
             self.assertIn(b"solid::adapter_attention", first["llama-graph.cpp"])
             self.assertIn(b"model.no_alloc() || solid::adapter_active", first["llama-context.cpp"])
             self.assertIn(b"solid::adapter_qkv", first["llama-graph.cpp"])
-            self.assertEqual((output / "ggml-backend.cpp").read_bytes().count(b"solid_copy_scope solid_copy("), 2)
+            self.assertNotIn(b"solid_copy_scope", (output / "ggml-backend.cpp").read_bytes())
+            self.assertNotIn(b"device_timing", (output / "ggml-cuda.cu").read_bytes())
         self.assertEqual(before, {name: (source / name).read_bytes() for name in before})
         self.assertEqual(backend_before, backend.read_bytes())
         self.assertEqual(cuda_before,cuda.read_bytes())
@@ -66,7 +66,6 @@ class GeneratorTests(unittest.TestCase):
     def test_changed_anchor_is_rejected(self):
         with self.assertRaises(ValueError):
             generator.replace_once("different upstream text", "required anchor", "replacement")
-
 
 if __name__ == "__main__":
     unittest.main()

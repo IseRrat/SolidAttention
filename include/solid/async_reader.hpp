@@ -6,19 +6,16 @@
 #include <stdexcept>
 
 namespace solid {
-// Optional diagnostic timestamp: when the I/O owner observes the completion.
-struct ReadCompletion { std::uint64_t id; std::int64_t result; std::uint64_t observed_ns=0; };
+// 原始 I/O 操作的完成回执，包含请求编号与读写结果。
+struct ReadCompletion { std::uint64_t id; std::int64_t result; };
 enum class ReadPriority : std::uint8_t { correction_selected, correction_deterministic, selected, deterministic, writeback };
 struct ReadDispatch {
     ReadPriority priority=ReadPriority::deterministic;
     bool critical=false;
     std::uint64_t latest_start=UINT64_MAX;
     bool before(const ReadDispatch & other) const {
-        const bool correction = priority <= ReadPriority::correction_deterministic;
-        const bool other_correction = other.priority <= ReadPriority::correction_deterministic;
-        if (correction != other_correction) return correction;
-        // Within the same frontier, use Algorithm 1's critical/LST order.
-        // Block category only breaks ties; it cannot hide a critical load.
+        // 同属 I/O 的就绪任务按算法 1 的关键路径、LST 排序。
+        // 请求类别只用于两者均相同时的稳定选择。
         if (critical!=other.critical) return critical;
         if (latest_start!=other.latest_start) return latest_start<other.latest_start;
         return priority<other.priority;
@@ -28,19 +25,17 @@ struct AsyncIoStats {
     std::uint64_t read_requests = 0;
     std::uint64_t read_bytes = 0;
     std::uint64_t completed_reads = 0;
-    std::uint64_t write_requests = 0, write_bytes = 0, write_ns = 0;
+    std::uint64_t write_requests = 0, write_bytes = 0;
     std::uint64_t cancel_requests = 0;
     std::uint64_t cancel_completions = 0;
     std::uint64_t cancel_successes = 0;
     std::uint64_t cancel_not_found = 0;
     std::uint64_t cancel_busy = 0;
     std::uint64_t cancel_errors = 0;
-    std::uint64_t completion_ns = 0;
     std::uint64_t queued_cancellations = 0;
     std::uint64_t worker_submissions = 0;
     int worker_cpu = -1;
     bool dedicated_worker = false;
-    bool ready_time_measured = false;
     std::uint32_t worker_capacity=0;
 };
 // 异步读写约定：submit 只接纳请求，poll 返回完成回执，drain 等待已接纳操作结束。
@@ -78,7 +73,7 @@ bool uring_available();
 std::unique_ptr<AsyncReader> make_uring_reader(std::uint32_t queue_depth);
 // 给底层引擎配一个独立 CPU 线程，统一持有提交队列和完成队列。
 std::unique_ptr<AsyncReader> make_io_worker(std::function<std::unique_ptr<AsyncReader>()> factory,
-                                          std::uint32_t queue_depth,int cpu=-1,bool notify_each_completion=false,bool measure_ready_time=false);
+                                          std::uint32_t queue_depth,int cpu=-1,bool notify_each_completion=false);
 std::unique_ptr<AsyncReader> make_threaded_uring_reader(std::uint32_t queue_depth,int cpu=-1,std::uint32_t admission_capacity=0,
-                                                       bool notify_each_completion=false,bool measure_ready_time=false);
+                                                       bool notify_each_completion=false);
 } // namespace solid

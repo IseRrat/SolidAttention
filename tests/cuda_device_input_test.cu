@@ -246,7 +246,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
         }
         frames[layer]=std::make_shared<solid::AttentionFrame>();
         nodes[layer]=std::make_unique<solid::AttentionNode>(session,frames[layer],layer,scale,nullptr,true,
-            cache.get(),nullptr,selected_cache.get());
+            cache.get(),selected_cache.get());
         outputs[layer]=nodes[layer]->build(context.get(),current_q,key,value,kv,scheduler.get(),gpu.get(),graph,absolute);
         ggml_set_output(outputs[layer]);
         nodes[layer]->set_query_proof(layer!=0);
@@ -314,15 +314,7 @@ void decode(int device,bool packed,solid::ScheduleMode mode,bool infllm=false,bo
     require(schedule.coalesce_uploads==coalesce_uploads,"CUDA transport ignored upload coalescing switch");
     if (!coalesce_uploads) require(schedule.historical_upload_ranges==schedule.historical_upload_blocks*(separate?2u:1u),
         "disabled coalescing still combined adjacent historical blocks");
-    require(schedule.history_consumer_wait_calls==16,"CUDA decode omitted consumer readiness wait accounting");
-    require(schedule.attention_layer_span_layers==16 && schedule.attention_layer_span_ns>0,
-        "CUDA replay omitted Q-frontier-to-attention latency samples");
-    require(schedule.attention_consumer_span_layers==16 && schedule.attention_consumer_span_ns>0 &&
-            (mode==solid::ScheduleMode::naive || schedule.attention_consumer_span_ns<=schedule.attention_layer_span_ns),
-        "CUDA replay omitted common KV-adapter-entry attention latency samples");
     if (mode==solid::ScheduleMode::sync_reuse) {
-        require(schedule.cache_load_host_block_layers==16 && schedule.cache_load_device_block_layers==16,
-            "CUDA graph replay omitted CPU/GPU cache loading blocking measurements");
         require(schedule.device_event_completions==16 && schedule.device_boundary_fallbacks==0,
             "CUDA graph replay replaced device completion events with CPU boundary receipts");
         require(schedule.archive_attention_reuses==16 && schedule.archive_separate_completions==0,

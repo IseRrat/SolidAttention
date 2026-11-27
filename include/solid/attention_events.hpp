@@ -6,10 +6,12 @@
 #include <optional>
 #include <vector>
 
+struct ggml_backend;
 struct ggml_backend_event;
+extern "C" void * solid_cuda_queue(ggml_backend * backend);
 namespace solid {
 enum class AttentionProof { device_signal, query_boundary, process_boundary, attention_boundary };
-struct AttentionReceipt { AttentionProof proof; std::uint64_t device_ns; };
+struct AttentionReceipt { AttentionProof proof; };
 class AttentionEvents {
 public:
     explicit AttentionEvents(std::uint32_t layers);
@@ -32,7 +34,7 @@ public:
     virtual bool host_marker() const { return false; }
     virtual const char * name() const=0;
 protected:
-    virtual std::uint64_t elapsed_ns(std::uint32_t layer) const=0;
+    virtual void on_receipt(std::uint32_t) const {}
 private:
     struct Slot;
     std::vector<std::unique_ptr<Slot>> slots_;

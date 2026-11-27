@@ -3,7 +3,6 @@
 #include "solid/projection.hpp"
 #include "solid/ggml_prefetch.hpp"
 #include "solid/device_ops.hpp"
-#include "solid/device_timing.hpp"
 #include "solid/trace.hpp"
 #include "solid/dense_offload.hpp"
 #include "solid/thread_affinity.hpp"
@@ -22,7 +21,6 @@
 #endif
 
 #include <algorithm>
-#include <chrono>
 #include <cmath>
 #include <cstring>
 #include <limits>
@@ -138,8 +136,6 @@ public:
               AsyncReader * reader = nullptr, std::size_t depth = 64) {
         if (selected.empty() || selected.size() > slots) throw std::logic_error("InfLLM cache selection size");
         begin_frame(layer, position);
-        using Clock = std::chrono::steady_clock;
-        const auto start = Clock::now();
         const auto & geometry = session_.geometry();
         const auto budget = session_.budget();
         indices_.resize(slots);
@@ -162,7 +158,6 @@ public:
                 if (distance < budget.local) row[i] = to_half(static_cast<float>(budget.local - distance));
             }
         }
-        session_.account_cached_gather(std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now() - start).count());
     }
 private:
     struct Entry { std::uint64_t first = 0, last = 0; std::uint32_t valid = 0; bool used = false; };
@@ -318,9 +313,8 @@ void SparseBaselineLookahead::begin(std::uint32_t layer, std::uint64_t position)
 }
 void SparseBaselineLookahead::upload(std::uint32_t layer, std::uint64_t position) {
     if (frame_ != std::make_optional(std::make_pair(layer, position))) throw std::logic_error("sparse prefetch layer or position mismatch");
-    const auto start = std::chrono::steady_clock::now();
     worker_.join();
-    session_.account_sparse_prefetch(std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count());
+    session_.account_sparse_prefetch();
     frame_.reset();
 }
 void SparseBaselineLookahead::completed(std::uint32_t layer, std::uint64_t position) {
@@ -353,7 +347,6 @@ struct AttentionNode::Impl {
     std::shared_ptr<AttentionFailure> failure;
     bool gathered;
     GgmlPrefetch * prefetch;
-    ProjectionIntervals * timing = nullptr;
     InfllmSelectedCache * selected_cache = nullptr;
     DenseOffload * dense = nullptr;
     SparseBaselineLookahead * sparse_lookahead = nullptr;
@@ -577,7 +570,7 @@ struct AttentionNode::Impl {
                 if (ggml_nelements(source) != 1 || !self.device_query || !self.device_query->data) throw std::logic_error("device query token or allocation missing");
                 self.prefetch->select_early_device_async(self.layer, self.frame->positions.front(),
                     {static_cast<const float *>(self.device_query->data),static_cast<std::size_t>(ggml_nelements(self.device_query)),*self.direct},
-                    self.query_proof,self.timing && self.timing->query ? self.timing->query->duration() : std::nullopt);
+                    self.query_proof);
             } else {
                 std::vector<float> query(static_cast<std::size_t>(ggml_nelements(source)));
                 std::memcpy(query.data(), source->data, query.size() * sizeof(float));
@@ -625,8 +618,7 @@ struct AttentionNode::Impl {
                         static_cast<std::size_t>(self.device_kv->ne[0]),*self.direct};
                     if (early) {
                         if (source->type!=GGML_TYPE_F32 || ggml_nelements(source)!=1) throw std::logic_error("device KV ready token missing");
-                        result=self.prefetch->decode_device(self.layer,self.frame->positions.front(),keys,self.device_kv,
-                            self.timing && self.timing->kv ? self.timing->kv->duration() : std::nullopt);
+                        result=self.prefetch->decode_device(self.layer,self.frame->positions.front(),keys,self.device_kv);
                     } else {
                         if (source->type!=GGML_TYPE_F16 || !ggml_is_contiguous(source) || ggml_nelements(source)!=ggml_nelements(self.device_kv)) {
                             throw std::logic_error("serial KV offload shape differs from device KV");
@@ -703,10 +695,10 @@ struct AttentionNode::Impl {
 };
 AttentionNode::AttentionNode(AttentionSession & session, std::shared_ptr<AttentionFrame> frame,
                             std::uint32_t layer, float scale, std::shared_ptr<AttentionFailure> failure, bool gathered, GgmlPrefetch * prefetch,
-                            ProjectionIntervals * timing, InfllmSelectedCache * selected_cache, DenseOffload * dense,
+                            InfllmSelectedCache * selected_cache, DenseOffload * dense,
                             SparseBaselineLookahead * sparse_lookahead) :
     impl_(std::make_unique<Impl>(Impl{session, std::move(frame), layer, scale,
-                                    failure ? std::move(failure) : std::make_shared<AttentionFailure>(), gathered, prefetch, timing,
+                                    failure ? std::move(failure) : std::make_shared<AttentionFailure>(), gathered, prefetch,
                                     selected_cache, dense, sparse_lookahead})) {
     if (prefetch && !gathered) throw std::invalid_argument("prefetch node requires decode attention");
 }
@@ -811,7 +803,6 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
     if (impl_->direct) {
         impl_->device_query = on_device(inputs[0]);
         auto * token = on_device(device_query_token(context,impl_->device_query));
-        if (impl_->timing) bind_device_timing(token,impl_->timing->query.get());
         if (impl_->prefetch && impl_->prefetch->early_enabled()) {
             impl_->early = ggml_custom_4d(context,GGML_TYPE_F32,1,1,1,1,&token,1,Impl::select_query,1,impl_.get());
             ggml_set_name(impl_->early,"solid_early_selection_device");
@@ -828,7 +819,6 @@ ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, 
         // instead of copying the CPU control result back to the device.
         impl_->device_kv = on_device(device_consolidate_kv(context,key,value,impl_->device_query,token));
         inputs[0] = impl_->prefetch && impl_->early ? on_device(device_kv_token(context,impl_->device_kv)) : impl_->device_kv;
-        if (impl_->timing && impl_->early) bind_device_timing(inputs[0],impl_->timing->kv.get());
         input_count = 1;
     } else if (impl_->prefetch && impl_->prefetch->early_enabled()) {
         auto * q = inputs[0];
@@ -1122,7 +1112,6 @@ struct AttentionAdapter::Impl {
     bool sparse_lookahead_enabled = false;
     std::unique_ptr<DenseOffload> dense;
     bool dense_enabled = false;
-    std::vector<std::optional<ProjectionIntervals>> timing;
     std::filesystem::path residency_trace;
     std::filesystem::path schedule_trace;
     ScheduleMode schedule = ScheduleMode::naive;
@@ -1152,7 +1141,6 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
                         options.interleaved ? KvLayout::interleaved : KvLayout::separate};
     geometry.contiguous_planes = !options.in_memory && !options.interleaved;
     impl_->dense_enabled = options.gpu_decode && !options.sparse && !options.fuse_kv_projection && geometry.contiguous_planes;
-    impl_->timing.resize(geometry.layers);
     if (options.infllm_attention && !options.in_memory && !options.prefetch && !options.interleaved &&
         !options.fuse_kv_projection && options.selection_replay.empty()) {
         impl_->sparse_lookahead_enabled = true;
@@ -1225,7 +1213,7 @@ AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionCon
     if (options.prefetch && admission>16384) throw std::invalid_argument("prefetch worker admission exceeds 16384 requests");
     impl_->session = std::make_unique<AttentionSession>(std::move(store), hp.n_head(), budget, options.sparse, prefill_tokens,
         options.selection_trace ? trace : std::filesystem::path{},
-        options.selection_replay, options.prefetch ? make_threaded_uring_reader(options.prefetch_queue_depth,impl_->placement->io_cpu(),static_cast<std::uint32_t>(admission),options.per_completion_uploads,options.measure_upload_ready_time) : nullptr,
+        options.selection_replay, options.prefetch ? make_threaded_uring_reader(options.prefetch_queue_depth,impl_->placement->io_cpu(),static_cast<std::uint32_t>(admission),options.per_completion_uploads) : nullptr,
         options.prefetch_slots_per_head, options.prefetch_trace ? trace.parent_path() / "prefetch.jsonl" : std::filesystem::path{}, rope,
         options.prefetch_ahead);
     if (options.prefetch_trace) impl_->residency_trace = trace.parent_path() / "residency.jsonl";
@@ -1350,12 +1338,16 @@ std::unique_ptr<AttentionNode> AttentionAdapter::node(std::shared_ptr<AttentionF
     }
     return std::make_unique<AttentionNode>(*impl_->session, std::move(frame), layer, scale, impl_->failure, gathered,
                                           gathered ? impl_->device.get() : nullptr,
-                                          gathered ? projection_intervals(layer,backend) : nullptr, selected_cache,
+                                          selected_cache,
                                           gathered ? impl_->dense.get() : nullptr,
                                           gathered ? impl_->sparse_lookahead.get() : nullptr);
 }
 bool AttentionAdapter::prefetch_enabled() const { return impl_->session->prefetch_enabled(); }
 bool AttentionAdapter::dense_offload_enabled() const { return impl_->dense_enabled; }
+bool AttentionAdapter::cuda_native_completion() const {
+    return impl_->device && impl_->device->direct_memory() == DeviceMemory::cuda &&
+           impl_->device->completion_token(0) != nullptr;
+}
 void AttentionAdapter::begin_prefetch(std::uint32_t layer, std::uint64_t position) {
     check();
     if (impl_->dense && gathered_decode(position)) impl_->dense->begin(position);
@@ -1406,11 +1398,6 @@ std::uint64_t AttentionAdapter::projection_buffer_bytes() const {
     for (const auto & p : impl_->projections) bytes += p->stats().buffer_bytes;
     return bytes;
 }
-std::uint64_t AttentionAdapter::projection_initialization_ns() const {
-    std::uint64_t ns = 0;
-    for (const auto & p : impl_->projections) ns += p->stats().initialization_ns;
-    return ns;
-}
 std::uint64_t AttentionAdapter::projection_source_bytes() const {
     std::uint64_t bytes = 0;
     for (const auto & p : impl_->projections) bytes += p->stats().source_bytes;
@@ -1425,34 +1412,6 @@ std::vector<std::string> AttentionAdapter::projection_weight_types() const {
     std::vector<std::string> types;
     for (const auto & p : impl_->projections) types.push_back(p->stats().weight_type);
     return types;
-}
-
-ProjectionIntervals * AttentionAdapter::projection_intervals(std::uint32_t layer,ggml_backend_t backend) {
-    if (!backend || !prefetch_enabled() || impl_->schedule==ScheduleMode::naive || !impl_->session->direct_memory()) return nullptr;
-    auto & slot=impl_->timing.at(layer);
-    if (!slot) {
-        ProjectionIntervals intervals;
-#ifdef SOLID_HAVE_CUDA_SELECTION
-        if (ggml_backend_is_cuda(backend)) {
-            auto * registry=ggml_backend_cuda_reg();
-            for (std::size_t ordinal=0;ordinal<ggml_backend_reg_dev_count(registry);++ordinal) {
-                if (ggml_backend_reg_dev_get(registry,ordinal)!=ggml_backend_get_device(backend)) continue;
-                intervals.query=make_cuda_device_interval(static_cast<int>(ordinal));
-                intervals.kv=make_cuda_device_interval(static_cast<int>(ordinal));
-                break;
-            }
-        }
-#endif
-#ifdef SOLID_HAVE_SYCL
-        if (ggml_backend_is_sycl(backend)) {
-            const auto queue=solid_sycl_queue(backend);
-            intervals.query=make_sycl_device_interval(queue);
-            intervals.kv=make_sycl_device_interval(queue);
-        }
-#endif
-        slot.emplace(std::move(intervals));
-    }
-    return slot->query || slot->kv ? &*slot : nullptr;
 }
 
 class AdapterInput final : public llm_graph_input_attn_kv {
@@ -1511,17 +1470,6 @@ bool adapter_fused_projection(const llama_model * model) {
     const auto * adapter = lookup(model);
     return adapter && adapter->fused_projection();
 }
-void adapter_mark_projection(const llm_graph_context & graph,ggml_tensor * projection,int layer,bool query) {
-    auto * adapter=lookup(&graph.model);
-    if (!adapter || layer<0 || graph.ubatch.n_tokens!=1 || !graph.ubatch.pos || graph.ubatch.pos[0]<0 ||
-        !adapter->gathered_decode(static_cast<std::uint64_t>(graph.ubatch.pos[0])) || !graph.loras->empty()) return;
-    auto * timing=adapter->projection_intervals(static_cast<std::uint32_t>(layer),layer_backend(graph,layer));
-    if (!timing) return;
-    while (projection && (projection->op==GGML_OP_RESHAPE || projection->op==GGML_OP_MUL || projection->op==GGML_OP_ADD)) {
-        projection=projection->src[0];
-    }
-    if (projection && projection->op==GGML_OP_MUL_MAT) bind_device_timing(projection,query ? timing->query.get() : timing->kv.get());
-}
 llm_graph_qkv adapter_qkv(const llm_graph_context & graph, const llama_layer & layer, ggml_tensor * input,
                          std::int64_t dimension_q, std::int64_t heads_q, std::int64_t dimension_k,
                          std::int64_t heads_k, std::int64_t dimension_v, std::int64_t heads_v, int id, bool reshape) {
@@ -1530,11 +1478,9 @@ llm_graph_qkv adapter_qkv(const llm_graph_context & graph, const llama_layer & l
         dimension_k != graph.hparams.n_embd_head_k() || heads_k != graph.hparams.n_head_kv() ||
         !graph.loras->empty() || graph.hdmd) throw std::invalid_argument("unsupported fused KV projection graph");
     auto * q = graph.build_lora_mm(layer.wq, input, layer.wq_s);
-    adapter_mark_projection(graph,q,id,true);
     if (layer.wq_b) q = ggml_add(graph.ctx0, q, layer.wq_b);
     auto * packed = adapter->projection(id).project(graph.ctx0, input);
     ggml_format_name(packed, "kv_projection.L%d", id);
-    adapter_mark_projection(graph,packed,id,false);
     if (graph.hparams.f_clamp_kqv > 0) {
         const auto bound = graph.hparams.f_clamp_kqv;
         q = ggml_clamp(graph.ctx0, q, -bound, bound);
