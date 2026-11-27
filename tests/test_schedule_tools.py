@@ -203,6 +203,63 @@ class ScheduleToolsTests(unittest.TestCase):
             self.assertEqual(audit['process_reused_fences'],0)
             self.assertEqual(audit['attention_fences'],0)
 
+    def test_projection_archive_keeps_independent_completion_in_overlap(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/"schedule.jsonl"
+            rows=trace("overlap")
+            for row in rows:
+                if row['event']=='define':
+                    if row['task']==7: row['predecessors']=[4]
+                    if row['task']==8: row['predecessors']=[3,5,6]
+                    if row['task']==11: row['predecessors']=[8,7]
+                elif row['event']=='complete':
+                    if row['task']==3: row['fence']='kv_device_ready'
+                    if row['task']==4: row.update(fence=scheduling.PROJECTION_ARCHIVE_PROOF,device_ns=2)
+                    if row['task']==9: row.update(fence='attention_device_event',device_ns=3)
+            jsonlines(path,rows)
+            audit=scheduling.audit_schedule(path,'overlap')
+            self.assertEqual(audit['device_event_completions'],1)
+            self.assertEqual(audit['device_attention_ns'],3)
+            wrong=copy.deepcopy(rows)
+            next(r for r in wrong if r['event']=='complete' and r['task']==4)['fence']=scheduling.SHARED_ARCHIVE_PROOF
+            jsonlines(path,wrong)
+            with self.assertRaisesRegex(ValueError,'shared archive proof outside'):
+                scheduling.audit_schedule(path,'overlap')
+            wrong=copy.deepcopy(rows)
+            next(r for r in wrong if r['event']=='define' and r['task']==4)['predecessors']=[8]
+            jsonlines(path,wrong)
+            with self.assertRaisesRegex(ValueError,'before dependency'):
+                scheduling.audit_schedule(path,'overlap')
+
+    def test_shared_writeback_depends_on_attention_completion(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            path=Path(temporary)/'schedule.jsonl'
+            rows=trace('overlap+sync_reuse')[:12]
+            for row in rows:
+                if row['task']==7: row['predecessors']=[4]
+                if row['task']==8: row['predecessors']=[3,5]
+                if row['task']==9: row['predecessors']=[8,6]
+                if row['task']==10: row['predecessors']=[7,9]
+                if row['task']==11: row['predecessors']=[5,7]
+            stamp=0
+            for task,event in [(0,'start'),(0,'complete'),(1,'start'),(1,'complete'),(2,'start'),(2,'complete'),
+                               (3,'start'),(3,'complete'),(4,'start'),(5,'start'),(5,'complete'),(6,'start'),
+                               (6,'complete'),(8,'start'),(8,'complete'),(9,'start'),(9,'complete'),(4,'complete'),
+                               (7,'start'),(7,'complete'),(10,'start'),(10,'complete'),(11,'start'),(11,'complete')]:
+                row=dict(event=event,frame=1,task=task,timestamp_ns=stamp,fence='');stamp+=1
+                if event=='complete':
+                    if task==3: row['fence']='kv_device_ready'
+                    if task==4: row.update(fence=scheduling.SHARED_ARCHIVE_PROOF,device_ns=1)
+                    if task in (6,8): row['fence']='attention_upload_dependency'
+                    if task==9: row.update(fence='attention_device_event',device_ns=1)
+                rows.append(row)
+            jsonlines(path,rows)
+            self.assertEqual(scheduling.audit_schedule(path,'overlap+sync_reuse')['device_event_completions'],1)
+            next(r for r in rows if r['event']=='define' and r['task']==10)['predecessors']=[7]
+            jsonlines(path,rows)
+            with self.assertRaisesRegex(ValueError,'dependencies differ'):
+                scheduling.audit_schedule(path,'overlap+sync_reuse')
+
     def test_deferred_pin_keeps_copy_and_attention_lifetimes_separate(self):
         with tempfile.TemporaryDirectory() as temporary:
             path = Path(temporary) / "residency.jsonl"

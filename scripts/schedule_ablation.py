@@ -18,9 +18,10 @@ TASKS = {"q_gpu_ready", "q_d2h_ready", "selection", "selection_ready", "kv_proje
          "kv_d2h_ready", "miss_read_and_reconcile", "history_h2d", "append_current_kv",
          "append_and_selection", "current_h2d", "attention_until_boundary", "buffered_ssd_store", "next_layer_prefetch"}
 SHARED_ARCHIVE_PROOF = "kv_archive_attention_complete"
+PROJECTION_ARCHIVE_PROOF = "kv_projection_archive_complete"
 DEVICE_PROOFS = {"attention_until_boundary": ("attention_device_event",), "q_gpu_ready": ("query_device_projection",),
                  "kv_projection_to_host": ("kv_device_ready",),
-                 "kv_d2h_ready": ("kv_archive_copy_complete", SHARED_ARCHIVE_PROOF)}
+                 "kv_d2h_ready": ("kv_archive_copy_complete", SHARED_ARCHIVE_PROOF, PROJECTION_ARCHIVE_PROOF)}
 
 
 def integer(value, positive=False):
@@ -117,11 +118,14 @@ def audit_schedule(path, mode, *, blocks=False):
                  "attention_until_boundary": ["current_h2d"], "buffered_ssd_store": [append],
                  "next_layer_prefetch": ["current_h2d"]}
         archive_proof = names["kv_d2h_ready"]["fence"]
-        if archive_proof in ("kv_archive_copy_complete", SHARED_ARCHIVE_PROOF):
+        if archive_proof in ("kv_archive_copy_complete", SHARED_ARCHIVE_PROOF, PROJECTION_ARCHIVE_PROOF):
             if serial or names["kv_projection_to_host"]["fence"] != "kv_device_ready":
                 raise ValueError("device archive lacks its KV production proof")
             if archive_proof == "kv_archive_copy_complete":
                 edges["kv_d2h_ready"] = ["current_h2d"]
+            elif archive_proof == PROJECTION_ARCHIVE_PROOF:
+                if mode != "overlap":
+                    raise ValueError("independent projection archive proof outside overlap mode")
             elif mode != "overlap+sync_reuse":
                 raise ValueError("shared archive proof outside sync reuse mode")
             elif names["kv_d2h_ready"]["end"] < names["attention_until_boundary"]["end"]:
@@ -131,6 +135,7 @@ def audit_schedule(path, mode, *, blocks=False):
             if archive_proof == SHARED_ARCHIVE_PROOF:
                 edges["current_h2d"].remove("history_h2d")
                 edges["attention_until_boundary"].append("history_h2d")
+                edges["buffered_ssd_store"].append("attention_until_boundary")
                 edges["next_layer_prefetch"] = ["miss_read_and_reconcile"]
                 if any(names[name]["fence"] != "attention_upload_dependency" for name in ("history_h2d", "current_h2d")):
                     raise ValueError("CUDA uploads lack a shared attention completion proof")
@@ -157,8 +162,10 @@ def audit_schedule(path, mode, *, blocks=False):
         totals["miss_projection_overlap_ns"] += max(0, min(miss["end"], kv["end"]) - max(miss["start"], kv["start"]))
         proof = names["attention_until_boundary"]["fence"]
         if proof not in proofs: raise ValueError("attention completion lacks a known proof")
-        if mode != "overlap+sync_reuse" and proof in ("query_dependency_reuse", "attention_device_event", "attention_device_event_untimed"):
+        if mode != "overlap+sync_reuse" and proof == "query_dependency_reuse":
             raise ValueError("query reuse proof in a mode that requires attention completion")
+        if mode == "naive" and proof in ("attention_device_event", "attention_device_event_untimed"):
+            raise ValueError("native attention proof in naive scheduling")
         if proof=="attention_device_event":
             if "device_ns" not in names["attention_until_boundary"]: raise ValueError("native attention completion lacks device timing")
             totals["device_attention_ns"]+=names["attention_until_boundary"]["device_ns"]

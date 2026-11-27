@@ -352,7 +352,8 @@ int main(int argc,char ** argv) {
         decode(device,false,solid::ScheduleMode::sync_reuse,true,false,true,false,false,true);
         for (auto mode:{solid::ScheduleMode::naive,solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse})
             decode(device,false,mode,true,false,true,true);
-        decode(device,false,solid::ScheduleMode::sync_reuse,true,false,false,false,true,false,true);
+        for (auto mode:{solid::ScheduleMode::overlap,solid::ScheduleMode::sync_reuse})
+            decode(device,false,mode,true,false,false,false,true,false,true);
         std::cout<<"CUDA borrowed Q/K, FP16 kernels, split graphs and replay checks passed\n"; return 0;
     } catch (const std::exception & error) { std::cerr<<error.what()<<'\n'; return 1; }
 }

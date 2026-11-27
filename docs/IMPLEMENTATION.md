@@ -218,7 +218,7 @@
 
    实验结果记录共享 attention 完成点和单独确认归档的次数。调度轨迹核对脚本校验共享归档对应的投影依赖。CUDA 回归用例核对两种调度模式的完成次数及 attention 输出。
 
-   设备 Q 提前选择入口支持同步、异步调用，并显式指定后续 KV 的归档方式。已下载到主机的 FP16 KV 采用“下载完成→追加→当前行安装”的依赖，进入 FP16 追加函数；同步复用路径的设备 KV 采用“投影就绪→下载归档→attention 完成确认→追加”，普通重叠路径在当前行安装后独立归档。两种入口均保留选择位置、输入类型和归档方式的一致性检查。
+   设备 Q 提前选择入口支持同步、异步调用，并显式指定后续 KV 的归档方式。已下载到主机的 FP16 KV 采用“下载完成→追加→当前行安装”的依赖，进入 FP16 追加函数；CUDA 同步复用路径的设备 KV 采用“投影就绪→下载归档→attention 完成确认→追加”，CUDA 普通重叠路径从相同的连续投影下载，通过独立事件确认后追加。两种入口均保留选择位置、输入类型和归档方式的一致性检查。
 
    [ggml_prefetch.hpp](../include/solid/ggml_prefetch.hpp)、[ggml_prefetch.cpp](../src/ggml_prefetch.cpp)、[session.cpp](../src/session.cpp)、[device_cache.cpp](../src/device_cache.cpp)、[scheduler.hpp](../include/solid/scheduler.hpp)、[baseline.cpp](../src/baseline.cpp)、[schedule_ablation.py](../scripts/schedule_ablation.py)、[cuda_device_input_test.cu](../tests/cuda_device_input_test.cu)。
 
@@ -369,6 +369,16 @@
    `ggml_prefetch.cpp` 在 CUDA 同步复用路径的当前 KV 就绪处，先按层图的投影依赖启动当前行回传，再进入历史补读、上传提交的消费者等待。历史块仍由协调线程沿独立复制队列处理。当前行使用独立的页锁定缓冲，在调度器建立时分配；回传只操作归档状态，后续归档收取继续由 attention 完成回执确认。入口检查当前张量为连续 FP16、字节数等于一层当前 token 的全部 K/V。缓存加载阻塞仍以提交回传前的原 KV 消费者入口计时。
 
    `cuda_device_input_test.cu` 新增实际 CUDA 下载门控：暂缓历史读盘结果，等待本层 FP16 KV 的真实下载完成后才放行读取；核对 8 个连续 Decode 步、两层共 16 次下载、历史读取及 attention 数值。`CMakeLists.txt` 为该核验提供 GGML 后端接口头文件。旧版回传顺序在首层明确报出等待错误，退出码为 1；修复版通过并能正常排空。旧版仅在自己的构建容器内挂载单个源码文件，核验后恢复当前源码构建。服务器 54 项 CPU 检查通过，正反核验、构建日志和源码哈希位于 `results/server5090/archive-frontier-check/`；修复版原始采集为 `infllm-port-check-archive-restored.Vi36Z5oc/nsys/archive-restored.nsys-rep`。
+
+16. **CUDA OL 与 SR 的当前行回传来源对齐**
+
+   `ggml_prefetch.cpp` 将 CUDA OL 的当前行回传改为与 SR 相同的连续 FP16 投影，一次回传该层全部 KV 头，并在历史补读等待前提交。归档的数据来源与完成确认方式分别记录：OL 在计算队列记录独立归档事件并收取该事件；SR 继续由 attention 完成回执确认。CPU、SYCL 及旧的显存槽位归档入口保留原数据路径。层图的投影归档直接依赖 KV 投影，独立确认使用 `kv_projection_archive_complete`，区分槽位归档和共享 attention 确认。
+
+   `cuda_device_input_test.cu` 将当前 KV 真实下载先于历史读取的门控覆盖到 OL、SR 两种模式，并保留独立／共享确认计数检查。`schedule_ablation.py` 按归档证明核对对应依赖，允许 OL 使用原生 attention 完成通知，继续拒绝 OL 使用 SR 的共享归档证明。`test_schedule_tools.py` 检查独立投影归档、错误共享证明及错误的当前行安装依赖。服务器 54 项 CPU 检查通过，记录位于 `results/server5090/archive-ol-align-check/compile-and-cpu.log`。
+
+17. **同步复用写回的 attention 依赖**
+
+   `ggml_prefetch.cpp` 的共享归档层图为 CPU→SSD 写回加入 attention 完成依赖，使图 11(c) 的同步复用约束进入 critical/LST 计算。正常写回继续在 attention 回执处理后派发。中断排空时，真实归档完成后直接提交并排空待写数据，保留该帧的中断状态；这条清理路径不记作成功完成 attention 或写回微任务。`schedule_ablation.py` 和 `test_schedule_tools.py` 核对该依赖，并拒绝缺少 attention 前驱的共享写回记录。上述依赖与工具检查包含在同目录的 54 项 CPU 检查中。
 
 ## 五、论文系统的工程接入
 

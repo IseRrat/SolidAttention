@@ -496,8 +496,8 @@ public:
         return nullptr;
 #endif
     }
-    void start_archive(const std::vector<std::uint32_t> & slots,std::uint64_t position,ggml_tensor * source=nullptr) {
-        if (archive_pending_ || (!source && slots.size()!=geometry_.heads)) throw std::logic_error("invalid KV archive frontier");
+    void start_archive(const std::vector<std::uint32_t> & slots,std::uint64_t position,ggml_tensor * source=nullptr,bool reuse_attention=false) {
+        if (archive_pending_ || (!source && (slots.size()!=geometry_.heads || reuse_attention))) throw std::logic_error("invalid KV archive frontier");
         auto * archive_backend=source?backend_:copy_backend_;
         auto * device=ggml_backend_get_device(archive_backend);
         const auto row_bytes=static_cast<std::size_t>(2)*geometry_.dimension*sizeof(Half);
@@ -508,9 +508,10 @@ public:
 #ifdef SOLID_HAVE_SYCL
         if (!sycl_copy_)
 #endif
-            if (!source) archive_event_=device?ggml_backend_event_new(device):nullptr;
+            if (!reuse_attention) archive_event_=device?ggml_backend_event_new(device):nullptr;
         archive_pending_=true;
         archive_on_compute_=source!=nullptr;
+        archive_shares_attention_=reuse_attention;
         try {
 #ifdef SOLID_HAVE_CUDA_SELECTION
             if (cuda_device_>=0 && !archive_interval_) archive_interval_=make_cuda_device_interval(cuda_device_);
@@ -522,6 +523,8 @@ public:
                 // Queue one download before the compute stream waits for the KV bank.
                 ggml_backend_tensor_get_async(backend_,source,output,0,bytes);
                 record_copy_interval(archive_interval_.get(),true,archive_backend);
+                if (archive_event_) ggml_backend_event_record(archive_event_,archive_backend);
+                else if (!reuse_attention) ggml_backend_synchronize(archive_backend);
                 return;
             }
             for (std::size_t h=0;h<slots.size();++h) {
@@ -552,7 +555,7 @@ public:
         }
     }
     std::vector<Half> finish_archive(std::optional<std::uint64_t> & device_ns,bool compute_complete) {
-        if (!archive_pending_ || archive_on_compute_!=compute_complete) throw std::logic_error("missing KV archive completion proof");
+        if (!archive_pending_ || archive_shares_attention_!=compute_complete) throw std::logic_error("missing KV archive completion proof");
         if (compute_complete) ++stats_.archive_attention_reuses;
         else ++stats_.archive_separate_completions;
 #ifdef SOLID_HAVE_SYCL
@@ -578,6 +581,7 @@ public:
         archive_event_=nullptr;
         archive_pending_=false;
         archive_on_compute_=false;
+        archive_shares_attention_=false;
     }
     void synchronize_compute() { ggml_backend_synchronize(backend_); ++stats_.backend_compute_waits; }
     ScheduleStats stats() const { return stats_; }
@@ -675,6 +679,7 @@ private:
     ggml_backend_event_t archive_event_=nullptr;
     bool archive_pending_=false;
     bool archive_on_compute_=false;
+    bool archive_shares_attention_=false;
     std::unique_ptr<ggml_context, decltype(&ggml_free)> context_{nullptr, ggml_free};
     std::shared_ptr<ggml_backend_buffer> buffer_;
     ggml_tensor * tensor_ = nullptr;
@@ -704,10 +709,11 @@ struct LayerWork {
     bool direct = false;
     bool deferred_archive;
     bool archive_at_attention;
+    bool archive_from_projection;
     std::optional<std::uint64_t> consumer_entry_ns;
     LayerWork(std::uint32_t layer, std::uint64_t position, ScheduleMode mode, ScheduleTrace & trace,
                 std::uint64_t id, const std::array<std::uint64_t, task_count> & estimates, bool archive, bool single_layer,
-                bool shared_archive) :
+                bool shared_archive,bool projected_archive) :
         layer(layer), position(position), dag([&] {
             const bool serial = mode == ScheduleMode::naive;
             std::vector<TaskSpec> specs = {
@@ -726,19 +732,22 @@ struct LayerWork {
                 {"next_layer_prefetch", TaskResource::ssd, {current_h2d}, 1},
             };
             if (archive) {
-                if (!shared_archive) specs[kv_d2h].predecessors={current_h2d};
+                if (!projected_archive) specs[kv_d2h].predecessors={current_h2d};
                 specs[append].predecessors={kv_d2h};
                 specs[current_h2d].predecessors={kv_projection,miss_read,history_h2d};
                 if (shared_archive) {
                     specs[current_h2d].predecessors.pop_back();
                     specs[attention].predecessors.push_back(history_h2d);
                     specs[next_prefetch].predecessors={miss_read};
+                    // Figure 11(c): noncritical writeback shares the completed
+                    // attention frontier. Include it in critical/LST analysis.
+                    specs[store_task].predecessors.push_back(attention);
                 }
                 if (single_layer) specs[next_prefetch].predecessors.push_back(append);
             }
             for (std::size_t i = 0; i < specs.size(); ++i) specs[i].estimate_ns = estimates[i];
             return specs;
-        }(), &trace, id, layer, position, mode), deferred_archive(archive), archive_at_attention(shared_archive) {}
+        }(), &trace, id, layer, position, mode), deferred_archive(archive), archive_at_attention(shared_archive),archive_from_projection(projected_archive) {}
 };
 }
 struct GgmlPrefetch::Impl {
@@ -778,7 +787,8 @@ struct GgmlPrefetch::Impl {
         if (sequence == UINT64_MAX) throw std::overflow_error("schedule frame identity exhausted");
         const bool archive=direct && deferred_archive && mode!=ScheduleMode::naive;
         work = std::make_shared<LayerWork>(layer, position, mode, trace, ++sequence, estimates, archive,
-            session.geometry().layers==1, archive && mode==ScheduleMode::sync_reuse && transport.can_archive_on_attention_stream());
+            session.geometry().layers==1, archive && mode==ScheduleMode::sync_reuse && transport.can_archive_on_attention_stream(),
+            archive && transport.can_archive_on_attention_stream());
         const auto time=trace.now();
         if (projection_ns) {
             work->dag.start(q_ready,time);
@@ -842,7 +852,8 @@ struct GgmlPrefetch::Impl {
         std::optional<std::uint64_t> archive_ns;
         const auto kv=transport.finish_archive(archive_ns,frame->archive_at_attention);
         frame->dag.complete(kv_d2h,trace.now(),
-            frame->archive_at_attention?"kv_archive_attention_complete":"kv_archive_copy_complete",archive_ns);
+            frame->archive_at_attention?"kv_archive_attention_complete":frame->archive_from_projection?
+                "kv_projection_archive_complete":"kv_archive_copy_complete",archive_ns);
         frame->dag.start(append,trace.now());
         session.archive_device_kv(frame->layer,frame->position,kv);
         frame->dag.complete(append,trace.now());
@@ -1124,13 +1135,13 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
         else current->dag.fence({kv_projection,kv_d2h}, impl_->trace.now(), "kv_download_complete");
     }
     const auto consumer_ready=impl_->trace.now();
-    if (early_enabled() && deferred && current->archive_at_attention) {
+    if (early_enabled() && deferred && current->archive_from_projection) {
         // Figure 11(c): current KV download depends on KV projection,
         // independently of the selected historical blocks still loading.
         // Archive state belongs to this thread until the KV worker joins;
         // historical uploads use the separate copy backend and slot state.
         current->dag.start(kv_d2h,impl_->trace.now());
-        impl_->transport.start_archive({},position,source);
+        impl_->transport.start_archive({},position,source,current->archive_at_attention);
     }
     const auto wait_begin = std::chrono::steady_clock::now();
     {
@@ -1212,7 +1223,8 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
             work->dag.complete(current_h2d, impl_->trace.now(), "upload_complete");
             work->dag.start(attention, impl_->trace.now());
         }
-        if (deferred && !work->archive_at_attention) impl_->transport.start_archive(impl_->device.current_slots({layer,position}), position);
+        if (deferred && !work->archive_at_attention && !work->archive_from_projection)
+            impl_->transport.start_archive(impl_->device.current_slots({layer,position}), position);
         ++impl_->totals.worker_jobs;
         impl_->worker.submit([this, work,epoch] {
             std::lock_guard<std::mutex> lock(impl_->mutex);
@@ -1236,7 +1248,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
             }
             bool next_started=false;
             if (work->deferred_archive) {
-                work->dag.start(kv_d2h,impl_->trace.now());
+                if (!work->archive_from_projection) work->dag.start(kv_d2h,impl_->trace.now());
                 if (impl_->session.geometry().layers>1) { impl_->next_layer(work); next_started=true; }
                 impl_->finish_archive(work);
             }
@@ -1286,7 +1298,10 @@ void GgmlPrefetch::quiesce() {
         impl_->work->dag.snapshot(kv_d2h).state==TaskState::running) {
         try {
             impl_->finish_archive(impl_->work);
-            impl_->start_store(impl_->work);
+            // Quiesce may follow an interrupted graph whose attention was
+            // never submitted. Drain the real archive/write without recording
+            // the canceled frame as a successfully scheduled attention/store.
+            (void) impl_->session.prefetcher().store_full_layer(impl_->work->layer);
         } catch (...) { error=std::current_exception(); }
     }
     impl_->transport.clear_archive();
