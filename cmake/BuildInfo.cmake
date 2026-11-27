@@ -1,3 +1,4 @@
+# 收集源码版本及构建特征，生成推理结果所引用的构建身份信息。
 file(GLOB_RECURSE SOLID_BUILD_INPUTS CONFIGURE_DEPENDS RELATIVE "${PROJECT_SOURCE_DIR}"
     "${PROJECT_SOURCE_DIR}/src/*.cpp" "${PROJECT_SOURCE_DIR}/src/*.cu" "${PROJECT_SOURCE_DIR}/include/*.hpp"
     "${PROJECT_SOURCE_DIR}/include/*.cuh" "${PROJECT_SOURCE_DIR}/cmake/*")

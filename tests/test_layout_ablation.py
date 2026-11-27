@@ -1,3 +1,4 @@
+# KV 布局消融的配置准备、身份核对和结果比较检查。
 import copy
 from array import array
 import importlib.util

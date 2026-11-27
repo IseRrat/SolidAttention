@@ -1,3 +1,4 @@
+# 单次推理启动器的构建身份、文件哈希、执行清单与失败清理检查。
 import importlib.util
 from pathlib import Path
 import tempfile

@@ -1,3 +1,4 @@
+// 主机模拟 attention 完成通知与回执生命周期检查。
 #include "solid/attention_events.hpp"
 #include <array>
 #include <cstring>

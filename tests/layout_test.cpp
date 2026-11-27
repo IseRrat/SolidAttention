@@ -1,3 +1,4 @@
+// KV separate/interleaved 布局、文件偏移和数据还原检查。
 #include "solid/kv_store.hpp"
 #include <algorithm>
 #include <cstring>

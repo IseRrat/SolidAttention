@@ -1,3 +1,4 @@
+// llama.cpp attention 图接入、节点保活和连续执行检查。
 #include "solid/llama_adapter.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"

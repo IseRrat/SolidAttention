@@ -1,3 +1,4 @@
+// 预取读写失败、取消和收尾时的资源生命周期检查。
 #include "deferred_copies.hpp"
 #include "prefetch_fakes.hpp"
 #include "solid/ggml_prefetch.hpp"

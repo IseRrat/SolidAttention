@@ -1,3 +1,4 @@
+// SolidAttention 的图执行接入口：协调评分、SSD→CPU→GPU、当前 KV 归档和下一层预取。
 #include "solid/ggml_prefetch.hpp"
 #include "solid/device_timing.hpp"
 #include "ggml.h"
@@ -227,6 +228,7 @@ public:
         return false;
 #endif
     }
+    // 按目标位置整理本批已就绪块；源地址和目标地址都连续时合并 H2D。
     std::uint64_t upload_batch(const std::vector<DeviceUpload> & blocks) override {
         if (!batches_uploads() || blocks.empty()) throw std::logic_error("invalid CUDA KV upload batch");
         if (next_==UINT64_MAX) throw std::overflow_error("copy ticket exhausted");
@@ -438,6 +440,7 @@ public:
         }
         completed_through_ = next_ - 1;
     }
+    // 在模型计算队列建立对已提交 KV 上传的依赖。
     void wait_on_compute() {
 #ifdef SOLID_HAVE_SYCL
         if (sycl_copy_) {
@@ -496,6 +499,7 @@ public:
         return nullptr;
 #endif
     }
+    // 把当前新 KV 从 GPU 下载到归档缓冲；reuse_attention 控制是否复用 attention 完成证明。
     void start_archive(const std::vector<std::uint32_t> & slots,std::uint64_t position,ggml_tensor * source=nullptr,bool reuse_attention=false) {
         if (archive_pending_ || (!source && (slots.size()!=geometry_.heads || reuse_attention))) throw std::logic_error("invalid KV archive frontier");
         auto * archive_backend=source?backend_:copy_backend_;
@@ -554,6 +558,7 @@ public:
             throw;
         }
     }
+    // 确认 D2H 已完成并收取新 KV，随后由会话追加到逐层写缓冲。
     std::vector<Half> finish_archive(std::optional<std::uint64_t> & device_ns,bool compute_complete) {
         if (!archive_pending_ || archive_shares_attention_!=compute_complete) throw std::logic_error("missing KV archive completion proof");
         if (compute_complete) ++stats_.archive_attention_reuses;
@@ -696,6 +701,7 @@ private:
 namespace {
 enum Task : std::uint32_t { q_ready, q_d2h, select_task, kv_projection, kv_d2h, miss_read, history_h2d,
                            append, current_h2d, attention, store_task, next_prefetch, task_count };
+// 一次“层、token”的调度状态，保存依赖、选块、归档与 attention 的完成证明。
 struct LayerWork {
     std::uint32_t layer;
     std::uint64_t position;
@@ -844,6 +850,7 @@ struct GgmlPrefetch::Impl {
             current->dag.complete(next_prefetch, trace.now(),transport.aliases_host_slots()?"shared_prefetch_planned":"");
         } else current->dag.complete(next_prefetch,trace.now(),"context_capacity_reached");
     }
+    // 启动下一层推测性 SSD 读取，读好的块随后按可用槽位推进上传。
     void begin_prediction(std::uint32_t layer, std::uint64_t position) {
         session.begin_prefetch(layer, position, {block_read_estimate, block_copy_estimate});
         observe_stores();
@@ -922,6 +929,7 @@ struct GgmlPrefetch::Impl {
             } else finish_attention_release(work,before_upload);
         }
     }
+    // 协调线程等待计算完成通知，同时收取 I/O 回执、推进可执行的上传。
     void progress_after_attention(const std::shared_ptr<LayerWork> & current,std::uint64_t epoch) {
         if (!events) return;
         bool released=false;
@@ -1022,6 +1030,7 @@ void GgmlPrefetch::select_early_device_async(std::uint32_t layer,std::uint64_t p
                                             std::optional<std::uint64_t> projection_ns,bool deferred_archive) {
     select_impl(layer, position, {}, &query, covers,projection_ns,true,deferred_archive);
 }
+// Q 前沿入口：启动选块，再把正式缺失块的读盘与上传交给常驻工作线程。
 void GgmlPrefetch::select_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query, const DeviceQuery * device,
                                 bool covers,std::optional<std::uint64_t> projection_ns,bool asynchronous,bool deferred_archive) {
     if (!early_enabled()) throw std::logic_error("early selection is disabled");
@@ -1118,6 +1127,7 @@ std::vector<Half> GgmlPrefetch::decode_device(std::uint32_t layer,std::uint64_t 
     if (!source || !early_enabled()) throw std::invalid_argument("deferred KV requires a device source and an early query");
     return decode_impl(layer, position, {}, {}, {}, true, nullptr, &keys, nullptr, source,projection_ns);
 }
+// 当前 KV 汇合点：收取历史工作、安装数据，并按 Naive/OL/SR 模式处理归档与等待。
 std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t position, const std::vector<float> & query,
                                           const std::vector<float> & keys, const std::vector<float> & values, bool packed,
                                           const std::vector<Half> * half, const DeviceKeys * device, const DeviceQuery * serial_query,ggml_tensor * source,
@@ -1264,6 +1274,7 @@ std::vector<Half> GgmlPrefetch::decode_impl(std::uint32_t layer, std::uint64_t p
     }
     return mask;
 }
+// 图边界的完成入口；确认 attention 后才复用其占用的显存槽位。
 void GgmlPrefetch::completed(std::uint64_t epoch) {
     trace::Scope wait("CPU Wait Attention Release");
     if (impl_->events && epoch!=impl_->device.attention_epoch()) return;

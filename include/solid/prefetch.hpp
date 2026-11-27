@@ -1,3 +1,4 @@
+// 主机 KV 槽位及推测性预取接口：预测下一层需求、核对正式选块并补读缺失块。
 #pragma once
 #include "solid/async_reader.hpp"
 #include "solid/attention.hpp"
@@ -12,6 +13,7 @@
 
 namespace solid {
 enum class SlotState { free, loading, ready, pinned, retiring };
+// 主机/设备共用的槽位状态表；租约中的代次用于区分同一槽位的不同使用轮次。
 class SlotTable {
 public:
     struct Entry {
@@ -25,9 +27,11 @@ public:
     std::optional<SlotLease> find(const BlockIdentity & id) const;
     std::optional<SlotLease> acquire(const BlockIdentity & id);
     std::optional<SlotLease> acquire_at(const BlockIdentity & id, std::uint32_t slot);
+    // 沿用同一物理槽位的已有前缀，为新增 KV 尾部更新块版本。
     SlotLease refresh(const SlotLease & previous, const BlockIdentity & identity);
     bool complete(const SlotLease & lease);
     bool retire(const SlotLease & lease);
+    // 标记槽位正被读者使用；unpin 后才能回收或覆盖。
     void pin(const SlotLease & lease, bool allow_pending = false);
     void unpin(const SlotLease & lease);
     bool matches(const SlotLease & lease) const;
@@ -73,18 +77,23 @@ public:
                std::unique_ptr<AsyncReader> reader, const std::filesystem::path & trace = {}, bool prefetch_ahead = true);
     ~Prefetcher();
     void bind_shared_blocks(const std::vector<Half *> & addresses, std::shared_ptr<void> owner,bool defer_prediction_slots=false);
+    // 用上一轮选块历史预测本层需求，开始异步读盘。
     void begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs = {});
     std::vector<SlotLease> resolve(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
+    // 核对正式历史选块；每批读完后通过 ready/batch 回调交给上传方。
     std::vector<SlotLease> resolve_history(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual,
                                          const StagePlan & plan = {}, const ReadyBlock & ready = {}, const StageFactory & factory = {},
                                          bool keep_tail = false, const ReadyBatch & batch = {}, bool admit_before_stage = false, bool per_completion = false);
+    // 保存本次真实选择，作为以后该层预取的依据。
     void remember_selection(std::uint32_t layer, std::uint64_t position, const std::vector<HeadSelection> & actual);
+    // 收取 SSD 完成回执并推进队列；wait 决定没有结果时是否等待。
     void poll(bool wait = false, const ReadyBlock & ready = {});
     std::uint64_t read_observed_ns(const SlotLease & lease) const;
     const KvBlock & block(const SlotLease & lease) const;
     void pin(const SlotLease & lease) { slots_.pin(lease); }
     void unpin(const SlotLease & lease) { slots_.unpin(lease); }
     std::vector<SlotLease> ready() const;
+    // 提交该层已满写缓冲，返回可查询完成时刻的写回回执。
     std::shared_ptr<const StoreReceipt> store_full_layer(std::uint32_t layer);
     bool asynchronous_stores() const { return disk_ != nullptr; }
     void wait_store(std::uint32_t layer);

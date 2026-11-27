@@ -1,3 +1,4 @@
+// CPU 代表向量构造器：维护待定 Key 与累计分数，在完整块退出窗口后生成代表。
 #include "solid/block_ranker.hpp"
 #include <algorithm>
 #include <cmath>

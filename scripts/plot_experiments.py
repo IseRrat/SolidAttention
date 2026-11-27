@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 读取实验汇总结果，绘制吞吐、延迟、内存等对照图。
 """Render a verified experiment summary as standalone PNG/PDF figures."""
 import argparse
 from pathlib import Path
@@ -8,6 +9,7 @@ from experiment_common import atomic_json, digest, load
 from experiments import collect
 
 
+# 按套件和指标选择汇总数据，绘制各方法随横轴变化的对照图。
 def render(summary, destination, suite, metric="decode_tokens_per_second", x="input_tokens"):
     summary = Path(summary).resolve(strict=True)
     value = load(summary)

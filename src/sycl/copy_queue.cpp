@@ -1,3 +1,4 @@
+// SYCL 独立复制队列及完成事件，连接主机搬运与设备计算的依赖。
 #include "solid/sycl_backend.hpp"
 #include "solid/sycl_runtime.hpp"
 

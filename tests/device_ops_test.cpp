@@ -1,3 +1,4 @@
+// 自定义 GGML 节点的 CPU 数值、布局和依赖检查。
 #include "solid/device_ops.hpp"
 #include "solid/kv_store.hpp"
 #include "ggml-backend.h"

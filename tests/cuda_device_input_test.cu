@@ -1,3 +1,4 @@
+// 真实 CUDA 图内输入、当前 KV、归档与 attention 数值及依赖检查。
 #include "prefetch_fakes.hpp"
 #include "solid/device_ops.cuh"
 #include "solid/ggml_prefetch.hpp"

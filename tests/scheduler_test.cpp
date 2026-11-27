@@ -1,3 +1,4 @@
+// DAG 依赖、关键路径、LST 优先级与工作线程检查。
 #include "solid/scheduler.hpp"
 #include "prefetch_fakes.hpp"
 #include <atomic>

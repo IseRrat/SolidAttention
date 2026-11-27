@@ -1,3 +1,4 @@
+// liburing 读写引擎：提交 SSD 请求、收取完成结果，并通过 eventfd 通知等待线程。
 #include "solid/async_reader.hpp"
 #include <cerrno>
 #include <chrono>

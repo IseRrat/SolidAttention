@@ -1,3 +1,4 @@
+# 预取对照工具和槽位使用记录审计检查。
 from array import array
 import copy
 import importlib.util

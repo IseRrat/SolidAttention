@@ -1,3 +1,4 @@
+// 模型、推理和 attention 配置字段，以及读取配置的入口。
 #pragma once
 
 #include <cstdint>

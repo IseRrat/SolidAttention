@@ -1,3 +1,4 @@
+# 读取调度记录，检查任务依赖、完成顺序与同步证明。
 """Cross-check real synthetic GGML traces against the offline auditors."""
 import json
 from pathlib import Path

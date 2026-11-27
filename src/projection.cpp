@@ -1,3 +1,4 @@
+// 初始化融合 K/V 权重和 bias，构建一次投影及其 K/V 视图，并支持 RoPE 后 K 写回。
 #include "solid/projection.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"

@@ -1,3 +1,4 @@
+# 实验脚本共用的配置、哈希、运行结果读取和统计工具。
 """Shared validation and result provenance for offline experiment tools."""
 import copy
 import json
@@ -58,6 +59,7 @@ def check_hash(path, expected):
     if digest(Path(path)) != expected: raise ValueError(f"checksum differs: {path}")
 
 
+# 核对一次结果的配置、运行身份与测量条件，供执行恢复和汇总使用。
 def audit_run(result_path, source_config=None, source_sha=None):
     path = Path(result_path)
     run = load(path.parent / "manifest.json")
@@ -131,6 +133,7 @@ def distribution(values):
             "p99": percentile(.99), "p999": percentile(.999)}
 
 
+# 从运行结果提取统一的吞吐、时间和内存指标。
 def run_metrics(result):
     trace = result["trace"]
     tokens = token_ids(result["generated_token_ids"])

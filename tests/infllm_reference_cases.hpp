@@ -1,3 +1,4 @@
+// 读取原版 InfLLM 对照数据，核对代表、窗口与选块结果的通用样例。
 #pragma once
 #include "solid/attention.hpp"
 #include <algorithm>

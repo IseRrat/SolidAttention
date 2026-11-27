@@ -1,3 +1,4 @@
+// SYCL attention 完成通知和设备计时，把队列事件交给主机调度器。
 #include "solid/attention_events.hpp"
 #include "solid/device_timing.hpp"
 #include "solid/sycl_flash_decode.hpp"

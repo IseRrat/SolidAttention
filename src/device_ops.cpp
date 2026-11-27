@@ -1,3 +1,4 @@
+// 构造 GGML 自定义节点及其 CPU 回调；设备实现由 CUDA/SYCL 后端接入。
 #include "solid/device_ops.hpp"
 #include "solid/kv_store.hpp"
 #include <stdexcept>

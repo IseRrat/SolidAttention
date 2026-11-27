@@ -1,3 +1,4 @@
+// KV 块身份与槽位租约：区分层、head、块编号、数据版本和槽位使用代次。
 #pragma once
 #include <cstdint>
 #include <tuple>

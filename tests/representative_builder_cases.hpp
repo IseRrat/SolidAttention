@@ -1,3 +1,4 @@
+// 代表构造器跨后端共用的输入、参考结果和检查样例。
 #pragma once
 
 #include "solid/attention.hpp"

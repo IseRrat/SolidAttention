@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 从参考运行生成预取对照配置与清单，沿用相同的模型、输入和上下文。
 """Prepare fixed-token prefetch verification from a synchronous sparse reference."""
 import argparse
 import json
@@ -9,6 +10,7 @@ from layout_ablation import digest
 from prepare_replay import prepare
 
 
+# 沿用参考模型和输入，生成预取对照配置及结果位置清单。
 def prepare_prefetch(reference, output, fixed_selection=False, queue_depth=64, slots_per_head=None):
     if type(queue_depth) is not int or not 2 <= queue_depth <= 16384:
         raise ValueError("queue depth must be in [2,16384]")

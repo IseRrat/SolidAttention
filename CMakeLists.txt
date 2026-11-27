@@ -1,3 +1,4 @@
+# 项目构建入口：组合核心库、llama.cpp 适配层、可选设备后端和检查程序。
 cmake_minimum_required(VERSION 3.22)
 project(SolidAttention VERSION 0.1.0 LANGUAGES C CXX)
 

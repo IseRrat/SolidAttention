@@ -1,3 +1,4 @@
+// 为投影节点绑定设备计时事件，向调度器提供 GPU 实际执行时长。
 #pragma once
 
 #include "ggml.h"
@@ -25,6 +26,7 @@ struct DeviceTimingBinding {
     DeviceInterval * interval = nullptr;
 };
 inline constexpr std::size_t device_timing_offset = 48;
+// 把投影计时对象挂到张量参数，后端执行时在设备队列记录起止事件。
 inline void bind_device_timing(ggml_tensor * tensor, DeviceInterval * interval) {
     static_assert(device_timing_offset + sizeof(DeviceTimingBinding) <= GGML_MAX_OP_PARAMS);
     if (!interval) return;

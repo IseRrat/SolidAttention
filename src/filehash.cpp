@@ -1,3 +1,4 @@
+// 流式读取文件并计算 SHA-256，供配置和实验结果记录文件身份。
 #include "solid/filehash.hpp"
 extern "C" {
 #include "sha256.h"

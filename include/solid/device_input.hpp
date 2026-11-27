@@ -1,3 +1,4 @@
+// 借用设备 Q、K、KV 和输出指针的轻量视图；同时声明布局、内存类型及生产完成事件。
 #pragma once
 
 #include "solid/kv_store.hpp"
@@ -24,6 +25,7 @@ struct DeviceQuery {
 // CUDA producer event accompanying a query that is still being computed.
 // The producer owns the query and event through rank completion/receipt collection.
 // Plain DeviceQuery retains its producer-complete contract.
+// Q 可能仍在计算中；消费者先在自己的设备队列等待 cuda_ready_event，再读取 Q。
 struct DeviceQueryWithEvent {
     DeviceQuery query;
     void * cuda_ready_event = nullptr;

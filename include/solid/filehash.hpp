@@ -1,3 +1,4 @@
+// 计算文件 SHA-256，用于标识模型、输入和可执行文件。
 #pragma once
 
 #include <filesystem>

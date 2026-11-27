@@ -1,3 +1,4 @@
+// 为推理、SSD I/O 和协调线程安排 CPU 核心的接口。
 #pragma once
 #include <memory>
 #include <vector>

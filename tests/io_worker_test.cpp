@@ -1,3 +1,4 @@
+// I/O 工作线程的优先级、完成通知、取消与排空检查。
 #include "solid/async_reader.hpp"
 #include "solid/thread_affinity.hpp"
 #include "solid/scheduler.hpp"

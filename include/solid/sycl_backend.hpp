@@ -1,3 +1,4 @@
+// SYCL 后端接入接口：共享 KV 内存、复制队列和复制完成事件。
 #pragma once
 
 #include "ggml-backend.h"

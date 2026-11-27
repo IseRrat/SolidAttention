@@ -1,3 +1,4 @@
+# 实验配置生成、消融开关、预算一致性、执行恢复与结果汇总检查。
 import copy
 import json
 from pathlib import Path

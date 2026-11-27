@@ -1,3 +1,4 @@
+# 生成 llama.cpp 适配覆盖文件，并把项目节点接入对应的上游构建目标。
 find_package(Python3 REQUIRED COMPONENTS Interpreter)
 set(SOLID_OVERLAY "${CMAKE_BINARY_DIR}/generated/upstream")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS "${PROJECT_SOURCE_DIR}/scripts/generate_adapter.py")

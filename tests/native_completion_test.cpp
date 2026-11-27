@@ -1,3 +1,4 @@
+// 设备原生完成回执对调度推进和槽位释放的影响检查。
 #include "deferred_copies.hpp"
 #include "solid/ggml_prefetch.hpp"
 #include "solid/llama_adapter.hpp"

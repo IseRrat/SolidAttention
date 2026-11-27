@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 构建并运行项目检查程序，按构建环境选择可用的后端检查。
 set -euo pipefail
 
 root="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

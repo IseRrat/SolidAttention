@@ -1,3 +1,4 @@
+// 推理程序入口：加载模型与配置，执行 Prefill/Decode，并保存输出、耗时及资源统计。
 #include "solid/config.hpp"
 #include "solid/trace.hpp"
 #include "solid/filehash.hpp"

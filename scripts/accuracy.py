@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 准确率评测流程：准备样本、调用推理、导出预测并运行固定版本的官方评分器。
 """Prepare rendered evaluation samples, generate predictions and use official LongBench scoring."""
 import argparse
 from contextlib import contextmanager
@@ -18,6 +19,7 @@ LONGBENCH = {"2wikimqa","triviaqa","hotpotqa","multifieldqa_en","multifieldqa_zh
              "passage_retrieval_en","passage_retrieval_zh"}
 
 
+# 把数据集样本和提示模板固定到评测清单，记录来源版本。
 def prepare(source, template, destination, dataset, revision, max_new_tokens=512):
     name(dataset)
     if not revision: raise ValueError("dataset revision must be recorded")
@@ -58,6 +60,7 @@ def read_samples(manifest):
     return manifest,rows
 
 
+# 逐样本调用推理客户端，保存预测及对应的运行结果。
 def generate(manifest, template, runner, output, variant="solid", max_seq_len=131583, truncation="error", block_tokens=32, budget_tokens=0):
     manifest,rows = read_samples(manifest)
     output = Path(output).resolve()
@@ -85,6 +88,7 @@ def generate(manifest, template, runner, output, variant="solid", max_seq_len=13
         return state_path
 
 
+# 将已完成预测整理成官方评分器所需字段。
 def export(manifest, predictions, destination):
     manifest,rows = read_samples(manifest)
     predictions = Path(predictions).resolve(strict=True)
@@ -150,6 +154,7 @@ def official_longbench(root):
         sys.dont_write_bytecode = bytecode
 
 
+# 加载指定仓库版本的 LongBench 官方评分器，对导出预测计算分数。
 def score_longbench(directory, repository, revision, destination):
     directory,repository = Path(directory).resolve(strict=True),Path(repository).resolve(strict=True)
     if len(revision) != 40 or any(c not in "0123456789abcdef" for c in revision): raise ValueError("pin a full official LongBench commit SHA")

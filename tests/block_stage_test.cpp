@@ -1,3 +1,4 @@
+// 块级读盘/上传状态和优先级检查，包含固定形状实现与通用 DAG 的对照。
 #include "prefetch_fakes.hpp"
 #include "solid/block_stage.hpp"
 #include <iostream>

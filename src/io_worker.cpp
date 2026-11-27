@@ -1,3 +1,4 @@
+// 独立 CPU I/O 线程：按调度优先级向底层引擎发请求，转交完成回执并处理取消和排空。
 #include "solid/async_reader.hpp"
 #include "solid/trace.hpp"
 #include "solid/thread_affinity.hpp"

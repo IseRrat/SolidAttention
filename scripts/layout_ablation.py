@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 准备并汇总 separate/interleaved KV 布局对照，核对两组输入和数值结果。
 """Prepare or compare a fixed-token, fixed-selection 2x2 layout/projection ablation."""
 import argparse
 import copy
@@ -19,6 +20,7 @@ def digest(path):
     return value.hexdigest()
 
 
+# 从同一参考运行生成两种 KV 布局配置及对照清单。
 def create(reference, destination, results, profile=False):
     reference = Path(reference).resolve(strict=True)
     value, _ = load_result(reference)
@@ -95,6 +97,7 @@ def metrics(result):
     return out
 
 
+# 核对布局对照的输入、选块和数值结果，再汇总搬运及耗时指标。
 def report(manifest_path, atol=1e-3, rtol=1e-4):
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     if (manifest.get("schema_version") != 1 or type(manifest.get("profile")) is not bool or

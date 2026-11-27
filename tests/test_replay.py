@@ -1,3 +1,4 @@
+# 固定 Decode 输入准备和参考运行上下文保留检查。
 import importlib.util
 import json
 from pathlib import Path

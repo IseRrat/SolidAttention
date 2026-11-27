@@ -1,3 +1,4 @@
+// CPU 稀疏预算、代表评分、固定窗口与历史块选择检查。
 #include "solid/attention.hpp"
 #include "solid/session.hpp"
 #include "solid/ranking_math.hpp"

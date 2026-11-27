@@ -1,3 +1,4 @@
+// 层级任务 DAG、关键路径/LST 优先级、工作线程及可选调度记录。
 #pragma once
 #include <condition_variable>
 #include <cstdint>
@@ -65,13 +66,16 @@ private:
     std::mutex mutex_;
     std::ofstream stream_;
 };
+// 层级微任务依赖图；任务只有在前驱完成后才进入就绪集合。
 class TaskDag {
 public:
     TaskDag(std::vector<TaskSpec> tasks, ScheduleTrace * trace = nullptr, std::uint64_t frame = 0,
             std::uint32_t layer = 0, std::uint64_t position = 0, ScheduleMode mode = ScheduleMode::naive);
+    // 按论文算法 1 排序：关键路径任务优先，其次 I/O，再按最晚开始时间选择。
     std::vector<std::uint32_t> ready(const std::vector<std::uint32_t> & candidates = {}) const;
     void start(std::uint32_t task, std::uint64_t now,const std::string & proof = {});
     void complete(std::uint32_t task, std::uint64_t now, const std::string & fence = {},std::optional<std::uint64_t> device_ns = {});
+    // 用一份实际同步完成证明，同时确认它覆盖的多个任务。
     void fence(const std::vector<std::uint32_t> & covered, std::uint64_t now, const std::string & proof);
     void abort(std::uint64_t now);
     std::uint64_t critical_path_ns() const;
@@ -92,6 +96,7 @@ private:
     bool dependencies_complete(std::uint32_t task) const;
 };
 // One persistent worker, one bounded job. Exceptions are delivered by join().
+// 复用一个常驻 CPU 线程执行任务；submit 提交，join 等待并收取异常。
 class TaskWorker {
 public:
     explicit TaskWorker(int cpu=-1, const char * name="sa.worker");

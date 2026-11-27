@@ -1,3 +1,4 @@
+# llama.cpp 适配覆盖生成、重复执行与上游锚点检查。
 import importlib.util
 from pathlib import Path
 import tempfile

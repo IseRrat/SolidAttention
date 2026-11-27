@@ -471,3 +471,7 @@
    `scripts/solid-nsys.sh` 开启 CUDA、NVTX、系统库调用与 CUDA Graph 节点采集。`scripts/profile_matrix.sh` 为每个任务生成独立 `.nsys-rep` 和 `INDEX.tsv`，记录方法、输入长度、模型、任务 ID、配置文件；续跑按执行清单跳过已有任务，并核对采集对应任务已完成。`run_baseline.py` 在运行清单记录标记开关。CPU 阶段条记录主机观察到的区间，GPU kernel 和 memory 行记录实际计算与传输。
 
    `tests/trace_test.cpp` 检查线程职责名、完整 Attention 的合并、批次标记共享、跨线程结束及上下文释放。`tests/test_adapter_generator.py` 检查生成结果可重复、上游源码保持原样，以及 FlashAttention 和 InfLLM 两个完成通知入口。
+
+8. **文件职责与主要函数注释**
+
+   为 `include/solid/`、`src/`、`scripts/`、`tests/`、`cmake/`、构建入口及 OpenCompass 配置入口共 144 个文件补充中文文件说明；为 153 处主要函数和类型补充职责注释。重点说明基线路径、稀疏评分、Prefill 分组、SSD 读取、H2D 上传、当前 KV 归档、等待位置、槽位占用与完成回执。共增加 297 行注释，与添加前的文件逐行核对，全部差异为注释插入；35 个 Python 文件的语法树一致。

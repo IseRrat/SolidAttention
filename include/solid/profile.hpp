@@ -1,3 +1,4 @@
+// 可选的逐算子诊断统计接口，分别累计计算节点与跨设备传输。
 #pragma once
 
 #include "ggml-backend.h"

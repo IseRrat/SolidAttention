@@ -1,3 +1,4 @@
+// 异步 SSD 读写接口、请求优先级和完成回执；实现分别位于 async_reader.cpp 与 io_worker.cpp。
 #pragma once
 #include "solid/kv_store.hpp"
 #include <memory>
@@ -42,6 +43,7 @@ struct AsyncIoStats {
     bool ready_time_measured = false;
     std::uint32_t worker_capacity=0;
 };
+// 异步读写约定：submit 只接纳请求，poll 返回完成回执，drain 等待已接纳操作结束。
 class AsyncReader {
 public:
     virtual ~AsyncReader() = default;
@@ -74,6 +76,7 @@ public:
 };
 bool uring_available();
 std::unique_ptr<AsyncReader> make_uring_reader(std::uint32_t queue_depth);
+// 给底层引擎配一个独立 CPU 线程，统一持有提交队列和完成队列。
 std::unique_ptr<AsyncReader> make_io_worker(std::function<std::unique_ptr<AsyncReader>()> factory,
                                           std::uint32_t queue_depth,int cpu=-1,bool notify_each_completion=false,bool measure_ready_time=false);
 std::unique_ptr<AsyncReader> make_threaded_uring_reader(std::uint32_t queue_depth,int cpu=-1,std::uint32_t admission_capacity=0,

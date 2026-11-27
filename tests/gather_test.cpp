@@ -1,3 +1,4 @@
+// 选中 KV 的聚集、掩码和 attention 输入布局检查。
 #include "solid/llama_adapter.hpp"
 #include "solid/dense_offload.hpp"
 #include "solid/device_ops.hpp"

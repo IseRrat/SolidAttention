@@ -1,3 +1,4 @@
+# 定位并校验固定版本的 llama.cpp 源码，供后续适配与构建使用。
 set(SOLID_UPSTREAM_COMMIT "ef6bc6f367082338006c8379bc7bcab3e1584766")
 if(NOT EXISTS "${PROJECT_SOURCE_DIR}/third_party/llama.cpp/include/llama.h")
     message(FATAL_ERROR "Run git submodule update --init --recursive first")

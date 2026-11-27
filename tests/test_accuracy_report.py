@@ -1,3 +1,4 @@
+# 官方汇总表导入和版本来源记录检查。
 from pathlib import Path
 import sys
 import tempfile

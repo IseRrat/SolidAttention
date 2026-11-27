@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 调度消融工具：准备 Naive、OL、OL+SR 对照，并核对 DAG 依赖和完成记录。
 """Prepare three fixed-selection scheduling runs and audit their completed traces."""
 import argparse
 import copy
@@ -30,6 +31,7 @@ def integer(value, positive=False):
     return value
 
 
+# 检查层级调度记录中的依赖、状态转换和完成证明。
 def audit_schedule(path, mode, *, blocks=False):
     if mode not in MODES:
         raise ValueError("unknown scheduling mode")
@@ -173,6 +175,7 @@ def audit_schedule(path, mode, *, blocks=False):
     return totals
 
 
+# 逐块检查 SSD 读完后才上传、上传完成后才参与计算等依赖。
 def audit_block_frames(frames):
     totals = {"block_frames": len(frames), "block_tasks": 0, "block_critical_path_ns": 0}
     identities = set()
@@ -223,6 +226,7 @@ def audit_block_schedule(path, mode, parent=None):
     return result
 
 
+# 从同一参考运行准备三种调度模式，保持其余配置相同。
 def create(reference, destination, results, queue_depth=64, slots_per_head=None):
     reference = Path(reference).resolve(strict=True)
     source = json.loads(reference.read_text(encoding="utf-8"))
@@ -249,6 +253,7 @@ def create(reference, destination, results, queue_depth=64, slots_per_head=None)
     return path
 
 
+# 汇总三组性能与完成记录，并比较选块和数值结果。
 def report(manifest_path, atol=1e-3, rtol=1e-4):
     manifest = json.loads(Path(manifest_path).read_text(encoding="utf-8"))
     variants = manifest["variants"]

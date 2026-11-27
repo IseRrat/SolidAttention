@@ -1,3 +1,4 @@
+// 分片 Prefill 的跨后端通用参考样例，包括因果掩码和跨片 softmax。
 #pragma once
 #include "solid/session.hpp"
 #include "solid/online_attention.hpp"

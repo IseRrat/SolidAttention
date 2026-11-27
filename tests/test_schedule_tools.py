@@ -1,3 +1,4 @@
+# 调度消融工具对 DAG、槽位和完成证明的审计检查。
 import copy
 import json
 from pathlib import Path

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 在生成目录中改写固定版本的 llama.cpp 接入点，连接项目算子、attention 和计时钩子。
 """Generate build-local integration files from the pinned upstream sources."""
 import argparse
 from pathlib import Path
@@ -10,6 +11,7 @@ def replace_once(text, before, after):
     return text.replace(before, after, 1)
 
 
+# 按固定上游锚点生成适配源码，接入自定义算子、完成通知和 attention 入口。
 def generate(source, destination):
     graph = (source / "llama-graph.cpp").read_text(encoding="utf-8")
     graph = '#include "solid/llama_adapter.hpp"\n' + graph

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 比较两次运行的输入、模型身份与 logits，报告数值误差和首次分歧位置。
 """Compare fixed-input logits from two recorded runs without loading a model."""
 import argparse
 from array import array
@@ -35,6 +36,7 @@ def load_result(path):
     return value, binary
 
 
+# 先核对两次运行身份和输入，再逐项比较 logits 并定位首个超差位置。
 def compare(reference_path, candidate_path, atol=1e-3, rtol=1e-4):
     if not math.isfinite(atol) or not math.isfinite(rtol) or atol < 0 or rtol < 0:
         raise ValueError("tolerances must be finite and nonnegative")

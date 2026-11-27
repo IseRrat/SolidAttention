@@ -1,3 +1,4 @@
+# logits 对照、误差容限与首次分歧报告检查。
 import importlib.util
 from array import array
 import json

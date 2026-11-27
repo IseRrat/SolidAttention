@@ -1,3 +1,4 @@
+// 真实 CUDA 设备 Q/KV Prefill 数值与输出检查。
 #include "device_prefill_graph_cases.hpp"
 #include "ggml-cuda.h"
 #include <iostream>

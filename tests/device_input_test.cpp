@@ -1,3 +1,4 @@
+// 借用设备指针的输入形状、内存归属和生命周期检查。
 #include "representative_builder_cases.hpp"
 #include <iostream>
 #include <limits>

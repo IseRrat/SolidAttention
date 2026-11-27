@@ -1,3 +1,4 @@
+# 批量检查仓库实验配置的模型字段、预算和方法开关。
 """Check every prepared experiment variant with the actual runner config parser."""
 from pathlib import Path
 import subprocess

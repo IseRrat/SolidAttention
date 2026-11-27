@@ -1,3 +1,4 @@
+// 显存 KV 槽位和传输接口；跟踪上传回执及 attention 对槽位的占用。
 #pragma once
 #include "solid/prefetch.hpp"
 
@@ -16,6 +17,7 @@ struct DeviceUpload {
     std::uint32_t slot;
     const KvBlock * block;
 };
+// 实际搬运的后端接口；返回的 ticket 表示数据何时可安全使用或覆盖。
 class DeviceTransport {
 public:
     virtual ~DeviceTransport() = default;
@@ -67,6 +69,7 @@ public:
     ~DeviceCache();
     // before_upload runs immediately before a new transfer starts, not after its
     // enqueue returns; the graph boundary may arrive during that enqueue.
+    // 把预测阶段已经读好的块送往显卡；individual 控制逐块提交。
     void prefetch_ready(const std::function<void()> & before_upload = {},bool individual=false);
     void reap_transfers();
     void wait_transfers();
@@ -79,12 +82,15 @@ public:
     // normal queue-boundary reap; do not scan all pending tickets per CQE.
     void stage_ready_completion(const SlotLease & lease,const std::shared_ptr<BlockStage> & stage = {},
                                 const std::function<void()> & before_upload = {});
+    // 提交同批已读好的正式选块，允许传输后端合并连续范围。
     void stage_ready_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage,
                            const std::function<void()> & before_upload = {});
+    // 安装选中 KV 并返回 attention 掩码；同时占用本次计算需要的槽位。
     std::vector<Half> prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
                               bool deferred_upload = false,const CurrentDeviceKv * current = nullptr,
                               bool keep_history_in_flight = false,std::uint32_t local_window = 0);
     // Called only after the backend confirms attention completion.
+    // 收到对应 epoch 的计算完成通知后，释放本次 attention 对槽位的占用。
     bool attention_complete(std::uint64_t epoch);
     std::uint64_t attention_epoch() const { return epoch_; }
     std::vector<std::uint32_t> current_slots(CurrentBlock current) const;

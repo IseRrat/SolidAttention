@@ -1,3 +1,4 @@
+# 管理脚本拥有的进程组、退出信号和清理流程，避免子进程脱离所属任务。
 """Process ownership and termination shared by launchers and experiment tools."""
 from contextlib import contextmanager
 import os

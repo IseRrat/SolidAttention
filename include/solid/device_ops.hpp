@@ -1,3 +1,4 @@
+// 供 llama.cpp 计算图使用的自定义节点接口：KV 整理、局部 Key 聚集和完成依赖。
 #pragma once
 
 #include "ggml.h"
@@ -82,14 +83,19 @@ inline bool device_op_supported(const ggml_tensor * tensor) {
     }
 }
 // Pure graph operations: no CPU coordination side effects in captured kernels.
+// 生成依赖 Q 的小型控制节点，用于把 Q 就绪位置暴露给图回调。
 ggml_tensor * device_query_token(ggml_context * context, ggml_tensor * query, ggml_tensor * dependency = nullptr);
+// 把 attention 输出与完成回执相连，使后续图节点按依赖使用输出。
 ggml_tensor * device_attention_result(ggml_context * context, ggml_tensor * output, ggml_tensor * receipt,
     ggml_tensor * kv = nullptr, ggml_tensor * scores = nullptr);
 ggml_tensor * device_kv_token(ggml_context * context, ggml_tensor * kv);
+// 从已有 raw-K 环和当前 KV 聚集近期 Key，输出连续设备张量。
 ggml_tensor * device_local_keys(ggml_context * context, ggml_tensor * current_kv, ggml_tensor * positions,
                                const DeviceKeyWindow & window, std::uint32_t tokens);
+// 把投影 K/V 转为 FP16 交织 KV，并保留 Q 与提前选块的图依赖。
 ggml_tensor * device_consolidate_kv(ggml_context * context, ggml_tensor * key, ggml_tensor * value,
                                    ggml_tensor * query, ggml_tensor * early_selection);
 ggml_tensor * device_release_mask(ggml_context * context, ggml_tensor * mask, ggml_tensor * kv, ggml_tensor * query = nullptr);
+// 将设备 Prefill 输出接回模型图，同时保活消费期间的 Q/KV。
 ggml_tensor * device_prefill_result(ggml_context * context,ggml_tensor * output,ggml_tensor * control,ggml_tensor * query,ggml_tensor * kv);
 } // namespace solid

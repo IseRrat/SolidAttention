@@ -1,3 +1,4 @@
+// 主机模拟完成通知与后端工厂入口；CUDA、SYCL 实现位于各自子目录。
 #include "solid/attention_events.hpp"
 #include <cerrno>
 #include <limits>

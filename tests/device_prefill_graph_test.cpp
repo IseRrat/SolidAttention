@@ -1,3 +1,4 @@
+// 在主机模拟后端运行设备 Prefill 图的通用检查样例。
 #include "device_prefill_graph_cases.hpp"
 #include "tiled_prefill_cases.hpp"
 #include "representative_builder_cases.hpp"

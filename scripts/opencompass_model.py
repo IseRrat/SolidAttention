@@ -1,3 +1,4 @@
+# OpenCompass 模型包装器：把生成、token 长度和困惑度请求转交给 RunnerClient。
 """OpenCompass model registration; add the repository root to PYTHONPATH."""
 from pathlib import Path
 import sys

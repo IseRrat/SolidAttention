@@ -1,3 +1,4 @@
+# 准确率样本、NLL、预测导出与官方评分器接入检查。
 from array import array
 import importlib.util
 import json

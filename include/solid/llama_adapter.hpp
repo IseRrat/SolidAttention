@@ -1,3 +1,4 @@
+// llama.cpp 适配接口：构建 attention 节点并选择纯卸载、稀疏基线或 SolidAttention 路径。
 #pragma once
 
 #include "solid/config.hpp"
@@ -24,6 +25,7 @@ struct ProjectionIntervals;
 class InfllmSelectedCache;
 class DenseOffload;
 std::shared_ptr<InfllmSelectedCache> make_infllm_selected_cache(AttentionSession & session, ggml_backend * backend);
+// 稀疏基线的固定窗口预取器，管理独立 I/O 工作线程与逐层执行位置。
 class SparseBaselineLookahead {
 public:
     static constexpr std::size_t queue_depth = 64;
@@ -55,6 +57,7 @@ private:
     std::uint64_t position_ = 0;
 };
 
+// 代表一层 attention 的图节点集合，保存跨次执行需要的回调状态。
 class AttentionNode {
 public:
     AttentionNode(AttentionSession & session, std::shared_ptr<AttentionFrame> frame, std::uint32_t layer,
@@ -81,6 +84,7 @@ private:
     std::unique_ptr<Impl> impl_;
 };
 
+// 一个模型对应的适配实例，持有会话与方法工作区，并向上游暴露图构建入口。
 class AttentionAdapter {
 public:
     AttentionAdapter(const llama_model * model, const AttentionConfig & options, std::uint32_t capacity,
@@ -124,10 +128,12 @@ bool adapter_active(const llama_model * model);
 bool graph_depends_on(const ggml_tensor * tensor, const ggml_tensor * ancestor);
 bool adapter_fused_projection(const llama_model * model);
 void adapter_mark_projection(const llm_graph_context & graph, ggml_tensor * projection, int layer, bool query);
+// 上游 Q/K/V 构图接入口；按配置使用原投影或融合 K/V 投影。
 llm_graph_qkv adapter_qkv(const llm_graph_context & graph, const llama_layer & layer, ggml_tensor * input,
                          std::int64_t dimension_q, std::int64_t heads_q, std::int64_t dimension_k,
                          std::int64_t heads_k, std::int64_t dimension_v, std::int64_t heads_v, int layer_id, bool reshape);
 llm_graph_input_attn_kv * adapter_input(const llm_graph_context & graph);
+// 上游 attention 构图接入口，返回本仓库所选方法的 attention 输出张量。
 ggml_tensor * adapter_attention(const llm_graph_context & graph, llm_graph_input_attn_kv * input,
                                 ggml_tensor * query, ggml_tensor * key, ggml_tensor * value, float scale, int layer);
 } // namespace solid

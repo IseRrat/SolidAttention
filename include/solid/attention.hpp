@@ -1,3 +1,4 @@
+// 稀疏上下文预算、代表向量索引和选块入口；同时提供 CPU attention 参考计算。
 #pragma once
 
 #include "solid/kv_store.hpp"
@@ -7,6 +8,7 @@
 
 namespace solid {
 
+// total 包含 init、local 和选中历史；Prefill 分组还受近期窗口长度约束。
 struct SparseBudget {
     std::uint32_t total = 1024;
     std::uint32_t initial = 32;
@@ -15,6 +17,7 @@ struct SparseBudget {
     bool shared_heads = false;
     bool infllm_attention = false;
     void validate(const KvGeometry & geometry) const;
+    // 返回 min(512, local)，即一次检索覆盖的 Prefill token 数上限。
     std::uint32_t prefill_group_tokens() const;
     std::uint32_t cache_slots(const KvGeometry & geometry) const;
     std::uint64_t complete_history_blocks(const KvGeometry & geometry, std::uint64_t position) const;
@@ -30,6 +33,7 @@ struct RelativeRope {
 // The caller owns width output elements; KV storage precision is independent.
 void mean_infllm_query(const float * queries, float * mean, std::size_t width, std::uint32_t count);
 
+// 维护各层历史块代表；正式 CUDA 路径把代表和待定 Key 留在设备上。
 class RepresentativeIndex {
 public:
     RepresentativeIndex(KvGeometry geometry, std::uint32_t query_heads, SparseBudget budget);
@@ -43,6 +47,7 @@ public:
     DeviceKeyWindow probability_key_window(std::uint32_t layer) const {
         return ranker_ && device_probabilities_ ? ranker_->probability_key_window(layer) : DeviceKeyWindow{};
     }
+    // 用近期 attention 的真实概率更新待定 Key 分数，完整块退出窗口后生成代表。
     void observe_device_probabilities(std::uint32_t layer, std::uint64_t first, std::uint32_t count,
                                      DeviceKvBatch kv, DeviceQuery scores, bool key_major, void * compute_stream = nullptr,
                                      bool on_compute = false);
@@ -53,6 +58,7 @@ public:
     void observe_probabilities(std::uint32_t layer, std::uint64_t position, const std::vector<float> & probabilities);
     void observe_query_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query,bool will_rank=false);
     void finish_query_for_rank_device();
+    // 追加设备上的原始 Key，供后续近期窗口和代表构造使用。
     void append_keys_device(std::uint32_t layer, std::uint64_t position, DeviceKeys keys,void * compute_stream=nullptr);
     void observe_batch_device(std::uint32_t layer,std::uint64_t first,std::uint32_t tokens,DeviceQuery query,DeviceKvBatch kv);
     std::optional<DeviceMemory> direct_memory() const { return ranker_ && ranker_->builder_window() ? ranker_->direct_memory() : std::optional<DeviceMemory>{}; }
@@ -114,6 +120,7 @@ struct HeadSelection {
     std::vector<std::uint64_t> blocks;
 };
 using SelectionCompletion = std::function<std::vector<HeadSelection>()>;
+// 异步提交正式选块；调用返回的收取函数时获得各 head 的最终位置和块编号。
 SelectionCompletion submit_select_blocks(const KvGeometry & geometry, const SparseBudget & budget,
     const RepresentativeIndex & representatives, std::uint32_t layer, std::uint64_t position, DeviceQuery query);
 
@@ -128,6 +135,7 @@ struct PrefillContext {
     std::vector<std::uint64_t> positions;
     std::size_t local_only_from;
 };
+// 为一组 Prefill token 选择历史上下文，并记录局部分支专用位置的边界。
 PrefillContext select_prefill_context(const KvGeometry & geometry, const SparseBudget & budget,
     const RepresentativeIndex & representatives, std::uint32_t layer, std::uint64_t first, std::uint32_t count,
     const std::vector<float> & mean_query);
@@ -139,6 +147,7 @@ PrefillContext select_prefill_context(const KvGeometry & geometry, const SparseB
     DeviceQueryWithEvent mean_query);
 
 // Q contains query-head-major vectors. K/V retain absolute positions and FP16 precision.
+// CPU 参考：分块读取选定 KV，用在线 softmax 累积 attention 输出。
 std::vector<float> streamed_attention(KvStore & store, std::uint32_t layer, std::uint64_t position,
                                       std::uint32_t query_heads, const std::vector<float> & query, float scale,
                                       const std::vector<HeadSelection> * selected = nullptr, const RelativeRope * rope = nullptr,

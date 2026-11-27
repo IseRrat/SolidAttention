@@ -1,3 +1,4 @@
+// CUDA 代表构造、评分和 Top-K 数值及工作区复用检查。
 #include "solid/block_ranker.hpp"
 #include "representative_builder_cases.hpp"
 #include <algorithm>

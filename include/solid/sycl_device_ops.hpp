@@ -1,3 +1,4 @@
+// GGML 自定义操作的 SYCL 实现，处理 KV 整理、局部 Key 和完成通知。
 #pragma once
 
 #include "solid/device_ops.hpp"

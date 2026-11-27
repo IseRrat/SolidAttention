@@ -1,3 +1,4 @@
+// 计算块级关键路径与最晚开始时间，跟踪 SSD 读取和 H2D 完成状态。
 #include "solid/block_stage.hpp"
 #include <algorithm>
 #include <chrono>

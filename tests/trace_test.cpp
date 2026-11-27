@@ -1,3 +1,4 @@
+// 阶段标记、线程名称和可选调度日志的开关及生命周期检查。
 #include "solid/trace.hpp"
 #include "solid/scheduler.hpp"
 #include <iostream>

@@ -1,3 +1,4 @@
+// 把完成回执绑定到 GGML 算子参数，供设备执行钩子记录事件并通知调度器。
 #pragma once
 #include <cstddef>
 #include <cstdint>
@@ -24,6 +25,7 @@ struct StreamCompletionBinding {
 };
 constexpr std::size_t stream_completion_offset=32;
 constexpr std::uint64_t stream_completion_magic=0x534f4c4944434d50ull;
+// 把回执指针、身份和起止阶段写入算子参数，供设备执行时读取。
 inline void bind_stream_completion(void * params,std::size_t bytes,StreamCompletionToken * token,CompletionPhase phase=CompletionPhase::both) {
     if (bytes<stream_completion_offset+sizeof(StreamCompletionBinding)) return;
     const StreamCompletionBinding binding{token?stream_completion_magic:0,token,token?token->identity:0,phase};

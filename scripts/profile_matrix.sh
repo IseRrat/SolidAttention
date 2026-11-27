@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# 按给定矩阵调用性能采集流程，归档各次运行的日志和结果。
 set -euo pipefail
 plan=$1
 repo=$(cd -- "$(dirname -- "$0")/.." && pwd)

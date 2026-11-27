@@ -1,3 +1,4 @@
+// 融合 K/V 权重、量化类型和投影视图的数值检查。
 #include "solid/projection.hpp"
 #include "ggml.h"
 #include "ggml-backend.h"

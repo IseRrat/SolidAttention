@@ -1,3 +1,4 @@
+// 实现任务依赖推进和关键路径优先选择，并管理持久工作线程与调度统计。
 #include "solid/scheduler.hpp"
 #include "solid/thread_affinity.hpp"
 #include "nlohmann/json.hpp"

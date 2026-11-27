@@ -1,3 +1,4 @@
+// SYCL 分片 Prefill：逐片累积 attention，管理设备输入、输出与工作区。
 #include "solid/tiled_prefill.hpp"
 #include "solid/sycl_runtime.hpp"
 

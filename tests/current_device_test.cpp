@@ -1,3 +1,4 @@
+// 当前 token 的设备 KV 安装、历史前缀复用与槽位版本检查。
 #include "prefetch_fakes.hpp"
 #include <iostream>
 

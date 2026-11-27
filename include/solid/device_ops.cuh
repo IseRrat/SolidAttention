@@ -1,3 +1,4 @@
+// GGML 自定义操作的 CUDA 实现，包括 KV 交织、局部 Key 聚集与 attention 输出依赖。
 #pragma once
 
 #include "solid/device_ops.hpp"

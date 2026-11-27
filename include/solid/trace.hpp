@@ -1,3 +1,4 @@
+// Nsight 阶段标记及线程/stream 命名接口；标记计算、搬运、读写和等待。
 #pragma once
 #include <cstdint>
 #include <memory>
@@ -8,6 +9,7 @@ void name_thread(const char * name) noexcept;
 void name_cuda_stream(void * stream, const char * name) noexcept;
 
 // Lexical ranges stay on their creating thread and form the NVTX range stack.
+// 同一 CPU 线程内的阶段范围，析构时结束，用于 Prefill/Decode 等嵌套标记。
 class Scope {
 public:
     Scope() noexcept = default;
@@ -27,6 +29,7 @@ private:
 
 // Start/end ranges can cross CPU threads. They describe host-observed stage
 // intervals; actual GPU execution remains on Nsight's kernel/memory rows.
+// 允许跨 CPU 线程结束的阶段范围，显示主机观察的生命周期。
 class Range {
 public:
     Range() noexcept = default;
@@ -47,6 +50,7 @@ private:
 
 // One visible I/O phase shared by all requests in a layer batch. The final
 // request receipt releases the range, including cancellation receipts.
+// 让同一批读盘或上传请求共用一个阶段条，最后一个持有者释放后结束。
 class Batch {
 public:
     Batch(const char * stage, std::uint32_t layer, std::uint64_t position) noexcept

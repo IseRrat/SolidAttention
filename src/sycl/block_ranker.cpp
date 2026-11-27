@@ -1,3 +1,4 @@
+// SYCL 代表向量构造、块评分与 Top-K，使用统一的候选和 token 预算接口。
 #include "solid/block_ranker.hpp"
 #include "solid/representative_math.hpp"
 #include "solid/sycl_runtime.hpp"

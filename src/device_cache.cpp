@@ -1,3 +1,4 @@
+// 把主机已就绪的 KV 块送入显存，构造 attention 槽位映射，在计算完成后释放占用。
 #include "solid/device_cache.hpp"
 #include <algorithm>
 #include <chrono>
@@ -175,6 +176,7 @@ SlotLease DeviceCache::upload(const SlotLease & host,const std::shared_ptr<Block
     }
     return *device;
 }
+// 同批提交已就绪主机块，并保留源槽位直到共享传输回执完成。
 void DeviceCache::upload_batch(const std::vector<SlotLease> & leases,const std::shared_ptr<BlockStage> & stage,
                                const std::function<void()> & before_upload) {
     Transfer transfer{0,{},stage};
@@ -349,6 +351,7 @@ void DeviceCache::stage_ready_batch(const std::vector<SlotLease> & leases,const 
     poll_transfers(false);
     upload_batch(leases,stage,before_upload);
 }
+// 把逻辑 token 位置映射为显存槽位和掩码，保留当前 attention 的读租约。
 std::vector<Half> DeviceCache::prepare(const std::vector<SlotLease> & host_leases, const std::vector<HeadSelection> & selection,
                                        bool deferred_upload,const CurrentDeviceKv * current,bool keep_history_in_flight,
                                        std::uint32_t local_window) {

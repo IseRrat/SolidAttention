@@ -1,3 +1,4 @@
+// 代表向量参考路径的均值、分数累加与稳定插入公式，供 CPU/CUDA 共用。
 #pragma once
 
 #include "solid/kv_store.hpp"

@@ -1,3 +1,4 @@
+// 通过 GGML 回调收集逐算子和传输耗时；启用时包含诊断所需的后端同步。
 #include "solid/profile.hpp"
 #include <stdexcept>
 

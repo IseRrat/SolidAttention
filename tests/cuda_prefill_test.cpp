@@ -1,3 +1,4 @@
+// CUDA Prefill 与异步均值/选块衔接检查。
 #include "tiled_prefill_cases.hpp"
 #include "infllm_reference_cases.hpp"
 #include <cuda_runtime_api.h>

@@ -1,3 +1,4 @@
+// CUDA 代表构造、历史块评分和 Top-K；共享选块路径使用 FP32 评分和 CUB 排序。
 #include "solid/block_ranker.hpp"
 #include "solid/trace.hpp"
 #include "solid/ranking_math.hpp"
@@ -48,6 +49,7 @@ __device__ double append_ordered_chunk(double value,double product,unsigned vali
 // One warp scores a (head, candidate). Adjacent lanes load adjacent Q/K
 // dimensions. The representative, GQA and dimension accumulation order is
 // unchanged; FMA contraction is disabled for this target.
+// 兼容逐 head 入口：用 Q 与块代表计算分数，保持参考路径的 FP64 累加顺序。
 __global__ void score_blocks(const __half * keys, const float * query, const std::uint64_t * ids,
                              double * scores, int * error, std::uint64_t count, std::uint32_t heads,
                              std::uint32_t group, std::uint32_t representatives, std::uint32_t dimension) {
@@ -80,6 +82,7 @@ __global__ void score_blocks(const __half * keys, const float * query, const std
 
 // Flatten the query heads into one score per historical block, then run one
 // Top-K over the shared list. GQA heads reference their existing KV rows.
+// 共享选块入口：跨 query heads 汇总一个历史块的 FP32 分数。
 __global__ void score_shared_blocks(const __half * keys, const float * query, std::uint64_t * ids,
                                     double * scores, int * error, std::uint64_t count, std::uint32_t heads,
                                     std::uint32_t group, std::uint32_t representatives, std::uint32_t dimension, bool prefix) {
@@ -120,6 +123,7 @@ __global__ void score_shared_blocks(const __half * keys, const float * query, st
 // costs exclude deterministic init/local positions. Every winning block keeps
 // its logical ID, independent of cache slot order. At most budget iterations,
 // normally ceil(remaining / block_tokens), with one reduction per iteration.
+// 兼容变成本入口：逐次选取最优块，直到用完剩余历史 token 预算。
 __global__ void select_top_blocks(double * scores, const std::uint64_t * ids, const std::uint32_t * costs,
                                   std::uint64_t * output, std::uint64_t count, std::uint32_t remaining,
                                   std::uint32_t stride) {
@@ -154,6 +158,7 @@ __global__ void select_top_blocks(double * scores, const std::uint64_t * ids, co
     }
 }
 
+// 代表构造的兼容入口：先对同 KV head 对应的 Q 求均值。
 __global__ void builder_mean_query(const float * query, double * mean, int * error, std::uint32_t heads,
                                     std::uint32_t width, std::uint32_t group) {
     const auto total = static_cast<std::uint64_t>(heads)*width;
@@ -163,6 +168,7 @@ __global__ void builder_mean_query(const float * query, double * mean, int * err
         if (!isfinite(mean[i])) atomicExch(error, 1);
     }
 }
+// 把新 Key 写入代表构造工作区，保留每个 KV head 的原始行。
 __global__ void builder_append_keys(const Half * source, Half * target, int * error,
                                     std::size_t head_stride, std::uint32_t heads, std::uint32_t width) {
     const auto total = static_cast<std::uint64_t>(heads)*width;

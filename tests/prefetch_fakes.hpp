@@ -1,3 +1,4 @@
+// 预取检查共用的模拟 SSD 读取器与可控制完成时机的辅助对象。
 #pragma once
 #include "solid/device_cache.hpp"
 #include <algorithm>

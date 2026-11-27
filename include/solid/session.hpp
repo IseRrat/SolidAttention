@@ -1,3 +1,4 @@
+// 一次 attention 会话的存储、代表索引、Prefill 和 Decode 入口。
 #pragma once
 
 #include "solid/attention.hpp"
@@ -38,6 +39,7 @@ struct SessionStats {
     PrefetchStats prefetch;
 };
 
+// 持有一次请求的 KV 存储、索引和工作区，统一管理 Prefill/Decode 生命周期。
 class AttentionSession {
 public:
     AttentionSession(std::unique_ptr<KvStore> store, std::uint32_t query_heads, SparseBudget budget,
@@ -55,6 +57,7 @@ public:
                      Half * packed, std::size_t elements, bool interleaved_inputs = false);
     std::uint32_t gather_slots() const;
     std::uint64_t gather_elements() const;
+    // 读取 Decode 需要的 KV 行区间，交由存储层组织文件读取。
     void read_decode_rows(std::uint32_t layer, const std::vector<KvRowRange> & ranges, AsyncReader * reader, std::size_t depth);
     void account_cached_gather(std::uint64_t ns) { stats_.gather_ns += ns; }
     void read_dense_history(std::uint32_t layer, std::uint32_t position, Half * destination, AsyncReader * reader);
@@ -70,6 +73,7 @@ public:
         stats_.sparse_prefetch_wait_ns += wait_ns;
     }
     void flush();
+    // 切换 Decode 的 KV 文件读取到 O_DIRECT，绕过 Linux 文件缓存。
     void enable_direct_reads();
     void finish();
     SessionStats stats() const;
@@ -88,6 +92,7 @@ public:
     void set_prefill(std::unique_ptr<TiledPrefill> prefill);
     void release_prefill_if_complete();
     std::optional<DeviceMemory> prefill_direct_memory() const;
+    // 直接消费设备 Q/KV 并写回设备输出，主机 KV 用于 SSD 归档。
     void process_prefill_device(std::uint32_t layer,std::uint64_t first,std::uint32_t tokens,DeviceQuery queries,
                                 DeviceKvBatch device_kv,const std::vector<Half> & host_kv,float scale,DeviceOutput output);
     void retain_prefill_graph_output(std::uint64_t bytes);
@@ -105,10 +110,12 @@ public:
                                 const std::vector<float> & keys, const std::vector<float> & values, bool interleaved_inputs);
     std::optional<DeviceMemory> direct_memory() const;
     std::vector<HeadSelection> select_before_kv_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query);
+    // Q 就绪时先提交历史选块，当前 token 的 KV 可在后续入口追加。
     void submit_before_kv_device(std::uint32_t layer, std::uint64_t position, DeviceQuery query);
     std::vector<HeadSelection> finish_before_kv_device();
     void append_after_selection_half(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv, DeviceKeys keys);
     void stage_device_keys(std::uint32_t layer, std::uint64_t position, DeviceKeys keys,void * compute_stream=nullptr);
+    // 把已从设备收回的新 KV 追加到该层写缓冲，供后续读请求访问。
     void archive_device_kv(std::uint32_t layer, std::uint64_t position, const std::vector<Half> & kv);
 private:
     std::unique_ptr<KvStore> store_;

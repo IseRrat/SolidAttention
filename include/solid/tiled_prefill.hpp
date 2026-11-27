@@ -1,3 +1,4 @@
+// 分片 Prefill 接口；支持设备 Q/KV、局部 QK、历史检索及联合 softmax。
 #pragma once
 
 #include "solid/kv_store.hpp"
@@ -51,6 +52,7 @@ struct PrefillStats {
     std::uint64_t device_query_tokens = 0, device_kv_tokens = 0;
     std::uint64_t retrieval_mean_events = 0, retrieval_mean_host_waits = 0;
 };
+// 一次 begin→多次 consume→finish 处理一组 query；工作区在层与调用之间复用。
 class TiledPrefill {
 public:
     virtual ~TiledPrefill() = default;
@@ -73,13 +75,16 @@ public:
     virtual bool supports_sparse() const { return false; }
     // Enqueue native local QK before historical retrieval. Borrowed Q/KV and
     // the representative K ring remain live through sparse()/abort().
+    // 先提交近期分支 QK；历史块检索和读取随后推进。
     virtual void begin_sparse_local(const SparsePrefillLocalFrame &) { throw std::logic_error("device local prefill is disabled"); }
     virtual DeviceQuery mean_sparse_query(DeviceQuery, std::uint32_t) { throw std::logic_error("device sparse query is disabled"); }
     // Retain the input Q until the ranker has consumed the returned event, or
     // this backend has completed its following sparse()/abort() call.
+    // 在设备上计算检索 Q 均值，返回指针及完成事件供评分队列等待。
     virtual DeviceQueryWithEvent mean_sparse_query_async(DeviceQuery query, std::uint32_t count) {
         return {mean_sparse_query(query, count), nullptr};
     }
+    // 合并近期与历史 logits 做联合 softmax，返回 attention 及近期概率分数。
     virtual SparsePrefillOutput sparse(const SparsePrefillFrame &) { throw std::logic_error("sparse prefill is disabled"); }
 };
 std::unique_ptr<TiledPrefill> make_cuda_tiled_prefill(const KvGeometry & geometry, std::uint32_t query_heads,

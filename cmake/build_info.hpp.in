@@ -1,2 +1,3 @@
+// 构建身份头文件模板；CMake 配置时填入源码版本与功能开关。
 #pragma once
 inline constexpr const char * solid_build_info = R"solid(@SOLID_BUILD_JSON@)solid";

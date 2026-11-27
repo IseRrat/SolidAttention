@@ -1,3 +1,4 @@
+// 实现纯 Offload 基线：异步读取整层历史 KV、上传计算所需数据，并写回新 KV。
 #include "solid/dense_offload.hpp"
 #include "solid/session.hpp"
 #include "solid/scheduler.hpp"

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 从选块记录计算历史块复用比例、命中分布等统计。
 """Measure consecutive formal selected-block overlap by layer and KV head."""
 import argparse
 import json
@@ -7,6 +8,7 @@ from pathlib import Path
 from experiment_common import atomic_json, audit_run, check_hash, digest, distribution, number
 
 
+# 剔除固定初始/近期部分后，统计相邻选择之间历史块的复用。
 def analyze(result_path):
     path = Path(result_path)
     result,run,_ = audit_run(path)

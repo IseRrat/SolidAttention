@@ -1,3 +1,4 @@
+// 运行 CPU 代表构造器的通用数值与状态检查。
 #include "representative_builder_cases.hpp"
 #include "solid/session.hpp"
 #include <iostream>

@@ -1,3 +1,4 @@
+// KV 数据布局、文件偏移与存储接口；提供内存存储及带逐层写缓冲的 SSD 存储。
 #pragma once
 
 #include <cstddef>
@@ -16,6 +17,7 @@ float from_half(Half value);
 
 enum class KvLayout : std::uint32_t { separate = 0, interleaved = 1 };
 
+// 描述层数、KV head 数、维度与文件布局，所有字节偏移由它计算。
 struct KvGeometry {
     std::uint32_t layers = 0;
     std::uint32_t heads = 0;
@@ -77,6 +79,7 @@ struct KvRowRange {
     Half * keys;
     Half * values;
 };
+// 一笔实际文件读取；scratch/skip 用于把对齐读盘结果还原为调用方要的范围。
 struct KvReadRequest {
     int fd;
     void * buffer;
@@ -136,6 +139,7 @@ public:
     }
     // Existing rows [0,prefix) are immutable. Only the newly committed suffix
     // requires I/O; dirty suffix rows are forwarded before submission.
+    // 把块读取拆为实际文件区间，并先从写缓冲补齐尚未落盘的尾部。
     virtual std::vector<KvReadSegment> plan_read(std::uint32_t layer, std::uint32_t head, std::uint64_t block,
                                                 KvBlock & destination, std::uint32_t prefix = 0);
 protected:
@@ -159,6 +163,7 @@ private:
     std::vector<std::uint64_t> lengths_;
 };
 
+// SSD KV 存储：各层使用固定大小写缓冲，未写出的尾部也能参与后续读取。
 class FileKvStore final : public KvStore {
 public:
     FileKvStore(KvGeometry geometry, std::unique_ptr<RandomAccessFile> file,

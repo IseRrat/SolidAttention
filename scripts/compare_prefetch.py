@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 对照预取开关的选块和数值结果，并核对槽位上传、占用与释放记录。
 """Compare prefetch selection/logits and audit recorded device-slot lifetimes."""
 import argparse
 import json
@@ -9,6 +10,7 @@ from compare_logits import compare
 from layout_ablation import digest, selection_difference
 
 
+# 沿记录重放槽位生命周期，核对上传、attention 占用和覆盖的先后关系。
 def audit_residency(path, block_tokens, slots_per_head):
     if type(block_tokens) is not int or block_tokens <= 0 or type(slots_per_head) is not int or slots_per_head <= 0:
         raise ValueError("invalid residency geometry")
@@ -80,6 +82,7 @@ def audit_residency(path, block_tokens, slots_per_head):
     return result
 
 
+# 比较参考和预取运行的选块、数值及数据身份。
 def compare_prefetch(reference_path, candidate_path, atol=1e-3, rtol=1e-4):
     reference_path, candidate_path = Path(reference_path), Path(candidate_path)
     reference = json.loads(reference_path.read_text(encoding="utf-8"))

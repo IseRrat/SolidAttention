@@ -1,3 +1,4 @@
+// 真实文件上的 liburing 读写、完成回执和取消检查。
 #include "solid/async_reader.hpp"
 #include <algorithm>
 #include <array>

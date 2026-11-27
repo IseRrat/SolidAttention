@@ -1,3 +1,4 @@
+// CUDA 局部 Key 聚集：从 raw-K 环与本组新 K 生成近期 attention 所需的连续行。
 #pragma once
 #include <cuda_runtime.h>
 #include <cstdint>

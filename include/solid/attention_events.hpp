@@ -1,3 +1,4 @@
+// attention 完成通知接口；把 GPU 完成事件交给 CPU 调度线程。
 #pragma once
 #include "solid/stream_completion.hpp"
 #include <atomic>

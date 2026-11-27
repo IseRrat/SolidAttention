@@ -1,3 +1,4 @@
+// SYCL 单 token masked attention：检查支持的张量形状，分片计算并归并结果。
 #pragma once
 
 #include "ggml.h"

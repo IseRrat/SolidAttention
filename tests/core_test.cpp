@@ -1,3 +1,4 @@
+// 基础 KV 存储、稀疏 attention 和会话行为检查。
 #include "solid/attention.hpp"
 #include "solid/session.hpp"
 

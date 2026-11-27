@@ -1,3 +1,4 @@
+// 读取 JSON 配置、解析路径并校验模型文件和 attention 参数组合。
 #include "solid/config.hpp"
 #include "nlohmann/json.hpp"
 

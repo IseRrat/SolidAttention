@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 单次运行启动器：校验配置与构建，启动推理程序并保存执行清单和结果。
 """Run the pinned baseline and save its inputs, provenance and process memory."""
 
 import argparse
@@ -129,6 +130,7 @@ def cgroup_memory(pid=None, group=None):
         return {}
 
 
+# 执行一次推理并采样主机资源；异常或中断时回收本次拥有的进程。
 def run_monitored(manifest, run_dir, output):
     """Own the runner from creation through monitoring, cleanup and recording."""
     start = time.monotonic()

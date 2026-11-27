@@ -1,3 +1,4 @@
+// 预测命中、缺失补读、主机槽位与异步写回检查。
 #include "prefetch_fakes.hpp"
 #include <iostream>
 #include <numeric>

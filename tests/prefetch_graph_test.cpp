@@ -1,3 +1,4 @@
+// 预取路径在 GGML 图中的数据依赖、三种调度模式与数值检查。
 #include "prefetch_fakes.hpp"
 #include "representative_builder_cases.hpp"
 #include "tiled_prefill_cases.hpp"

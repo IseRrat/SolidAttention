@@ -1,3 +1,4 @@
+// CUDA Prefill：复用 cuBLAS 执行分片 QK/PV，并实现稀疏联合 softmax 与代表概率统计。
 #include "solid/tiled_prefill.hpp"
 #include "solid/trace.hpp"
 #include "solid/attention.hpp"
@@ -36,6 +37,7 @@ public:
 private:
     int previous_=0; bool changed_=false;
 };
+// 初始化每个 query/head 的在线 softmax 最大值、分母和输出累积区。
 __global__ void initialize(float * weights,float * maximum,float * sum,std::uint64_t rows,std::uint32_t width) {
     for (auto i=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;i<rows*width;
          i+=static_cast<std::uint64_t>(gridDim.x)*blockDim.x) {
@@ -47,6 +49,7 @@ __global__ void initialize(float * weights,float * maximum,float * sum,std::uint
 // loads an eight-token K/V panel once, then all four queries reuse that panel.
 // The maximum shared footprint is 32 KiB at dimension 1024.
 template<int Width>
+// 参考计算路径：消费一个 KV tile，逐步累积稳定的 attention 输出。
 __global__ void accumulate(const float * query,const __half * kv,float * weights,float * maximum,float * sum,int * error,
     std::uint64_t first_query,std::uint64_t first_key,std::uint32_t valid,std::uint32_t queries,
     std::uint32_t query_heads,std::uint32_t group,std::uint32_t width,std::size_t token_stride,std::size_t head_stride,float scale) {
@@ -126,6 +129,7 @@ __global__ void accumulate(const float * query,const __half * kv,float * weights
         }
     }
 }
+// 用累计 softmax 分母归一化最终 attention 输出。
 __global__ void normalize(float * values,const float * sum,int * error,std::uint64_t elements,std::uint32_t width) {
     for (auto i=static_cast<std::uint64_t>(blockIdx.x)*blockDim.x+threadIdx.x;i<elements;
          i+=static_cast<std::uint64_t>(gridDim.x)*blockDim.x) {
@@ -136,6 +140,7 @@ __global__ void normalize(float * values,const float * sum,int * error,std::uint
     }
 }
 
+// 把 Q 整理为 cuBLAS 所需的 FP16 矩阵布局。
 __global__ void pack_query(const float * input, __half * packed, std::uint32_t heads,
                            std::uint32_t queries, std::uint32_t width) {
     const auto size = static_cast<std::uint64_t>(heads) * queries * width;
@@ -147,6 +152,7 @@ __global__ void pack_query(const float * input, __half * packed, std::uint32_t h
     }
 }
 
+// 把交织 KV tile 拆为 cuBLAS 可直接读取的 K/V 工作矩阵。
 __global__ void pack_kv(const __half * input, __half * keys, __half * values, std::uint32_t heads,
                         std::uint32_t tokens, std::uint32_t width, std::size_t token_stride, std::size_t head_stride,
                         const __half * current, std::uint32_t historical) {
@@ -162,6 +168,7 @@ __global__ void pack_kv(const __half * input, __half * keys, __half * values, st
         values[i] = source[width];
     }
 }
+// 在 GPU 上求本组 token 的 Q 均值，供历史块检索使用。
 __global__ void mean_sparse_queries(const float * queries, float * mean, std::size_t width, std::uint32_t count) {
     for (auto i = static_cast<std::size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
          i < width; i += static_cast<std::size_t>(gridDim.x) * blockDim.x) {
@@ -173,6 +180,7 @@ __global__ void mean_sparse_queries(const float * queries, float * mean, std::si
 
 // Each block merges one tile into the running FP32 softmax. Probabilities
 // are packed for the tensor-core V product. Masked columns contribute zero.
+// 对新 tile 的 logits 应用因果掩码，并更新跨片 softmax 归一化状态。
 __global__ void merge_scores(const float * scores, __half * probabilities, float * maximum, float * sum,
                              float * previous_scale, int * error, std::uint64_t first_query, std::uint64_t first_key,
                              std::uint32_t queries, std::uint32_t heads, std::uint32_t tokens) {
@@ -223,6 +231,7 @@ __global__ void merge_scores(const float * scores, __half * probabilities, float
     if (!threadIdx.x) sum[output_row] = previous_scale[row] * sum[output_row] + reduce[0];
 }
 
+// 按新的 softmax 比例缩放旧输出，再加上本片 PV 结果。
 __global__ void merge_values(const float * tile, const float * previous_scale, float * output,
                              std::uint32_t queries, std::uint32_t heads, std::uint32_t width) {
     const auto elements = static_cast<std::uint64_t>(queries) * heads * width;
@@ -240,6 +249,7 @@ __global__ void rotary_frequencies(float * frequencies, std::uint32_t dimensions
     }
 }
 
+// 把近期分支 Q 旋转到 InfLLM 规定的位置，并整理矩阵布局。
 __global__ void pack_local_queries(const float * query, __half * packed, const float * frequencies,
     std::uint64_t first, std::uint64_t origin, std::uint32_t local, std::uint32_t heads, std::uint32_t count,
     std::uint32_t width, std::uint32_t rotary, bool split_halves) {
@@ -262,6 +272,7 @@ __global__ void pack_local_queries(const float * query, __half * packed, const f
     }
 }
 
+// 按近期 Key 相对位置施加 RoPE，供局部分支 QK 计算。
 __global__ void rotate_local_keys(__half * keys, const std::uint64_t * positions, const float * frequencies,
     std::uint64_t origin, std::uint32_t tokens, std::uint32_t heads, std::uint32_t width, std::uint32_t rotary, bool split_halves) {
     const auto size = static_cast<std::uint64_t>(heads) * tokens * (rotary / 2);
@@ -280,6 +291,7 @@ __global__ void rotate_local_keys(__half * keys, const std::uint64_t * positions
     }
 }
 
+// 将近期、历史两组 logits 联合归一化，并按位置施加各自掩码。
 __global__ void sparse_softmax(const float * global_scores, const float * local_scores, __half * probabilities,
     const std::uint64_t * positions, int * error, std::uint64_t first,
     std::uint32_t count, std::uint32_t local, std::uint32_t tokens,
@@ -335,6 +347,7 @@ __global__ void sparse_softmax(const float * global_scores, const float * local_
 
 // Reuse completed FP32 logit workspaces for the two compact FP16 P operands.
 // The local and historical branches partition the unique-token union mask.
+// 把联合概率拆回近期/历史两部分，分别交给 PV 矩阵乘法。
 __global__ void split_sparse_probabilities(const __half * joint, __half * nearby, __half * historical,
     const std::uint64_t * positions, std::uint64_t first, std::uint32_t queries, std::uint32_t heads,
     std::uint32_t local, std::uint32_t tokens, std::uint32_t local_begin, std::uint32_t global_tokens) {
@@ -366,6 +379,7 @@ __global__ void copy_sparse_local_rows(const __half * packed, __half * local_key
     }
 }
 
+// 按 query 累加近期概率，生成每个 Key、query head 的分数，供代表构造更新。
 __global__ void sum_sparse_local_scores(const __half * probabilities, float * scores, std::uint64_t first,
     std::uint64_t origin, std::uint32_t queries, std::uint32_t heads, std::uint32_t local,
     std::uint32_t tokens, std::uint32_t local_begin) {
@@ -396,6 +410,7 @@ __global__ void scatter_sparse_output(const float * input, float * output, int *
     }
 }
 
+// 持有复用的 CUDA 工作区与 cuBLAS 句柄，组织 Prefill 的设备计算与复制。
 class CudaTiledPrefill final:public TiledPrefill {
 public:
     CudaTiledPrefill(KvGeometry geometry,std::uint32_t query_heads,std::uint32_t queries,std::uint32_t tile_tokens,int device,

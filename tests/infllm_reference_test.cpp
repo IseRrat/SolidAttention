@@ -1,3 +1,4 @@
+// 运行原版 InfLLM 与本仓库 CPU 路径的对照检查。
 #include "infllm_reference_cases.hpp"
 
 int main(int argc, char ** argv) {

@@ -1,3 +1,4 @@
+// 主机模拟设备 Q/KV 的 Prefill 数值与数据流检查。
 #include "representative_builder_cases.hpp"
 #include "tiled_prefill_cases.hpp"
 #include <iostream>

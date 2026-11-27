@@ -1,3 +1,4 @@
+// 运行分片 Prefill 的 CPU/可用后端通用数值样例。
 #include "tiled_prefill_cases.hpp"
 #include <iostream>
 #ifdef SOLID_PREFILL_GRAPH_TEST

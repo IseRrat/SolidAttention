@@ -1,4 +1,5 @@
 #!/usr/bin/env bash
+# Nsight Systems 启动包装器：采集 CUDA、NVTX 和系统调用时间线并保存原始报告。
 set -euo pipefail
 if [[ $# -lt 2 ]]; then
     printf 'Usage: %s REPORT_PREFIX COMMAND [ARG ...]\n' "$0" >&2

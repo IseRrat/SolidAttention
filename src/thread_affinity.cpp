@@ -1,3 +1,4 @@
+// 读取 CPU 拓扑和线程亲和性，为 I/O、协调线程预留核心，并在结束时恢复原设置。
 #include "solid/thread_affinity.hpp"
 #include <algorithm>
 #include <cerrno>

@@ -1,3 +1,4 @@
+// 组织初始、近期与历史上下文，调用评分器选块，并实现 CPU 流式 attention 参考。
 #include "solid/attention.hpp"
 
 #include <algorithm>

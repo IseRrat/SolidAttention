@@ -1,3 +1,4 @@
+// SYCL 公用运行工具：有序队列、USM 设备内存分配及指针归属检查。
 #pragma once
 
 #include <sycl/sycl.hpp>

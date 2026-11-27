@@ -1,3 +1,4 @@
+// 把三种方法接入 llama.cpp 计算图，连接 GPU 投影、稀疏 attention、SSD 工作区与完成通知。
 #include "solid/llama_adapter.hpp"
 #include "solid/projection.hpp"
 #include "solid/ggml_prefetch.hpp"
@@ -67,6 +68,7 @@ struct PrefillOutput {
     ~PrefillOutput() { session.release_prefill_graph_output(bytes); }
 };
 }
+// 稀疏基线的选中 KV 工作区，使用独立上传队列并按层更新内容。
 class InfllmSelectedCache {
 public:
     InfllmSelectedCache(AttentionSession & session, ggml_backend_t backend) : session_(session), backend_(backend), copy_backend_(backend) {
@@ -305,6 +307,7 @@ std::shared_ptr<InfllmSelectedCache> make_infllm_selected_cache(AttentionSession
 }
 SparseBaselineLookahead::SparseBaselineLookahead(AttentionSession & session, InfllmSelectedCache & workspace, bool use_uring) :
     session_(session), workspace_(workspace), reader_(use_uring ? make_uring_reader(queue_depth) : nullptr) {}
+// 稀疏基线提前读取已知的初始/近期区域；历史块等待正式选块结果。
 void SparseBaselineLookahead::begin(std::uint32_t layer, std::uint64_t position) {
     if (frame_ || layer >= session_.geometry().layers) throw std::logic_error("invalid sparse prefetch frontier");
     worker_.submit([this, layer, position] {
@@ -708,6 +711,7 @@ AttentionNode::AttentionNode(AttentionSession & session, std::shared_ptr<Attenti
     if (prefetch && !gathered) throw std::invalid_argument("prefetch node requires decode attention");
 }
 AttentionNode::~AttentionNode() = default;
+// 构建本层 attention 图：连接投影、局部 QK、选块/读盘入口、联合计算及完成回执。
 ggml_tensor * AttentionNode::build(ggml_context * context, ggml_tensor * query, ggml_tensor * key, ggml_tensor * value,
                                   ggml_tensor * packed_kv, ggml_backend_sched * scheduler, ggml_backend * decode_backend,
                                   ggml_cgraph * graph, ggml_tensor * absolute_positions) {
@@ -1132,6 +1136,7 @@ struct AttentionAdapter::Impl {
     bool configure_prefill = false;
     std::uint32_t prefill_queries=128, prefill_tile_tokens=512;
 };
+// 按配置创建 KV 会话和方法专属工作区，把它们注册到对应 llama_model。
 AttentionAdapter::AttentionAdapter(const llama_model * model, const AttentionConfig & options,
                                   std::uint32_t capacity, std::uint64_t prefill_tokens, const std::filesystem::path & trace, std::uint32_t prefill_queries) :
     impl_(std::make_unique<Impl>()) {
@@ -1358,6 +1363,7 @@ void AttentionAdapter::begin_prefetch(std::uint32_t layer, std::uint64_t positio
     else if (impl_->device) impl_->device->begin_prefetch(layer, position);
     else impl_->session->begin_prefetch(layer, position);
 }
+// GGML 执行回调：在已登记的图边界传递主机状态并检查执行失败。
 bool AttentionAdapter::observe(ggml_tensor * tensor, bool ask) noexcept {
     if (impl_->dense && tensor->op == GGML_OP_FLASH_ATTN_EXT &&
         std::strcmp(ggml_get_name(tensor), "offload_dense_flash_attention") == 0) {

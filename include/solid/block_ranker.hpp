@@ -1,3 +1,4 @@
+// 代表向量构造与块评分接口；CPU/CUDA/SYCL 通过同一输入和预算约定完成选块。
 #pragma once
 
 #include "solid/kv_store.hpp"
@@ -12,6 +13,7 @@ namespace solid {
 using RankedBlocks = std::vector<std::vector<std::uint64_t>>;
 using RankCompletion = std::function<RankedBlocks()>;
 // Candidates have the same eligibility and token cost for every KV head.
+// 候选逻辑块与每块 token 成本；连续候选可仅用块数量表达，省去逐块 CPU 数组。
 struct BlockCandidates {
     std::vector<std::uint64_t> blocks;
     std::vector<std::uint32_t> tokens;
@@ -91,10 +93,12 @@ public:
     virtual ~BlockRanker() = default;
     // Immutable finalized representatives: [block, kv_head, representative, D].
     // Return only after the caller may reuse keys.
+    // 发布已定稿的块代表到评分器，后续检索直接读取这份代表表。
     virtual void publish(std::uint32_t layer, std::uint64_t first_block, std::uint64_t count,
                          const std::vector<Half> & keys) = 0;
     // Per head, descending relevance; equal scores use ascending logical block ID.
     // Return enough blocks to cover remaining tokens, or all candidates if fewer.
+    // 按相关性选足剩余历史预算；shared_heads 模式让各 head 使用同一组逻辑块。
     virtual std::vector<std::vector<std::uint64_t>> rank(std::uint32_t layer, const std::vector<float> & query,
                                                         const BlockCandidates & candidates) = 0;
     virtual RankerStats stats() const = 0;
@@ -109,6 +113,7 @@ public:
     }
     // One outstanding receipt. A separate queue snapshots borrowed inputs;
     // on_compute preserves upstream's update-before-FFN GPU queue order.
+    // 提交设备近期概率更新；on_compute 指定沿计算队列执行以保持更新顺序。
     virtual void submit_probability_update(const ProbabilityFrame &, void *, bool = false) {
         throw std::logic_error("asynchronous probability builder is disabled");
     }
@@ -135,6 +140,7 @@ public:
     // Submit before returning to model computation; collect on the I/O worker.
     // One outstanding receipt owns the ranker's workspace. Keep the query and
     // ranker alive until collection; candidate metadata is copied on submission.
+    // 提交设备 Q 的异步评分/Top-K；返回的收取函数负责取得最终块编号。
     virtual RankCompletion submit_rank_device(std::uint32_t layer, DeviceQueryWithEvent query,
                                               const BlockCandidates & candidates) {
         auto result = rank_device_after_event(layer, query, candidates);

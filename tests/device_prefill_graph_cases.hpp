@@ -1,3 +1,4 @@
+// 设备 Prefill 图复用与输入输出共享检查的通用样例。
 #pragma once
 #include "solid/device_ops.hpp"
 #include "solid/llama_adapter.hpp"

@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 实验矩阵入口：生成逐组配置、顺序执行任务、恢复未完成任务并汇总结果。
 """Prepare, execute and collect reproducible experiment matrices."""
 import argparse
 import copy
@@ -28,6 +29,7 @@ def name(value):
     return value
 
 
+# 从统一模板生成某一种方法的配置，集中设置布局、预算、预取及调度开关。
 def variant_config(template, variant, block, budget):
     if variant not in VARIANTS: raise ValueError("unknown experiment variant")
     if variant in ("solid-no-prefetch", "solid-no-interleaved", "solid-no-coalescing", "solid-per-completion"):
@@ -86,6 +88,7 @@ def variant_config(template, variant, block, budget):
     return config
 
 
+# 展开模型、输入长度、方法与重复次数，保存逐任务配置和实验计划。
 def create(spec_path, destination):
     spec_path, destination = Path(spec_path).resolve(strict=True), Path(destination).resolve()
     spec = load(spec_path)
@@ -229,6 +232,7 @@ def audited_job(row, settings, attempt, runner_sha=None):
     return result,run,config,metrics,group,reads
 
 
+# 依计划执行尚未完成的任务，并记录每次尝试的状态与运行身份。
 def execute(plan_path, runner, limit=None):
     if platform.system() != "Linux": raise ValueError("execute experiment plans in the Linux experiment environment")
     plan_path,plan = read_plan(plan_path)
@@ -302,6 +306,7 @@ def execute(plan_path, runner, limit=None):
     return state
 
 
+# 读取各任务结果，保留失败或缺失项，汇总每组的实际测量值。
 def collect(plan_path, destination):
     plan_path,plan = read_plan(plan_path)
     ledger_path = plan_path.parent/"execution.json"

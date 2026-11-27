@@ -1,3 +1,4 @@
+// 真实 CUDA stream、图复用和 attention 完成通知检查。
 #include "solid/attention_events.hpp"
 #include "solid/cuda_completion.cuh"
 #include <chrono>

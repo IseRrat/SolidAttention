@@ -1,3 +1,4 @@
+# 检查 llama.cpp 分词结果与 GGUF 词表样例的一致性。
 """Exercise --tokenize with a metadata-only synthetic GGUF and zero tensors."""
 import hashlib
 import json

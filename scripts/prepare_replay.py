@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
+# 从参考运行提取固定 Decode 输入，生成后续数值对照所用的配置。
 """Create a fixed-token replay configuration from an existing reference result."""
 import argparse
 import json
 from pathlib import Path
 
 
+# 沿用参考运行的模型与输入，生成固定 Decode token 的重放配置。
 def prepare(reference, template, output):
     reference_path = Path(reference).resolve()
     reference = json.loads(reference_path.read_text(encoding="utf-8"))

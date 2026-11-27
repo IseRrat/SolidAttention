@@ -1,3 +1,4 @@
+// 实现 FP16 KV 的布局寻址、追加、区间读取和逐层写缓冲；直接读模式通过 O_DIRECT 访问文件。
 #include "solid/kv_store.hpp"
 #include "solid/trace.hpp"
 #include "solid/async_reader.hpp"

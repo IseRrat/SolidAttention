@@ -1,3 +1,4 @@
+// 管理 KV 追加与索引更新，分派密集/稀疏 Prefill、Decode 选块、读盘和结果统计。
 #include "solid/session.hpp"
 #include "solid/trace.hpp"
 #include "nlohmann/json.hpp"
@@ -129,6 +130,7 @@ std::vector<float> AttentionSession::process(std::uint32_t layer, std::uint64_t 
     } catch (...) { failed_ = true; throw; }
     return output;
 }
+// 按近期窗口允许的组大小检索历史，连接局部/历史 attention 并更新代表分数。
 std::vector<float> AttentionSession::infllm_prefill(std::uint32_t layer, std::uint64_t first, std::size_t tokens,
     const std::vector<float> & queries, const std::vector<float> & keys, const std::vector<float> & values,
     float scale, bool packed, DeviceQuery device_query, DeviceOutput device_output, DeviceKvBatch device_kv,

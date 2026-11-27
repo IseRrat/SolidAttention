@@ -1,3 +1,4 @@
+// 根据选块历史发起 SSD 预取；正式选择到来后复用命中、补读缺失，并管理主机槽位及写回。
 #include "solid/prefetch.hpp"
 #include <algorithm>
 #include <chrono>
@@ -375,6 +376,7 @@ void Prefetcher::poll(bool wait,const ReadyBlock & ready) {
     }
     if (wait) stats_.wait_ns += std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - start).count();
 }
+// 根据该层历史选择准备预测请求；主机槽位与请求数量受工作区容量限制。
 void Prefetcher::begin(std::uint32_t layer, std::uint64_t position, PredictionCosts costs) {
     check();
     const auto & g = store_.geometry();
@@ -456,6 +458,7 @@ std::vector<SlotLease> Prefetcher::resolve_history(std::uint32_t layer, std::uin
     }
     return resolve_impl(layer, position, past, true, plan, ready, factory, batch, admit_before_stage, per_completion);
 }
+// 把正式需求和预测结果对齐：保留命中、处理版本变化、补读缺失并通知上传方。
 std::vector<SlotLease> Prefetcher::resolve_impl(std::uint32_t layer, std::uint64_t position,
                                             const std::vector<HeadSelection> & actual, bool historical,
                                             const StagePlan & plan, const ReadyBlock & ready,const StageFactory & factory,

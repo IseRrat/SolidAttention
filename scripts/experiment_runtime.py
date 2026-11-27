@@ -1,3 +1,4 @@
+# 为实验进程设置内存、显存和交换空间条件，并管理可选的后台 I/O 负载。
 """External-environment process isolation and read-only fio interference."""
 import os
 import json
@@ -35,6 +36,7 @@ def condition(value):
     return value
 
 
+# 把资源限制包装到子进程启动命令中。
 def isolated_command(command, settings):
     condition(settings)
     limit = cuda_memory_limit(settings)
@@ -61,6 +63,7 @@ def isolated_command(command, settings):
     return command
 
 
+# 读取实验约定的 CUDA 显存上限，交给启动环境使用。
 def cuda_memory_limit(settings):
     mib = settings.get("cuda_memory_max_mib")
     if mib is None:
@@ -72,6 +75,7 @@ def swap_limit(settings):
     return 0 if settings.get("swap_max_bytes") is None else settings["swap_max_bytes"]
 
 
+# 生成后台磁盘负载命令，避开模型及本轮受保护的输入文件。
 def fio_command(settings, directory, protected=()):
     background = condition(settings).get("background")
     if not background: return None

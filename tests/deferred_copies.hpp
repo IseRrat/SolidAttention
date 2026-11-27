@@ -1,3 +1,4 @@
+// 可控制完成时机的模拟传输器，供搬运与缓冲区生命周期检查使用。
 #pragma once
 #include "prefetch_fakes.hpp"
 #include "ggml.h"

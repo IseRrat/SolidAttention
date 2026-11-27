@@ -1,3 +1,4 @@
+# 准确率工具的推理客户端：分词、截断、生成与 teacher-forcing NLL 计算。
 """Serialized model client shared by LongBench and OpenCompass adapters."""
 from array import array
 from collections import OrderedDict
@@ -18,6 +19,7 @@ from process_lifetime import run_owned
 ROOT = Path(__file__).resolve().parents[1]
 
 
+# 按约定处理超长 token 序列，支持保留首尾的中间截断。
 def truncate(tokens, capacity, policy):
     number(capacity,1,True)
     if len(tokens) <= capacity: return list(tokens)
@@ -26,6 +28,7 @@ def truncate(tokens, capacity, policy):
     return tokens[:first] + (tokens[-(capacity-first):] if capacity > first else [])
 
 
+# 从 teacher-forcing logits 提取目标 token 的平均负对数似然。
 def mean_nll(result_path, targets, denominator=None):
     value,binary = load_result(Path(result_path))
     token_ids(targets)

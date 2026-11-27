@@ -1,3 +1,4 @@
+// 单层历史块的读盘→上传状态与优先级；固定依赖形状使用紧凑状态表。
 #pragma once
 #include "solid/async_reader.hpp"
 #include "solid/block_identity.hpp"
@@ -15,6 +16,7 @@ struct BlockStageStats {
 };
 struct BlockDispatch { ReadDispatch read,copy; };
 // Algorithm 1 for the fixed parallel READ -> H2D -> join graph.
+// 为 READ→H2D→汇合的固定形状计算关键路径与 LST，返回读盘和上传优先级。
 std::vector<BlockDispatch> plan_block_dispatch(const std::vector<BlockWork> & blocks);
 // One bounded historical working set. The coordinator owns all transitions;
 // read dispatch keys can be passed to the independent I/O owner by value.
@@ -22,13 +24,16 @@ class BlockStage {
 public:
     BlockStage(std::vector<BlockWork> blocks,ScheduleTrace * trace=nullptr,std::uint64_t frame=0,
                std::uint32_t layer=0,std::uint64_t position=0,ScheduleMode mode=ScheduleMode::overlap);
+    // 返回按关键路径和 LST 排序的待读块。
     std::vector<BlockIdentity> read_order() const;
+    // 仅返回读盘已完成、上传尚未开始的块，按上传优先级排列。
     std::vector<BlockIdentity> copy_order() const;
     ReadDispatch dispatch(const BlockIdentity & identity) const;
     ReadDispatch copy_dispatch(const BlockIdentity & identity) const;
     void read_started(const BlockIdentity & identity,const std::string & proof={});
     void read_complete(const BlockIdentity & identity,const std::string & proof={});
     void copy_started(const BlockIdentity & identity);
+    // 确认上传完成；有设备计时时用 device_ns 统计实际搬运时长。
     void copy_complete(const BlockIdentity & identity,const std::string & proof={},std::optional<std::uint64_t> device_ns={});
     bool finished() const;
     void abort();

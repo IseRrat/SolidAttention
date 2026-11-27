@@ -1,3 +1,4 @@
+# 实验脚本拥有的进程组在退出、中断和异常时的清理检查。
 import os
 from pathlib import Path
 import signal

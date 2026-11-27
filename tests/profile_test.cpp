@@ -1,3 +1,4 @@
+// 逐算子计算与传输统计的启停、结果和回调检查。
 #include "solid/profile.hpp"
 #include "ggml-alloc.h"
 #include "ggml-cpu.h"

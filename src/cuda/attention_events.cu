@@ -1,3 +1,4 @@
+// CUDA attention 完成事件与投影计时；通过通知描述符唤醒 CPU 协调线程。
 #include "solid/attention_events.hpp"
 #include "solid/cuda_completion.cuh"
 #include "solid/device_timing.hpp"

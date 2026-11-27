@@ -1,3 +1,4 @@
+// 配置解析、参数组合和实验约束检查。
 #include "solid/config.hpp"
 #include "solid/filehash.hpp"
 

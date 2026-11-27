@@ -1,3 +1,4 @@
+// 实现 NVTX 阶段范围和线程/stream 命名，让 Nsight 时间线显示 Prefill、Decode 及数据流向。
 #include "solid/trace.hpp"
 #include <cstdio>
 #include <cstdlib>

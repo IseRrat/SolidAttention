@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 调用仓库固定版本的原版 InfLLM，生成代表和选块对照样例。
 """Export CPU fixtures by executing the pinned, unmodified InfLLM methods."""
 import argparse
 import importlib
@@ -22,6 +23,7 @@ def upstream(root):
     return importlib.import_module("inf_llm.attention.context_manager")
 
 
+# 在 CPU 上建立原版 InfLLM 上下文，供小规模数值对照调用。
 def cpu_context(module, kv_heads, heads, width, block, initial, local, representatives, capacity):
     # Bypass CUDA allocation in __init__, retain all actual append_global,
     # MemoryUnit, get_block_k, grouped-head expansion and VectorTensor code.
@@ -48,6 +50,7 @@ def cpu_context(module, kv_heads, heads, width, block, initial, local, represent
     return context
 
 
+# 运行原版代表构造和检索，将输入与期望结果写入对照文件。
 def write_fixture(output, module):
     cases = [
         # KV heads, query heads, D, block, init, local, total budget, capacity, chunks

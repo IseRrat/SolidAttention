@@ -1,4 +1,5 @@
 #!/usr/bin/env python3
+# 整理官方准确率汇总表，保留模型、数据集与评分器版本信息。
 """Import an official OpenCompass summary column with audited backend provenance."""
 import argparse
 import csv
